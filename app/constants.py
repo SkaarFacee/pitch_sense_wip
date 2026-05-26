@@ -23,6 +23,10 @@ GREEN_HSV_UPPER = (90, 255, 255)  # Upper HSV bound for green mask
 COLOR_CACHE_REFRESH_N = 5     # Recompute team centroids every N frames (frequent refresh)
 GK_COLOR_DIST_THRESHOLD = 2.5  # Std-dev multiplier to flag goalkeeper colors (more permissive)
 
+# Referee detection — color-based (player model has no "referee" class)
+REF_DIST_THRESHOLD = 2.0       # Std-dev multiplier to flag referee as outlier from both teams
+REF_SATURATION_THRESHOLD = 40  # Max saturation value to flag as referee (black/white/gray)
+
 
 # PITCH GEOMETRY
 PITCH_LENGTH = 105.0

@@ -390,11 +390,19 @@ class KeypointHomographyComputer:
                 'confidence': confidence,
             })
 
+        # ---- Step 4: Keep only the top 4 most confident keypoints ----
+        # The model may predict keypoints for features not actually in the
+        # frame (hallucinations). Using exactly the 4 highest-confidence
+        # correspondences gives the minimal DLT solution and avoids
+        # hallucinated points from corrupting the homography.
+        candidates.sort(key=lambda c: c['confidence'], reverse=True)
+        candidates = candidates[:4]
+
         info['total_points'] = len(candidates)
         info['used_keypoints'] = candidates
         info['confidences'] = [c['confidence'] for c in candidates]
 
-        # ---- Step 4: Build correspondence arrays ----
+        # ---- Step 5: Build correspondence arrays ----
         if len(candidates) < 4:
             return self._fallback_or_none(last_H, info,
                 f'insufficient-keypoints ({len(candidates)} < 4)')
@@ -408,7 +416,7 @@ class KeypointHomographyComputer:
             dtype=np.float32,
         ).reshape(-1, 1, 2)
 
-        # ---- Step 5: Compute homography via RANSAC ----
+        # ---- Step 6: Compute homography via RANSAC ----
         # RANSAC is robust to outliers: it randomly samples 4-point subsets,
         # finds the one maximizing inliers, and rejects outlier correspondences.
         # This handles low-confidence keypoints that passed the confidence filter
@@ -439,7 +447,7 @@ class KeypointHomographyComputer:
             info['inliers'] = inliers
             info['H'] = H
 
-            # ---- Step 6: Temporal smoothing (EMA + stability gate) ----
+            # ---- Step 7: Temporal smoothing (EMA + stability gate) ----
             H = self._apply_homography_smoothing(H, last_H)
 
             info['H'] = H
