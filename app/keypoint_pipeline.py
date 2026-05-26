@@ -195,10 +195,11 @@ class KeypointPipeline:
         # --------------------------------------------------------------
         used_kpts = H_info.get('used_keypoints', [])
         annotated_frame = self._draw_keypoints_on_frame(frame, used_kpts)
-        # Overlay team-colored player bounding boxes
+        # Overlay team-colored player bounding boxes with confidence scores
         if team_info is not None and len(player_xyxy) > 0:
             annotated_frame = self._draw_team_bboxes(
-                annotated_frame, player_xyxy, team_info['team_colors']
+                annotated_frame, player_xyxy, team_info['team_colors'],
+                player_conf=player_conf,
             )
 
         # Deep analysis frame with seg overlay + keypoints + team bboxes
@@ -210,7 +211,8 @@ class KeypointPipeline:
             deep_analysis_frame = seg_overlay_frame
         if team_info is not None and len(player_xyxy) > 0:
             deep_analysis_frame = self._draw_team_bboxes(
-                deep_analysis_frame, player_xyxy, team_info['team_colors']
+                deep_analysis_frame, player_xyxy, team_info['team_colors'],
+                player_conf=player_conf,
             )
 
         return {
@@ -339,17 +341,21 @@ class KeypointPipeline:
         frame: np.ndarray,
         player_xyxy: np.ndarray,
         team_colors: list,
+        player_conf: np.ndarray = None,
     ) -> np.ndarray:
         """
-        Draw team-colored bounding boxes around detected players.
+        Draw team-colored bounding boxes around detected players, with
+        confidence scores displayed above each bbox.
 
         Args:
             frame: BGR image (H, W, 3).
             player_xyxy: (N, 4) array of bboxes in [x1, y1, x2, y2].
             team_colors: List of N BGR tuples, one per player.
+            player_conf: (N,) array of confidence scores for each player.
+                         If None, no confidence text is drawn.
 
         Returns:
-            Frame with bounding boxes drawn.
+            Frame with bounding boxes and confidence labels drawn.
         """
         out = frame.copy()
         n = min(len(player_xyxy), len(team_colors))
@@ -368,6 +374,38 @@ class KeypointPipeline:
             cv2.addWeighted(overlay, 0.25, out, 0.75, 0, out)
             # Draw border
             cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+
+            # Draw confidence score above the bounding box
+            if player_conf is not None and i < len(player_conf):
+                conf = player_conf[i]
+                label = f"{conf:.2f}"
+                # Choose text color: bright white with a dark outline for readability
+                text_color = (255, 255, 255)
+                outline_color = (0, 0, 0)
+                font_scale = 0.5
+                thickness = 2
+                (tw, th), baseline = cv2.getTextSize(
+                    label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness
+                )
+                # Position: centered above the bbox top edge
+                tx = (x1 + x2 - tw) // 2
+                ty = y1 - 5  # 5px above the bbox
+
+                # If the text would go above the frame, place it just inside the bbox top
+                if ty - th < 0:
+                    ty = y1 + th + 2
+
+                # Draw text outline for readability
+                for dx, dy in [(-1, -1), (-1, 1), (1, -1), (1, 1)]:
+                    cv2.putText(
+                        out, label, (tx + dx, ty + dy),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, outline_color, thickness, cv2.LINE_AA,
+                    )
+                # Draw the actual text
+                cv2.putText(
+                    out, label, (tx, ty),
+                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_color, thickness, cv2.LINE_AA,
+                )
 
         return out
 

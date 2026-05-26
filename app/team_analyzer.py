@@ -48,7 +48,7 @@ class TeamColorAnalyzer:
     GK_COLOR = (0, 255, 255)  # Yellow
 
     # BGR color for referee/unknown
-    REF_COLOR = (255, 255, 255)  # White
+    REF_COLOR = (0, 0, 0)  # Black
 
     def __init__(self, n_clusters: int = TEAM_N_CLUSTERS):
         """
@@ -122,7 +122,7 @@ class TeamColorAnalyzer:
         team_colors = []
         for tid in team_ids:
             if tid == -2:
-                team_colors.append(self.REF_COLOR)  # referee → white
+                team_colors.append(self.REF_COLOR)  # referee → black
             elif tid == -1:
                 team_colors.append(self.GK_COLOR)   # goalkeeper → yellow
             elif tid == 0:
@@ -209,7 +209,9 @@ class TeamColorAnalyzer:
 
         # Mask out very dark (shadows) and very bright (white lines, sky)
         dark_mask = cv2.inRange(hsv_roi, np.array([0, 0, 0]), np.array([180, 255, 30]))
-        bright_mask = cv2.inRange(hsv_roi, np.array([0, 0, 230]), np.array([180, 80, 255]))
+        # Bright mask: only filter very low-saturation bright pixels (white lines, sky)
+        # Use S < 40 to avoid filtering light-colored jerseys (e.g., light pink)
+        bright_mask = cv2.inRange(hsv_roi, np.array([0, 0, 230]), np.array([180, 40, 255]))
 
         # Keep pixels that are NOT green AND NOT dark AND NOT bright
         valid_mask = cv2.bitwise_not(green_mask)
@@ -278,6 +280,10 @@ class TeamColorAnalyzer:
         Cluster players into teams using K-means on HSV (hue, saturation).
         Uses circular hue distance for accurate color grouping.
 
+        Improvement: Pre-filter low-saturation players (potential referees
+        in black/white/gray) before K-means clustering so they don't
+        contaminate the team centroids.
+
         Args:
             player_hsv: (N, 2) — [hue, saturation] per player.
             player_bgr: (N, 3) — BGR colors for visualization.
@@ -289,10 +295,23 @@ class TeamColorAnalyzer:
         if n_players < 2:
             return None, None, None
 
-        k = min(self.n_clusters, n_players)
+        # ---- Pre-filter: identify low-saturation players (potential referees) ----
+        # Remove them from clustering input so they don't pull team centroids
+        low_sat_mask = player_hsv[:, 1] < REF_SATURATION_THRESHOLD
+        colored_idx = np.where(~low_sat_mask)[0]  # indices of colored players
+
+        if len(colored_idx) < 2:
+            # Not enough colored players to cluster — fall back to original method
+            colored_idx = np.arange(n_players)
+            low_sat_mask = np.zeros(n_players, dtype=bool)
+
+        colored_hsv = player_hsv[colored_idx]  # (M, 2) — only colored players
+
+        # ---- K-means clustering on colored players only ----
+        k = min(self.n_clusters, len(colored_hsv))
         try:
             kmeans = KMeans(n_clusters=k, random_state=0, n_init='auto')
-            kmeans.fit(player_hsv)  # Cluster on hue + saturation
+            kmeans.fit(colored_hsv)
             labels = kmeans.labels_
             centroids_hsv = kmeans.cluster_centers_  # (k, 2)
         except Exception:
@@ -301,7 +320,7 @@ class TeamColorAnalyzer:
         # Sort centroids by hue for consistent team ordering
         hue_order = np.argsort(centroids_hsv[:, 0])
         remap = {old: new for new, old in enumerate(hue_order)}
-        team_ids = np.array([remap[l] for l in labels], dtype=np.int32)
+        colored_team_ids = np.array([remap[l] for l in labels], dtype=np.int32)
         sorted_centroids_hsv = centroids_hsv[hue_order]
 
         # Build corresponding BGR centroids for visualization
@@ -313,8 +332,14 @@ class TeamColorAnalyzer:
             sorted_centroids_bgr.append(vis_bgr)
         sorted_centroids_bgr = np.array(sorted_centroids_bgr, dtype=np.float32)
 
-        # Outlier detection for goalkeepers using circular hue distance
-        for i in range(n_players):
+        # ---- Build full team_ids array ----
+        # Initialize all as referee, then fill in colored players
+        team_ids = np.full(n_players, -2, dtype=np.int32)
+        for pos, idx_in_full in enumerate(colored_idx):
+            team_ids[idx_in_full] = colored_team_ids[pos]
+
+        # ---- Goalkeeper detection on colored players ----
+        for i in colored_idx:
             dists = [self._hsv_distance(player_hsv[i], sorted_centroids_hsv[t])
                      for t in range(k)]
             min_dist = min(dists)
@@ -323,23 +348,12 @@ class TeamColorAnalyzer:
             if min_dist > mean_dist + GK_COLOR_DIST_THRESHOLD * std_dist:
                 team_ids[i] = -1
 
-        # --- Referee detection ---
-        # Referees typically wear black/white/gray (low HSV saturation) or colors
-        # that don't match either team. Detect them via:
-        #   1. Low saturation (achromatic: white/black/gray uniforms)
-        #   2. Cluster outlier: player is far from their assigned team centroid
-        for i in range(n_players):
+        # --- Referee detection on clustered (colored) players ---
+        # Check if any colored player is an outlier from their assigned team
+        for i in colored_idx:
             if team_ids[i] == -1:
                 continue  # already GK, don't override
 
-            sat = player_hsv[i, 1]
-
-            # 1. Very low saturation → achromatic (white/black/gray) → referee
-            if sat < REF_SATURATION_THRESHOLD:
-                team_ids[i] = -2
-                continue
-
-            # 2. Check if player is an outlier within their assigned cluster
             t = team_ids[i]
             dist_to_own = self._hsv_distance(player_hsv[i], sorted_centroids_hsv[t])
             # Only compute within-cluster stats if we have enough players in this team
@@ -360,6 +374,11 @@ class TeamColorAnalyzer:
         """
         Assign each player to the nearest cached team centroid using
         circular hue distance.
+
+        Includes referee detection via:
+          1. Low saturation (achromatic: white/black/gray uniforms)
+          2. Outlier distance: player is far from their assigned team centroid
+             (mirrors the logic in _cluster_teams for cached frames)
 
         Args:
             player_hsv: (N, 2) — [hue, saturation] per player.
@@ -388,13 +407,33 @@ class TeamColorAnalyzer:
                 team_ids[i] = min_idx
 
         # --- Referee detection for cached assignments ---
-        # Use low-saturation check (white/black/gray referee uniforms)
+        # 1. Low-saturation check (white/black/gray referee uniforms)
+        # 2. Outlier check: far from assigned team centroid
         for i in range(n_players):
             if team_ids[i] == -1:
                 continue  # already GK
+
             sat = player_hsv[i, 1]
+
+            # 1. Very low saturation → achromatic (white/black/gray) → referee
             if sat < REF_SATURATION_THRESHOLD:
                 team_ids[i] = -2
+                continue
+
+            # 2. Outlier check: is this player unusually far from their team?
+            t = team_ids[i]
+            dist_to_own = self._hsv_distance(player_hsv[i], centroids[t])
+            # Compute within-team stats
+            team_mask = (team_ids == t)
+            if team_mask.sum() > 2:
+                team_dists = np.array([
+                    self._hsv_distance(player_hsv[j], centroids[t])
+                    for j in range(n_players) if team_ids[j] == t
+                ])
+                team_mean = float(np.mean(team_dists))
+                team_std = float(np.std(team_dists)) + 1e-6
+                if dist_to_own > team_mean + REF_DIST_THRESHOLD * team_std:
+                    team_ids[i] = -2
 
         return team_ids
 
