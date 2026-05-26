@@ -90,6 +90,7 @@ class KeypointPipeline:
                 'H_info'          : dict from KeypointHomographyComputer
                 'player_xyxy'     : player bboxes in image coords (N,4)
                 'player_conf'     : player confidences (N,)
+                'track_ids'       : (N,) int — ByteTrack track IDs per detection
                 'player_pitch_pts': player bottom-center in pitch coords (M,2)
                 'keypoints_used'  : list of used keypoint dicts
                 'seg_result'      : raw YOLO seg result
@@ -132,13 +133,16 @@ class KeypointPipeline:
             self.last_H_info = H_info
 
         # --------------------------------------------------------------
-        # 3. Player detection & projection
+        # 3. Player detection & projection (with ByteTrack tracking)
         # --------------------------------------------------------------
-        player_results = self.player_detector.model.predict(
-            frame, conf=PLAYER_CONF, verbose=False
-        )
-        formatted = self.player_detector.format_results(player_results[0])
-        player_xyxy, player_conf, _ = formatted if formatted is not None else (np.empty((0, 4), dtype=np.float32), np.empty((0,), dtype=np.float32), np.empty((0,), dtype=int))
+        # Use model.track() with persist=True for cross-frame track IDs
+        formatted = self.player_detector.track_players(frame, conf=PLAYER_CONF)
+        if formatted is not None:
+            player_xyxy, player_conf, _, track_ids = formatted
+        else:
+            player_xyxy = np.empty((0, 4), dtype=np.float32)
+            player_conf = np.empty((0,), dtype=np.float32)
+            track_ids = np.empty((0,), dtype=np.int32)
         player_pitch_pts = np.empty((0, 2), dtype=np.float32)
         if H is not None and len(player_xyxy) > 0:
             player_pitch_pts = self.player_detector.project_points(player_xyxy, H)
@@ -147,12 +151,12 @@ class KeypointPipeline:
                 player_pitch_pts[:, 0] = PITCH_LENGTH - player_pitch_pts[:, 0]
 
         # --------------------------------------------------------------
-        # 3b. Team color analysis
+        # 3b. Team color analysis (with per-track majority voting)
         # --------------------------------------------------------------
         team_info = None
         if self.team_analyzer is not None and len(player_xyxy) > 0:
             team_info = self.team_analyzer.assign_team_colors(
-                frame, player_xyxy, player_conf
+                frame, player_xyxy, player_conf, track_ids=track_ids
             )
 
         # --------------------------------------------------------------
@@ -220,6 +224,7 @@ class KeypointPipeline:
             'H_info': H_info,
             'player_xyxy': player_xyxy,
             'player_conf': player_conf,
+            'track_ids': track_ids,
             'player_pitch_pts': player_pitch_pts,
             'keypoints_used': used_kpts,
             'seg_result': seg_op,

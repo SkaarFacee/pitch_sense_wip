@@ -13,6 +13,7 @@ Improvements over v1:
 
 import numpy as np
 import cv2
+from collections import deque, Counter
 from sklearn.cluster import KMeans
 from constants import (
     TEAM_N_CLUSTERS,
@@ -50,6 +51,17 @@ class TeamColorAnalyzer:
     # BGR color for referee/unknown
     REF_COLOR = (0, 0, 0)  # Black
 
+    # Maximum frames of team assignment history to keep per track
+    MAX_HISTORY_LENGTH = 20
+    
+    # Minimum majority ratio required to change a track's team assignment.
+    # Higher = more stable (less flickering), but slower to adapt to real changes.
+    MAJORITY_THRESHOLD = 0.65
+    
+    # How much extra weight to give the most recent assignment.
+    # Helps stable tracks resist noise from occasional misclassifications.
+    RECENCY_WEIGHT = 1.5
+
     def __init__(self, n_clusters: int = TEAM_N_CLUSTERS):
         """
         Args:
@@ -61,6 +73,9 @@ class TeamColorAnalyzer:
         self.frame_counter = 0
         self.initialized = False
 
+        # Per-track team assignment history for cross-frame consistency
+        self.track_team_history = {}      # track_id -> deque of recent team IDs
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -70,6 +85,7 @@ class TeamColorAnalyzer:
         frame: np.ndarray,
         player_xyxy: np.ndarray,
         player_conf: np.ndarray,
+        track_ids: np.ndarray = None,
     ) -> dict:
         """
         Assign team colors to all detected players.
@@ -78,6 +94,9 @@ class TeamColorAnalyzer:
             frame: BGR image (H, W, 3).
             player_xyxy: Player bounding boxes (N, 4) in [x1, y1, x2, y2] format.
             player_conf: Confidence scores (N,).
+            track_ids: Optional (N,) int array of ByteTrack track IDs for
+                       cross-frame player identity. Enables per-track majority
+                       voting for stable team assignment.
 
         Returns:
             dict with keys:
@@ -117,6 +136,12 @@ class TeamColorAnalyzer:
         if not self.initialized or team_ids is None:
             return self._empty_result()
 
+        # ---- Step 2b: Per-track majority voting for stable team assignment ----
+        # Apply ByteTrack per-player history to smooth out frame-to-frame
+        # team label noise and detect K-means centroid label swaps.
+        if track_ids is not None and len(track_ids) > 0 and len(track_ids) == len(team_ids):
+            team_ids = self._apply_track_voting(track_ids, team_ids)
+
         # ---- Step 3: Build per-player color list ----
         centroids = self.team_centroids_bgr
         team_colors = []
@@ -149,6 +174,130 @@ class TeamColorAnalyzer:
             'team1_bgr': team1_bgr,
             'team2_bgr': team2_bgr,
         }
+
+    # ------------------------------------------------------------------
+    # Per-track team voting (ByteTrack integration)
+    # ------------------------------------------------------------------
+
+    def _apply_track_voting(
+        self,
+        track_ids: np.ndarray,
+        team_ids_raw: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Apply per-track RECENCY-WEIGHTED majority voting for stable team
+        assignments across frames.
+
+        Maintains a deque of recent team assignments per track_id. Uses a
+        weighted vote where the most recent assignment gets extra weight to
+        provide a "sticky" bias. Requires a clear majority (>MAJORITY_THRESHOLD)
+        to flip a track's team. If no clear majority, keeps the previous
+        assignment.
+
+        Also detects global label swaps (K-means centroid label flip) and
+        corrects all assignments when >60% of tracks simultaneously flip.
+
+        Args:
+            track_ids: (N,) int — ByteTrack track IDs per detection.
+            team_ids_raw: (N,) int — Raw team IDs from K-means/nearest-centroid.
+
+        Returns:
+            (N,) int — Smoothed team IDs after per-track voting + swap correction.
+        """
+        n = len(team_ids_raw)
+        stable_ids = np.copy(team_ids_raw).astype(np.int32)
+
+        # ---- Update per-track history ----
+        for i, tid in enumerate(track_ids):
+            tid = int(tid)
+            raw_team = int(team_ids_raw[i])
+
+            if tid not in self.track_team_history:
+                self.track_team_history[tid] = deque(maxlen=self.MAX_HISTORY_LENGTH)
+
+            self.track_team_history[tid].append(raw_team)
+
+        # ---- Apply recency-weighted majority voting ----
+        for i, tid in enumerate(track_ids):
+            tid = int(tid)
+            history = list(self.track_team_history[tid])
+
+            if len(history) >= 3:
+                # Only consider valid team assignments (0 or 1) for voting
+                valid_assignments = [t for t in history if t >= 0]
+                if len(valid_assignments) >= 2:
+                    # Weighted voting: most recent assignment gets RECENCY_WEIGHT
+                    weights = []
+                    team_values = []
+                    for pos, t in enumerate(valid_assignments):
+                        team_values.append(t)
+                        if pos == len(valid_assignments) - 1:
+                            weights.append(self.RECENCY_WEIGHT)  # Extra weight to latest
+                        else:
+                            weights.append(1.0)
+
+                    # Count weighted votes for each team
+                    vote_count = {0: 0.0, 1: 0.0}
+                    for team, w in zip(team_values, weights):
+                        if team in vote_count:
+                            vote_count[team] += w
+
+                    total_weight = sum(weights)
+                    best_team = max(vote_count, key=vote_count.get)
+                    best_ratio = vote_count[best_team] / total_weight
+
+                    # Only flip if clear majority. Otherwise keep previous assignment.
+                    if best_ratio >= self.MAJORITY_THRESHOLD:
+                        stable_ids[i] = best_team
+                    else:
+                        # No clear majority: keep the most common historical assignment
+                        # or the raw assignment if history is split
+                        if len(valid_assignments) >= 5:
+                            stable_ids[i] = max(vote_count, key=vote_count.get)
+                        # else keep raw assignment (already in stable_ids)
+
+        # ---- Global label swap detection ----
+        # If most tracks simultaneously flip teams, it means K-means centroids
+        # swapped their label mapping (Team 0 <-> Team 1).
+        tracks_with_history = [
+            int(tid) for tid in track_ids
+            if int(tid) in self.track_team_history
+            and len(self.track_team_history[int(tid)]) >= 4
+        ]
+
+        if len(tracks_with_history) >= 4:
+            flips = 0
+            for tid in tracks_with_history:
+                history = list(self.track_team_history[tid])
+                # Filter to valid team assignments only
+                valid = [t for t in history if t >= 0]
+                if len(valid) < 4:
+                    continue
+                half = len(valid) // 2
+                first_half = valid[:half]
+                second_half = valid[half:]
+                if first_half and second_half:
+                    first_team = Counter(first_half).most_common(1)[0][0]
+                    second_team = Counter(second_half).most_common(1)[0][0]
+                    if first_team != second_team:
+                        flips += 1
+
+            # If >60% of tracked players flipped teams, correct globally
+            if flips > len(tracks_with_history) * 0.6:
+                # Flip all team assignments
+                for i in range(n):
+                    if stable_ids[i] >= 0:  # Don't flip GK (-1) or Ref (-2)
+                        stable_ids[i] = 1 - stable_ids[i]
+                # Also correct the stored history to reflect the swap
+                for tid in tracks_with_history:
+                    corrected = deque(
+                        maxlen=self.MAX_HISTORY_LENGTH
+                    )
+                    for t in self.track_team_history[tid]:
+                        corrected.append(1 - t if t >= 0 else t)
+                    self.track_team_history[tid] = corrected
+
+        return stable_ids
 
     # ------------------------------------------------------------------
     # Color extraction
@@ -451,8 +600,9 @@ class TeamColorAnalyzer:
         }
 
     def reset(self):
-        """Reset cached centroids for a new video."""
+        """Reset cached centroids and track history for a new video."""
         self.team_centroids_hsv = None
         self.team_centroids_bgr = None
         self.frame_counter = 0
         self.initialized = False
+        self.track_team_history.clear()
