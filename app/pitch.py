@@ -1,5 +1,36 @@
-from constants import * 
-import numpy as np 
+from constants import (
+    CANVAS_H,
+    CANVAS_W,
+    DRAW_SCALE,
+    BORDER,
+    PITCH_LENGTH,
+    PITCH_WIDTH,
+    CENTER_X,
+    CENTER_Y,
+    CENTER_CIRCLE_RADIUS,
+    PENALTY_AREA_DEPTH,
+    PENALTY_AREA_WIDTH,
+    PENALTY_Y_TOP,
+    PENALTY_Y_BOTTOM,
+    GOAL_AREA_DEPTH,
+    GOAL_AREA_WIDTH,
+    GOAL_AREA_Y_TOP,
+    GOAL_AREA_Y_BOTTOM,
+    PENALTY_SPOT_DISTANCE,
+    PENALTY_ARC_RADIUS,
+    LEFT_PENALTY_X,
+    RIGHT_PENALTY_X,
+    LEFT_GOAL_AREA_X,
+    RIGHT_GOAL_AREA_X,
+    LEFT_PENALTY_SPOT_X,
+    RIGHT_PENALTY_SPOT_X,
+    GREEN,
+    WHITE,
+    WHITE_LINE_THICKNESS,
+    BALL_TRAIL_LENGTH,
+    BALL_DOT_COLOR,
+)
+import numpy as np
 import cv2
 class PitchArtist():
 
@@ -164,5 +195,113 @@ class PitchArtist():
         cv2.circle(out, (box_x + 18, box_y + 52), 10, (255, 255, 255), 1)
         cv2.putText(out, team2_label, (box_x + 32, box_y + 57),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+
+        return out
+
+    # ------------------------------------------------------------------
+    # Ball visualization methods
+    # ------------------------------------------------------------------
+    def draw_ball_on_pitch(
+        self,
+        img: np.ndarray,
+        ball_pitch_pt: np.ndarray,
+        ball_color: tuple = BALL_DOT_COLOR,
+    ) -> np.ndarray:
+        """
+        Draw the ball as a bright dot on the pitch canvas.
+
+        Args:
+            img: Pitch canvas (H, W, 3).
+            ball_pitch_pt: (2,) array — ball position on pitch in meters.
+            ball_color: BGR color for the ball dot.
+
+        Returns:
+            Canvas with ball dot drawn.
+        """
+        if ball_pitch_pt is None or len(ball_pitch_pt) < 2:
+            return img
+
+        out = img.copy()
+        pt_px = self.transform_coordinates_to_pixels(
+            ball_pitch_pt.reshape(1, 2)
+        )[0]
+        x, y = int(pt_px[0]), int(pt_px[1])
+
+        if x < 0 or y < 0 or x >= out.shape[1] or y >= out.shape[0]:
+            return out
+
+        # Draw ball as a larger, brighter dot with white outline
+        cv2.circle(out, (x, y), 10, ball_color, -1)
+        cv2.circle(out, (x, y), 12, (255, 255, 255), 2)
+        cv2.circle(out, (x, y), 14, (0, 0, 0), 1)
+
+        return out
+
+    def draw_ball_trajectory(
+        self,
+        img: np.ndarray,
+        trajectory: list,
+        max_trail: int = BALL_TRAIL_LENGTH,
+    ) -> np.ndarray:
+        """
+        Draw a fading trajectory trail of ball positions on the pitch canvas.
+
+        The trail fades from bright red (most recent) to orange (oldest),
+        with line segments connecting consecutive positions.
+
+        Args:
+            img: Pitch canvas (H, W, 3).
+            trajectory: List of (2,) pitch-coordinate arrays or [x, y] lists,
+                        ordered from oldest to newest.
+            max_trail: Maximum number of positions to display.
+
+        Returns:
+            Canvas with ball trajectory trail drawn.
+        """
+        if not trajectory:
+            return img
+
+        out = img.copy()
+
+        # Take the most recent N positions
+        recent = trajectory[-max_trail:]
+        if len(recent) < 2:
+            return out
+
+        # Convert to pixel coordinates
+        pts_np = np.array(recent, dtype=np.float32).reshape(-1, 2)
+        pts_px = self.transform_coordinates_to_pixels(pts_np)
+
+        # Draw trail as connected line segments with fading color
+        n_segments = len(pts_px) - 1
+        for i in range(n_segments):
+            x1, y1 = int(pts_px[i][0]), int(pts_px[i][1])
+            x2, y2 = int(pts_px[i + 1][0]), int(pts_px[i + 1][1])
+
+            # Skip out-of-bounds
+            if (x1 < 0 or y1 < 0 or x1 >= out.shape[1] or y1 >= out.shape[0] or
+                x2 < 0 or y2 < 0 or x2 >= out.shape[1] or y2 >= out.shape[0]):
+                continue
+
+            # Fading color: older = dark orange, newer = bright red
+            ratio = i / max(n_segments - 1, 1)
+            r = int(0 + ratio * 255)        # 0 → 255
+            g = int(165 * (1 - ratio))       # 165 → 0
+            b = 0
+            color = (b, g, r)
+
+            # Line thickness: thicker for newer segments
+            thickness = max(1, int(2 * ratio + 1))
+            cv2.line(out, (x1, y1), (x2, y2), color, thickness, cv2.LINE_AA)
+
+        # Draw small dots at each trajectory position
+        trail_color = (0, 165, 255)  # Orange
+        for i, (x, y) in enumerate(pts_px):
+            xi, yi = int(x), int(y)
+            if xi < 0 or yi < 0 or xi >= out.shape[1] or yi >= out.shape[0]:
+                continue
+            # Fade dot opacity: older = smaller
+            dot_radius = max(1, int(2 * (i / max(len(pts_px) - 1, 1)) + 1))
+            cv2.circle(out, (xi, yi), dot_radius, trail_color, -1)
 
         return out

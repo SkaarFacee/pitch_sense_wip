@@ -5,12 +5,13 @@ Pipeline flow per frame:
     Keypoint detection → Homography matrix
     Player detection → Bottom-center projection via H
     Team color analysis → Team segregation via K-means on jersey colors
+    Ball detection (dedicated ball model) → Projection via H → Trajectory trail
     Segmentation → Deep analysis overlay (on original frame + pitch canvas)
 
 Outputs:
-    - Annotated original frame (keypoints + seg masks + team-colored bboxes)
-    - Top-down pitch canvas (players projected + team-colored dots + legend)
-    - Deep analysis frame (seg overlay + team colors)
+    - Annotated original frame (keypoints + seg masks + team-colored bboxes + ball bbox)
+    - Top-down pitch canvas (players projected + team-colored dots + legend + ball + trail)
+    - Deep analysis frame (seg overlay + team colors + ball)
 """
 
 import cv2
@@ -26,9 +27,14 @@ from constants import (
     CANVAS_H,
     PITCH_LENGTH,
     PITCH_WIDTH,
+    BALL_CONF,
+    BALL_TRAIL_LENGTH,
+    BALL_BBOX_COLOR,
+    BALL_DOT_COLOR,
 )
 from keypoint_service import KeypointHomographyComputer, PitchKeypointMapper
 from player_service import PlayerDetector
+from ball_service import BallDetector
 from segmentation import Segmentor, BboxManipulor, GeometryManipulor
 from seg_helpers import CanvasMapper
 from pitch import PitchArtist
@@ -40,7 +46,8 @@ from team_analyzer import TeamColorAnalyzer
 class KeypointPipeline:
     """
     Orchestrates the full keypoint → homography → player projection →
-    team color analysis → segmentation analysis pipeline for each video frame.
+    team color analysis → ball detection → segmentation analysis pipeline
+    for each video frame.
     """
 
     def __init__(
@@ -48,6 +55,7 @@ class KeypointPipeline:
         keypoint_model_path: str,
         player_model_path: str,
         seg_model_path: str,
+        ball_model_path: str = "",
         flip_projection_x: bool = False,
         enable_team_colors: bool = True,
     ):
@@ -56,9 +64,11 @@ class KeypointPipeline:
             keypoint_model_path: Path to YOLO-Pose keypoint model.
             player_model_path: Path to YOLO player detection model.
             seg_model_path: Path to YOLO segmentation model.
+            ball_model_path: Path to YOLO ball detection model. If empty string,
+                             ball detection is disabled.
             flip_projection_x: If True, mirror the x-axis of projected player
-                               positions (PITCH_LENGTH - x). Fixes left-right
-                               flip caused by camera being on opposite side.
+                                positions (PITCH_LENGTH - x). Fixes left-right
+                                flip caused by camera being on opposite side.
             enable_team_colors: If True, run team color analysis per frame.
         """
         # Models
@@ -66,12 +76,14 @@ class KeypointPipeline:
         self.player_detector = PlayerDetector(player_model_path)
         self.segmentor = Segmentor(seg_model_path)
         self.team_analyzer = TeamColorAnalyzer() if enable_team_colors else None
+        self.ball_detector = BallDetector(ball_model_path, conf=BALL_CONF) if ball_model_path else None
 
         # State
         self.last_H = None
         self.last_H_info = None
         self.pitch_artist = PitchArtist()
         self.flip_projection_x = flip_projection_x
+        self.ball_trajectory = []  # List of (x, y) pitch-coords for trajectory trail
 
     # ------------------------------------------------------------------
     # Core pipeline
@@ -95,9 +107,13 @@ class KeypointPipeline:
                 'keypoints_used'  : list of used keypoint dicts
                 'seg_result'      : raw YOLO seg result
                 'processed_segments': list from Segmentor.extract()
-                'pitch_canvas'    : np.ndarray — top-down pitch with players
-                'annotated_frame' : np.ndarray — original frame with overlays
+                'pitch_canvas'    : np.ndarray — top-down pitch with players + ball
+                'annotated_frame' : np.ndarray — original frame with overlays + ball
                 'deep_analysis_frame': np.ndarray — frame with seg mask overlay
+                'ball_xyxy'       : (1,4) or empty — ball bbox in image coords
+                'ball_conf'       : (1,) or empty — ball confidence
+                'ball_pitch_pt'   : (2,) or None — ball on pitch in meters
+                'ball_trajectory' : list of past ball pitch positions
         """
         frame_h, frame_w = frame.shape[:2]
 
@@ -160,9 +176,38 @@ class KeypointPipeline:
             )
 
         # --------------------------------------------------------------
-        # 4. Pitch canvas (top-down view)
+        # 3c. Ball detection & projection (dedicated ball model)
+        # --------------------------------------------------------------
+        ball_xyxy = np.empty((0, 4), dtype=np.float32)
+        ball_conf = np.empty((0,), dtype=np.float32)
+        ball_pitch_pt = None
+
+        if self.ball_detector is not None:
+            ball_xyxy, ball_conf = self.ball_detector.detect_ball(frame)
+            if len(ball_xyxy) > 0 and H is not None:
+                ball_pitch_pt = self.ball_detector.project_ball_to_pitch(
+                    ball_xyxy, H,
+                    flip_x=self.flip_projection_x,
+                    pitch_length=PITCH_LENGTH,
+                )
+                # Update trajectory
+                self.ball_trajectory.append(ball_pitch_pt.copy())
+                # Keep only the last N positions
+                if len(self.ball_trajectory) > BALL_TRAIL_LENGTH:
+                    self.ball_trajectory.pop(0)
+
+        # --------------------------------------------------------------
+        # 4. Pitch canvas (top-down view) with players + ball + trail
         # --------------------------------------------------------------
         pitch_canvas = self.pitch_artist.draw_pitch_base()
+
+        # Draw ball trajectory trail FIRST (behind players & ball)
+        if len(self.ball_trajectory) > 1:
+            pitch_canvas = self.pitch_artist.draw_ball_trajectory(
+                pitch_canvas, self.ball_trajectory, max_trail=BALL_TRAIL_LENGTH
+            )
+
+        # Draw players
         if len(player_pitch_pts) > 0:
             # Filter points that are within pitch bounds
             valid_mask = (
@@ -194,8 +239,14 @@ class KeypointPipeline:
                     team2_label="Team 2",
                 )
 
+        # Draw ball dot on pitch canvas (on top of players)
+        if ball_pitch_pt is not None:
+            pitch_canvas = self.pitch_artist.draw_ball_on_pitch(
+                pitch_canvas, ball_pitch_pt, ball_color=BALL_DOT_COLOR
+            )
+
         # --------------------------------------------------------------
-        # 5. Annotated frames with keypoints + team-colored bboxes
+        # 5. Annotated frames with keypoints + team-colored bboxes + ball bbox
         # --------------------------------------------------------------
         used_kpts = H_info.get('used_keypoints', [])
         annotated_frame = self._draw_keypoints_on_frame(frame, used_kpts)
@@ -206,7 +257,13 @@ class KeypointPipeline:
                 player_conf=player_conf,
             )
 
-        # Deep analysis frame with seg overlay + keypoints + team bboxes
+        # Draw ball bounding box on annotated frame
+        if len(ball_xyxy) > 0:
+            annotated_frame = self._draw_ball_bbox(
+                annotated_frame, ball_xyxy, ball_conf, color=BALL_BBOX_COLOR
+            )
+
+        # Deep analysis frame with seg overlay + keypoints + team bboxes + ball
         if used_kpts:
             deep_analysis_frame = self._draw_keypoints_on_frame(
                 seg_overlay_frame, used_kpts
@@ -217,6 +274,10 @@ class KeypointPipeline:
             deep_analysis_frame = self._draw_team_bboxes(
                 deep_analysis_frame, player_xyxy, team_info['team_colors'],
                 player_conf=player_conf,
+            )
+        if len(ball_xyxy) > 0:
+            deep_analysis_frame = self._draw_ball_bbox(
+                deep_analysis_frame, ball_xyxy, ball_conf, color=BALL_BBOX_COLOR
             )
 
         return {
@@ -233,6 +294,11 @@ class KeypointPipeline:
             'annotated_frame': annotated_frame,
             'deep_analysis_frame': deep_analysis_frame,
             'team_info': team_info,
+            # Ball detection outputs
+            'ball_xyxy': ball_xyxy,
+            'ball_conf': ball_conf,
+            'ball_pitch_pt': ball_pitch_pt,
+            'ball_trajectory': list(self.ball_trajectory),
         }
 
     # ------------------------------------------------------------------
@@ -414,6 +480,64 @@ class KeypointPipeline:
 
         return out
 
+    def _draw_ball_bbox(
+        self,
+        frame: np.ndarray,
+        ball_xyxy: np.ndarray,
+        ball_conf: np.ndarray,
+        color: tuple = BALL_BBOX_COLOR,
+    ) -> np.ndarray:
+        """
+        Draw ball bounding box on the frame with a "Ball" label.
+
+        Args:
+            frame: BGR image (H, W, 3).
+            ball_xyxy: (1, 4) array [x1, y1, x2, y2].
+            ball_conf: (1,) confidence array.
+            color: BGR tuple for the ball bbox.
+
+        Returns:
+            Frame with ball bbox drawn.
+        """
+        if len(ball_xyxy) == 0:
+            return frame
+
+        out = frame.copy()
+        x1, y1, x2, y2 = map(int, ball_xyxy[0])
+        # Clamp to frame bounds
+        x1 = max(0, x1)
+        y1 = max(0, y1)
+        x2 = min(frame.shape[1] - 1, x2)
+        y2 = min(frame.shape[0] - 1, y2)
+
+        # Draw solid bounding box with high opacity (more visible for small ball)
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, 3)
+
+        # Draw label with confidence
+        conf = ball_conf[0] if len(ball_conf) > 0 else 0.0
+        label = f"Ball {conf:.2f}"
+        font_scale = 0.6
+        thickness = 2
+        (tw, th), baseline = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness
+        )
+
+        # Position label above the bbox
+        tx = x1
+        ty = y1 - 5
+        if ty - th < 0:
+            ty = y2 + th + 5
+
+        # Draw background rectangle for label text
+        cv2.rectangle(out, (tx - 2, ty - th - 2), (tx + tw + 2, ty + 2),
+                      (0, 0, 0), -1)
+
+        # Draw text
+        cv2.putText(out, label, (tx, ty),
+                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness, cv2.LINE_AA)
+
+        return out
+
     # ------------------------------------------------------------------
     # Video processing
     # ------------------------------------------------------------------
@@ -430,9 +554,9 @@ class KeypointPipeline:
         Process an entire video and produce output videos.
 
         Outputs:
-            - full_pitch_debug_map.mp4: Top-down pitch view
-            - annotated_video.mp4: Original frame with keypoints + team bboxes
-            - deep_analysis.mp4: Original frame with segmentation overlay
+            - full_pitch_debug_map.mp4: Top-down pitch view (with ball + trajectory)
+            - annotated_video.mp4: Original frame with keypoints + team bboxes + ball bbox
+            - deep_analysis.mp4: Original frame with segmentation overlay + ball
             - final_draft.mp4: Original frame with pitch debug map overlayed (PIP)
 
         Args:
@@ -486,6 +610,8 @@ class KeypointPipeline:
 
         frame_idx = 0
         processed_count = 0
+        # Reset ball trajectory for new video
+        self.ball_trajectory = []
 
         try:
             while True:
@@ -543,9 +669,11 @@ class KeypointPipeline:
                     mode = result['H_info'].get('mode', '?')
                     n_kpts = len(result['H_info'].get('used_keypoints', []))
                     n_players = len(result['player_pitch_pts'])
+                    has_ball = len(result.get('ball_xyxy', [])) > 0
+                    ball_str = f", ball={'YES' if has_ball else 'no'}"
                     print(
                         f"  Frame {frame_idx}: H={mode}, "
-                        f"kpts={n_kpts}, players={n_players}"
+                        f"kpts={n_kpts}, players={n_players}{ball_str}"
                     )
 
                 yield result

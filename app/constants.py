@@ -65,7 +65,13 @@ GREEN=(34, 139, 34)
 WHITE=(255, 255, 255)
 WHITE_LINE_THICKNESS=2
 
-# SegmentationPriority 
+# Ball detection
+BALL_CONF = 0.25                  # Confidence threshold for ball detection
+BALL_TRAIL_LENGTH = 50            # Number of past positions for ball trajectory trail
+BALL_BBOX_COLOR = (0, 255, 0)     # Green for ball bbox on annotated frame
+BALL_DOT_COLOR = (0, 255, 255)    # Yellow for ball dot on pitch canvas
+
+# SegmentationPriority
 SEGMENTATION_PRIORITY = {
     "18Yard": 140,
     "5Yard": 170,
