@@ -36,6 +36,8 @@ from constants import (
     LEFT_PENALTY_SPOT_X,
     RIGHT_PENALTY_SPOT_X,
     REUSE_LAST_HOMOGRAPHY,
+    SMOOTHING_ALPHA,
+    H_STABILITY_THRESHOLD,
 )
 
 
@@ -148,6 +150,9 @@ class KeypointHomographyComputer:
     Runs YOLO-Pose keypoint inference, filters keypoints by confidence,
     maps them to real-world pitch coordinates, and computes the
     homography matrix via DLT (Direct Linear Transform).
+
+    Supports temporal smoothing of the homography matrix to reduce
+    frame-to-frame jitter in the output video.
     """
 
     def __init__(
@@ -156,6 +161,8 @@ class KeypointHomographyComputer:
         conf_threshold: float = KEYPOINT_CONF,
         min_conf_threshold: float = KEYPOINT_MIN_CONF,
         exclude_kpt_ids: set = None,
+        smoothing_alpha: float = SMOOTHING_ALPHA,
+        stability_threshold: float = H_STABILITY_THRESHOLD,
     ):
         """
         Args:
@@ -165,10 +172,17 @@ class KeypointHomographyComputer:
             exclude_kpt_ids: Set of keypoint IDs to exclude (e.g. collinear
                    points that would make the homography degenerate).
                    Default excludes keypoint 15 (field_center).
+            smoothing_alpha: EMA factor for temporal H smoothing
+                   (0 = no update from new H, 1 = instant update, no smoothing).
+            stability_threshold: Max relative Frobenius-norm change between
+                   successive H matrices before rejecting a new H as unstable.
         """
         self.model = YOLO(model_path)
         self.conf_threshold = conf_threshold
         self.min_conf_threshold = min_conf_threshold
+        self.smoothing_alpha = smoothing_alpha
+        self.stability_threshold = stability_threshold
+        self.smoothed_H = None  # Accumulator for EMA smoothing
         # Exclude perfectly collinear center-line keypoints (all on same x=CENTER_X line),
         # which cause degenerate homography when over-represented.
         # Excluded: 11=center_line_top, 12=center_line_bottom, 15=field_center
@@ -424,9 +438,60 @@ class KeypointHomographyComputer:
             info['mode'] = 'keypoint-ransac'
             info['inliers'] = inliers
             info['H'] = H
+
+            # ---- Step 6: Temporal smoothing (EMA + stability gate) ----
+            H = self._apply_homography_smoothing(H, last_H)
+
+            info['H'] = H
             return H, info
         else:
             return self._fallback_or_none(last_H, info, 'ransac-failed')
+
+    def _apply_homography_smoothing(
+        self, raw_H: np.ndarray, last_H: np.ndarray
+    ) -> np.ndarray:
+        """
+        Apply temporal smoothing to the homography matrix using EMA
+        (Exponential Moving Average), with a stability gate to reject
+        large sudden changes.
+
+        Strategy:
+            1. If no previous smoothed_H exists, initialize it with raw_H.
+            2. If a stability_threshold is set, compute the relative
+               Frobenius-norm change between raw_H and smoothed_H.
+               If the change exceeds the threshold, reject raw_H and
+               keep the previous smoothed_H (or fall back to last_H).
+            3. Apply EMA: smoothed_H = alpha * raw_H + (1 - alpha) * smoothed_H.
+            4. Normalize H[2,2] to 1.0 to keep it a valid homography.
+
+        Args:
+            raw_H: Freshly computed homography from RANSAC.
+            last_H: Previous frame's H for fallback (same as self.smoothed_H
+                    in typical usage).
+
+        Returns:
+            Smoothed homography matrix (3x3).
+        """
+        # ---- Stability gate: reject H if it changes too drastically ----
+        if self.smoothed_H is not None and self.stability_threshold > 0:
+            change = np.linalg.norm(raw_H - self.smoothed_H) / (
+                np.linalg.norm(self.smoothed_H) + 1e-10
+            )
+            if change > self.stability_threshold:
+                # Reject — keep the previous smoothed matrix
+                return self.smoothed_H
+
+        # ---- EMA smoothing ----
+        if self.smoothed_H is None:
+            self.smoothed_H = raw_H.copy()
+        else:
+            alpha = self.smoothing_alpha
+            self.smoothed_H = alpha * raw_H + (1.0 - alpha) * self.smoothed_H
+
+        # Normalize H[2,2] to 1.0
+        self.smoothed_H = self.smoothed_H / self.smoothed_H[2, 2]
+
+        return self.smoothed_H
 
     def _fallback_or_none(self, last_H, info, reason: str):
         """Try fallback to last_H or return None."""
@@ -434,5 +499,16 @@ class KeypointHomographyComputer:
         if REUSE_LAST_HOMOGRAPHY and last_H is not None:
             info['mode'] = 'fallback-last'
             info['H'] = last_H
+            # When falling back, also sync the smoothed_H to prevent
+            # a sudden jump when a new H is eventually accepted.
+            if self.smoothed_H is not None:
+                # Blend last_H into smoothed_H to keep it warm
+                alpha = self.smoothing_alpha * 0.5  # gentle blend on fallback
+                self.smoothed_H = (
+                    alpha * last_H + (1.0 - alpha) * self.smoothed_H
+                )
+                self.smoothed_H = self.smoothed_H / self.smoothed_H[2, 2]
+            else:
+                self.smoothed_H = last_H.copy()
             return last_H, info
         return None, info

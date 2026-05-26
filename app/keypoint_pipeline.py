@@ -4,11 +4,13 @@ KeypointPipeline — End-to-end pipeline orchestrator.
 Pipeline flow per frame:
     Keypoint detection → Homography matrix
     Player detection → Bottom-center projection via H
+    Team color analysis → Team segregation via K-means on jersey colors
     Segmentation → Deep analysis overlay (on original frame + pitch canvas)
 
 Outputs:
-    - Annotated original frame (keypoints + seg masks)
-    - Top-down pitch canvas (players projected + seg overlay)
+    - Annotated original frame (keypoints + seg masks + team-colored bboxes)
+    - Top-down pitch canvas (players projected + team-colored dots + legend)
+    - Deep analysis frame (seg overlay + team colors)
 """
 
 import cv2
@@ -32,12 +34,13 @@ from seg_helpers import CanvasMapper
 from pitch import PitchArtist
 from seg_plural import BestSegmentPicker
 from director import Director
+from team_analyzer import TeamColorAnalyzer
 
 
 class KeypointPipeline:
     """
     Orchestrates the full keypoint → homography → player projection →
-    segmentation analysis pipeline for each video frame.
+    team color analysis → segmentation analysis pipeline for each video frame.
     """
 
     def __init__(
@@ -46,6 +49,7 @@ class KeypointPipeline:
         player_model_path: str,
         seg_model_path: str,
         flip_projection_x: bool = False,
+        enable_team_colors: bool = True,
     ):
         """
         Args:
@@ -55,11 +59,13 @@ class KeypointPipeline:
             flip_projection_x: If True, mirror the x-axis of projected player
                                positions (PITCH_LENGTH - x). Fixes left-right
                                flip caused by camera being on opposite side.
+            enable_team_colors: If True, run team color analysis per frame.
         """
         # Models
         self.keypoint_computer = KeypointHomographyComputer(keypoint_model_path)
         self.player_detector = PlayerDetector(player_model_path)
         self.segmentor = Segmentor(seg_model_path)
+        self.team_analyzer = TeamColorAnalyzer() if enable_team_colors else None
 
         # State
         self.last_H = None
@@ -141,6 +147,15 @@ class KeypointPipeline:
                 player_pitch_pts[:, 0] = PITCH_LENGTH - player_pitch_pts[:, 0]
 
         # --------------------------------------------------------------
+        # 3b. Team color analysis
+        # --------------------------------------------------------------
+        team_info = None
+        if self.team_analyzer is not None and len(player_xyxy) > 0:
+            team_info = self.team_analyzer.assign_team_colors(
+                frame, player_xyxy, player_conf
+            )
+
+        # --------------------------------------------------------------
         # 4. Pitch canvas (top-down view)
         # --------------------------------------------------------------
         pitch_canvas = self.pitch_artist.draw_pitch_base()
@@ -154,22 +169,49 @@ class KeypointPipeline:
             )
             valid_pts = player_pitch_pts[valid_mask]
             if len(valid_pts) > 0:
+                # Get per-player team colors for valid points only
+                colors = None
+                if team_info is not None:
+                    colors = team_info['team_colors']
+                    # Filter colors to match valid_mask
+                    colors = [colors[i] for i in range(len(colors)) if valid_mask[i]] if len(colors) == len(valid_mask) else None
+
                 pitch_canvas = self.pitch_artist.draw_players_on_pitch(
-                    pitch_canvas, valid_pts, color=(0, 0, 255)
+                    pitch_canvas, valid_pts, colors=colors, default_color=(0, 0, 255)
+                )
+
+            # Add team legend
+            if team_info is not None:
+                pitch_canvas = self.pitch_artist.draw_team_legend(
+                    pitch_canvas,
+                    team_info['team1_bgr'],
+                    team_info['team2_bgr'],
+                    team1_label="Team 1",
+                    team2_label="Team 2",
                 )
 
         # --------------------------------------------------------------
-        # 5. Annotated frames with keypoints
+        # 5. Annotated frames with keypoints + team-colored bboxes
         # --------------------------------------------------------------
         used_kpts = H_info.get('used_keypoints', [])
         annotated_frame = self._draw_keypoints_on_frame(frame, used_kpts)
-        # Also add keypoints to the deep analysis overlay
+        # Overlay team-colored player bounding boxes
+        if team_info is not None and len(player_xyxy) > 0:
+            annotated_frame = self._draw_team_bboxes(
+                annotated_frame, player_xyxy, team_info['team_colors']
+            )
+
+        # Deep analysis frame with seg overlay + keypoints + team bboxes
         if used_kpts:
             deep_analysis_frame = self._draw_keypoints_on_frame(
                 seg_overlay_frame, used_kpts
             )
         else:
             deep_analysis_frame = seg_overlay_frame
+        if team_info is not None and len(player_xyxy) > 0:
+            deep_analysis_frame = self._draw_team_bboxes(
+                deep_analysis_frame, player_xyxy, team_info['team_colors']
+            )
 
         return {
             'H': H,
@@ -183,6 +225,7 @@ class KeypointPipeline:
             'pitch_canvas': pitch_canvas,
             'annotated_frame': annotated_frame,
             'deep_analysis_frame': deep_analysis_frame,
+            'team_info': team_info,
         }
 
     # ------------------------------------------------------------------
@@ -291,6 +334,43 @@ class KeypointPipeline:
 
         return out
 
+    def _draw_team_bboxes(
+        self,
+        frame: np.ndarray,
+        player_xyxy: np.ndarray,
+        team_colors: list,
+    ) -> np.ndarray:
+        """
+        Draw team-colored bounding boxes around detected players.
+
+        Args:
+            frame: BGR image (H, W, 3).
+            player_xyxy: (N, 4) array of bboxes in [x1, y1, x2, y2].
+            team_colors: List of N BGR tuples, one per player.
+
+        Returns:
+            Frame with bounding boxes drawn.
+        """
+        out = frame.copy()
+        n = min(len(player_xyxy), len(team_colors))
+        for i in range(n):
+            x1, y1, x2, y2 = map(int, player_xyxy[i])
+            # Clamp to frame bounds
+            x1 = max(0, x1)
+            y1 = max(0, y1)
+            x2 = min(frame.shape[1] - 1, x2)
+            y2 = min(frame.shape[0] - 1, y2)
+
+            color = team_colors[i]
+            # Draw filled rectangle with low opacity for the bbox
+            overlay = out.copy()
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
+            cv2.addWeighted(overlay, 0.25, out, 0.75, 0, out)
+            # Draw border
+            cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+
+        return out
+
     # ------------------------------------------------------------------
     # Video processing
     # ------------------------------------------------------------------
@@ -305,6 +385,12 @@ class KeypointPipeline:
     ):
         """
         Process an entire video and produce output videos.
+
+        Outputs:
+            - full_pitch_debug_map.mp4: Top-down pitch view
+            - annotated_video.mp4: Original frame with keypoints + team bboxes
+            - deep_analysis.mp4: Original frame with segmentation overlay
+            - final_draft.mp4: Original frame with pitch debug map overlayed (PIP)
 
         Args:
             source_video_path: Path to input video.
@@ -323,6 +409,7 @@ class KeypointPipeline:
         full_pitch_path = output_path / "full_pitch_debug_map.mp4"
         annotated_path = output_path / "annotated_video.mp4"
         deep_analysis_path = output_path / "deep_analysis.mp4"
+        final_draft_path = output_path / "final_draft.mp4"
 
         cap = cv2.VideoCapture(source_video_path)
         if not cap.isOpened():
@@ -349,6 +436,9 @@ class KeypointPipeline:
         )
         deep_writer = Director.make_video_writer(
             deep_analysis_path, actual_fps, (frame_w, frame_h)
+        )
+        final_draft_writer = Director.make_video_writer(
+            final_draft_path, actual_fps, (frame_w, frame_h)
         )
 
         frame_idx = 0
@@ -378,6 +468,33 @@ class KeypointPipeline:
                 if result['deep_analysis_frame'] is not None:
                     deep_writer.write(result['deep_analysis_frame'])
 
+                # Build final_draft frame: overlay pitch canvas onto original frame
+                if result['pitch_canvas'] is not None:
+                    # Make a copy of the raw (non-annotated) original frame
+                    final_draft_frame = frame.copy()
+                    # Resize pitch canvas to ~25% of frame width, place bottom-right
+                    pip_width = frame_w // 4
+                    pip_height = int(pip_width * CANVAS_H / CANVAS_W)
+                    pip_canvas = cv2.resize(result['pitch_canvas'], (pip_width, pip_height))
+                    # Overlay with a semi-transparent border background
+                    x_offset = frame_w - pip_width - 15
+                    y_offset = frame_h - pip_height - 15
+                    # Dark semi-transparent background behind the PIP
+                    overlay = final_draft_frame.copy()
+                    cv2.rectangle(overlay,
+                        (x_offset - 5, y_offset - 5),
+                        (x_offset + pip_width + 5, y_offset + pip_height + 5),
+                        (0, 0, 0), -1)
+                    cv2.addWeighted(overlay, 0.4, final_draft_frame, 0.6, 0, final_draft_frame)
+                    # Paste the resized pitch canvas
+                    final_draft_frame[y_offset:y_offset + pip_height, x_offset:x_offset + pip_width] = pip_canvas
+                    # Add a white border
+                    cv2.rectangle(final_draft_frame,
+                        (x_offset - 2, y_offset - 2),
+                        (x_offset + pip_width + 2, y_offset + pip_height + 2),
+                        (255, 255, 255), 2)
+                    final_draft_writer.write(final_draft_frame)
+
                 # Log every 30 frames
                 if processed_count % 30 == 0:
                     mode = result['H_info'].get('mode', '?')
@@ -396,7 +513,9 @@ class KeypointPipeline:
             pitch_writer.release()
             annotated_writer.release()
             deep_writer.release()
+            final_draft_writer.release()
             print(f"\nDone. Processed {processed_count} frames.")
             print(f"  Pitch canvas:  {full_pitch_path}")
             print(f"  Annotated:     {annotated_path}")
             print(f"  Deep analysis: {deep_analysis_path}")
+            print(f"  Final draft:   {final_draft_path}")

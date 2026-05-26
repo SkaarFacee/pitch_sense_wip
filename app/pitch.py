@@ -75,7 +75,25 @@ class PitchArtist():
 
 
 
-    def draw_players_on_pitch(self,img, player_points_pitch, labels=None, color=(0, 0, 255)):
+    def draw_players_on_pitch(
+        self,
+        img,
+        player_points_pitch,
+        labels=None,
+        colors=None,
+        default_color=(0, 0, 255),
+    ):
+        """
+        Draw players on the pitch canvas.
+
+        Args:
+            img: Pitch canvas (H, W, 3).
+            player_points_pitch: (N, 2) array of pitch coordinates in meters.
+            labels: Optional list of labels for each player.
+            colors: Optional list of BGR tuples, one per player.
+                    If provided, each player dot uses its color.
+            default_color: Fallback color when colors is None or missing.
+        """
         out = img.copy()
 
         if player_points_pitch is None or len(player_points_pitch) == 0:
@@ -90,18 +108,61 @@ class PitchArtist():
             if x < 0 or y < 0 or x >= out.shape[1] or y >= out.shape[0]:
                 continue
 
-            cv2.circle(out, (x, y), 8, color, -1)
+            # Use per-player color if available
+            if colors is not None and i < len(colors):
+                color = colors[i]
+            else:
+                color = default_color
 
-            label = str(i) if labels is None else str(labels[i])
-            cv2.putText(
-                out,
-                label,
-                (x + 8, y - 8),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (255, 255, 255),
-                1,
-                cv2.LINE_AA,
-            )
+            cv2.circle(out, (x, y), 8, color, -1)
+            # Outline for better visibility against pitch
+            cv2.circle(out, (x, y), 10, (255, 255, 255), 1)
+
+        return out
+
+    def draw_team_legend(
+        self,
+        img,
+        team1_color,
+        team2_color,
+        team1_label="Team 1",
+        team2_label="Team 2",
+    ):
+        """
+        Draw a color legend in the top-right corner of the pitch canvas.
+
+        Args:
+            img: Pitch canvas (H, W, 3).
+            team1_color: BGR tuple for Team 1.
+            team2_color: BGR tuple for Team 2.
+            team1_label: Display name for Team 1.
+            team2_label: Display name for Team 2.
+        """
+        out = img.copy()
+        h, w = out.shape[:2]
+
+        # Legend box dimensions
+        box_x = w - 200
+        box_y = 10
+        box_w = 185
+        box_h = 70
+
+        # Semi-transparent background
+        overlay = out.copy()
+        cv2.rectangle(overlay, (box_x, box_y), (box_x + box_w, box_y + box_h),
+                      (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.5, out, 0.5, 0, out)
+
+        # Team 1 swatch
+        cv2.circle(out, (box_x + 18, box_y + 22), 8, tuple(map(int, team1_color)), -1)
+        cv2.circle(out, (box_x + 18, box_y + 22), 10, (255, 255, 255), 1)
+        cv2.putText(out, team1_label, (box_x + 32, box_y + 27),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+
+        # Team 2 swatch
+        cv2.circle(out, (box_x + 18, box_y + 52), 8, tuple(map(int, team2_color)), -1)
+        cv2.circle(out, (box_x + 18, box_y + 52), 10, (255, 255, 255), 1)
+        cv2.putText(out, team2_label, (box_x + 32, box_y + 57),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
         return out

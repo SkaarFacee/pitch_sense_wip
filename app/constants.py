@@ -8,6 +8,21 @@ MAX_FRAMES = None
 PROCESS_EVERY_N_FRAMES = 1
 REUSE_LAST_HOMOGRAPHY = True
 
+# Homography temporal smoothing — reduces frame-to-frame jitter
+SMOOTHING_ALPHA = 0.4       # EMA factor (0=no update, 1=instant). Lower = smoother.
+H_STABILITY_THRESHOLD = 0.15  # Max relative change (Frobenius norm) to accept new H
+
+# Team color analysis
+TEAM_N_CLUSTERS = 2           # Number of teams to cluster (usually 2)
+TEAM_JERSEY_Y_START = 0.12   # Top of jersey crop as fraction of bbox height (12% from top, avoids head)
+TEAM_JERSEY_Y_END = 0.50     # Bottom of jersey crop as fraction of bbox height (50% from top, avoids shorts)
+TEAM_JERSEY_X_START = 0.15   # Left crop as fraction of bbox width (15% from left, avoids arms)
+TEAM_JERSEY_X_END = 0.85     # Right crop as fraction of bbox width (85% from left)
+GREEN_HSV_LOWER = (30, 30, 30)    # Lower HSV bound to exclude pitch green (wider range)
+GREEN_HSV_UPPER = (90, 255, 255)  # Upper HSV bound for green mask
+COLOR_CACHE_REFRESH_N = 5     # Recompute team centroids every N frames (frequent refresh)
+GK_COLOR_DIST_THRESHOLD = 2.5  # Std-dev multiplier to flag goalkeeper colors (more permissive)
+
 
 # PITCH GEOMETRY
 PITCH_LENGTH = 105.0
