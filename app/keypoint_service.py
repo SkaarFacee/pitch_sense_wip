@@ -3,9 +3,9 @@ Keypoint-based homography computation for football pitch registration.
 
 Pipeline:
     YOLO-Pose inference → 29 keypoints
-        ↓ filter by confidence & visibility
+        ↓ filter by confidence threshold (KEYPOINT_MIN_CONF)
         ↓ map keypoint_id → real-world pitch coordinate
-        ↓ cv2.findHomography(RANSAC) → H matrix
+        ↓ cv2.findHomography(DLT) → H matrix
 """
 
 from ultralytics import YOLO
@@ -13,7 +13,7 @@ import numpy as np
 import cv2
 from constants import (
     KEYPOINT_CONF,
-    KEYPOINT_VISIBILITY,
+    KEYPOINT_MIN_CONF,
     PITCH_LENGTH,
     PITCH_WIDTH,
     CENTER_X,
@@ -83,16 +83,18 @@ class PitchKeypointMapper:
         # Left sideline
         0: (0.0, 0.0),                       # sideline_top_left
         9: (0.0, PITCH_WIDTH),               # sideline_bottom_left
-        # Left penalty area (big_rect) — clockwise from outer-top
+        # Left penalty area (big_rect)
+        # pt1 = outer (sideline side, x=0), pt2 = inner (center side, x=LEFT_PENALTY_X)
         1: (0.0, PENALTY_Y_TOP),             # big_rect_left_top_pt1 (outer)
         2: (LEFT_PENALTY_X, PENALTY_Y_TOP),  # big_rect_left_top_pt2 (inner)
-        3: (LEFT_PENALTY_X, PENALTY_Y_BOTTOM), # big_rect_left_bottom_pt1 (inner)
-        4: (0.0, PENALTY_Y_BOTTOM),          # big_rect_left_bottom_pt2 (outer)
-        # Left goal area (small_rect) — clockwise from outer-top
+        3: (0.0, PENALTY_Y_BOTTOM),          # big_rect_left_bottom_pt1 (outer)
+        4: (LEFT_PENALTY_X, PENALTY_Y_BOTTOM), # big_rect_left_bottom_pt2 (inner)
+        # Left goal area (small_rect)
+        # pt1 = outer (sideline side, x=0), pt2 = inner (center side, x=LEFT_GOAL_AREA_X)
         5: (0.0, GOAL_AREA_Y_TOP),           # small_rect_left_top_pt1 (outer)
         6: (LEFT_GOAL_AREA_X, GOAL_AREA_Y_TOP), # small_rect_left_top_pt2 (inner)
-        7: (LEFT_GOAL_AREA_X, GOAL_AREA_Y_BOTTOM), # small_rect_left_bottom_pt1 (inner)
-        8: (0.0, GOAL_AREA_Y_BOTTOM),        # small_rect_left_bottom_pt2 (outer)
+        7: (0.0, GOAL_AREA_Y_BOTTOM),        # small_rect_left_bottom_pt1 (outer)
+        8: (LEFT_GOAL_AREA_X, GOAL_AREA_Y_BOTTOM), # small_rect_left_bottom_pt2 (inner)
         # Left D-box arc
         10: (LEFT_PENALTY_SPOT_X + PENALTY_ARC_RADIUS, CENTER_Y),  # left_semicircle_right
         # Center line & circle
@@ -106,14 +108,16 @@ class PitchKeypointMapper:
         # Right sideline
         16: (PITCH_LENGTH, 0.0),              # sideline_top_right
         25: (PITCH_LENGTH, PITCH_WIDTH),      # sideline_bottom_right
-        # Right penalty area (big_rect) — clockwise from inner-top
-        17: (RIGHT_PENALTY_X, PENALTY_Y_TOP),  # big_rect_right_top_pt1 (inner)
-        18: (PITCH_LENGTH, PENALTY_Y_TOP),    # big_rect_right_top_pt2 (outer)
+        # Right penalty area (big_rect)
+        # pt1 = outer (sideline side, x=PITCH_LENGTH), pt2 = inner (center side, x=RIGHT_PENALTY_X)
+        17: (PITCH_LENGTH, PENALTY_Y_TOP),    # big_rect_right_top_pt1 (outer)
+        18: (RIGHT_PENALTY_X, PENALTY_Y_TOP), # big_rect_right_top_pt2 (inner)
         19: (PITCH_LENGTH, PENALTY_Y_BOTTOM), # big_rect_right_bottom_pt1 (outer)
         20: (RIGHT_PENALTY_X, PENALTY_Y_BOTTOM), # big_rect_right_bottom_pt2 (inner)
-        # Right goal area (small_rect) — clockwise from inner-top
-        21: (RIGHT_GOAL_AREA_X, GOAL_AREA_Y_TOP),   # small_rect_right_top_pt1 (inner)
-        22: (PITCH_LENGTH, GOAL_AREA_Y_TOP),        # small_rect_right_top_pt2 (outer)
+        # Right goal area (small_rect)
+        # pt1 = outer (sideline side, x=PITCH_LENGTH), pt2 = inner (center side, x=RIGHT_GOAL_AREA_X)
+        21: (PITCH_LENGTH, GOAL_AREA_Y_TOP),        # small_rect_right_top_pt1 (outer)
+        22: (RIGHT_GOAL_AREA_X, GOAL_AREA_Y_TOP),   # small_rect_right_top_pt2 (inner)
         23: (PITCH_LENGTH, GOAL_AREA_Y_BOTTOM),     # small_rect_right_bottom_pt1 (outer)
         24: (RIGHT_GOAL_AREA_X, GOAL_AREA_Y_BOTTOM),# small_rect_right_bottom_pt2 (inner)
         # Right D-box arc
@@ -141,37 +145,37 @@ class PitchKeypointMapper:
 
 class KeypointHomographyComputer:
     """
-    Runs YOLO-Pose keypoint inference, filters keypoints by confidence and
-    visibility, maps them to real-world pitch coordinates, and computes the
-    homography matrix via RANSAC.
+    Runs YOLO-Pose keypoint inference, filters keypoints by confidence,
+    maps them to real-world pitch coordinates, and computes the
+    homography matrix via DLT (Direct Linear Transform).
     """
 
     def __init__(
         self,
         model_path: str,
         conf_threshold: float = KEYPOINT_CONF,
-        visibility_threshold: float = KEYPOINT_VISIBILITY,
-        top_k: int = 4,
+        min_conf_threshold: float = KEYPOINT_MIN_CONF,
         exclude_kpt_ids: set = None,
     ):
         """
         Args:
             model_path: Path to the YOLO-Pose model (.pt file).
             conf_threshold: Minimum overall detection confidence.
-            visibility_threshold: Minimum per-keypoint visibility (0-1).
-            top_k: Use only the top-k highest-confidence keypoints for
-                   homography (after filtering by visibility_threshold).
+            min_conf_threshold: Minimum per-keypoint confidence (0-1).
             exclude_kpt_ids: Set of keypoint IDs to exclude (e.g. collinear
                    points that would make the homography degenerate).
-                   Default excludes center-line points (11,12,13,14,15).
+                   Default excludes keypoint 15 (field_center).
         """
         self.model = YOLO(model_path)
         self.conf_threshold = conf_threshold
-        self.visibility_threshold = visibility_threshold
-        self.top_k = top_k
-        # Exclude keypoint 15 (field_center) which is collinear with 13 & 14
-        # on the same vertical line (x=CENTER_X), causing degenerate homography
-        self.exclude_kpt_ids = exclude_kpt_ids if exclude_kpt_ids is not None else {15}
+        self.min_conf_threshold = min_conf_threshold
+        # Exclude perfectly collinear center-line keypoints (all on same x=CENTER_X line),
+        # which cause degenerate homography when over-represented.
+        # Excluded: 11=center_line_top, 12=center_line_bottom, 15=field_center
+        # Re-included: 13=center_circle_top, 14=center_circle_bottom (vertical constraint)
+        # Keeping 27 (center_circle_left) and 28 (center_circle_right) since
+        # they provide horizontal constraint on y=CENTER_Y.
+        self.exclude_kpt_ids = exclude_kpt_ids if exclude_kpt_ids is not None else {11, 12, 15}
 
     def print_model_metadata(self):
         """Print keypoint model class names and configuration."""
@@ -189,15 +193,14 @@ class KeypointHomographyComputer:
         Extract keypoints from a YOLO-Pose result.
 
         YOLO-Pose returns keypoints with shape (N, K, 3) where each keypoint
-        has (x, y, visibility). visibility=0 means not visible, 1 means
-        occluded, 2 means fully visible. We treat > 0 as visible enough.
+        has (x, y, confidence) with confidence in [0, 1].
 
         Args:
             result: A single YOLO result object (result.keypoints).
             debug: If True, print debug info.
 
         Returns:
-            keypoints: np.ndarray of shape (K, 3) = (x, y, visibility)
+            keypoints: np.ndarray of shape (K, 3) = (x, y, confidence)
                        or None if no keypoints detected.
         """
         if result is None:
@@ -227,25 +230,70 @@ class KeypointHomographyComputer:
         if debug:
             print(f"  [_extract] kps_np shape: {kps_np.shape}")
             # Show summary stats
-            vis_values = kps_np[:, 2]
-            print(f"  [_extract] visibility stats: min={vis_values.min():.3f}, max={vis_values.max():.3f}, mean={vis_values.mean():.3f}")
-            print(f"  [_extract] num with vis>0: {(vis_values > 0).sum()}")
-            print(f"  [_extract] num with vis>=0.5: {(vis_values >= 0.5).sum()}")
+            conf_values = kps_np[:, 2]
+            print(f"  [_extract] confidence stats: min={conf_values.min():.3f}, max={conf_values.max():.3f}, mean={conf_values.mean():.3f}")
+            print(f"  [_extract] num with conf>0: {(conf_values > 0).sum()}")
+            print(f"  [_extract] num with conf>=0.5: {(conf_values >= 0.5).sum()}")
             # Show some sample keypoints
-            valid_idx = np.where(vis_values > 0)[0]
+            valid_idx = np.where(conf_values > 0)[0]
             if len(valid_idx) > 0:
                 print(f"  [_extract] Sample valid keypoints (first 5):")
                 for idx in valid_idx[:5]:
                     name = PitchKeypointMapper.get_keypoint_name(int(idx))
-                    print(f"    kpt {idx} ({name}): x={kps_np[idx,0]:.1f}, y={kps_np[idx,1]:.1f}, vis={kps_np[idx,2]:.3f}")
+                    print(f"    kpt {idx} ({name}): x={kps_np[idx,0]:.1f}, y={kps_np[idx,1]:.1f}, conf={kps_np[idx,2]:.3f}")
 
         return kps_np
+
+    @staticmethod
+    def _validate_keypoint_with_segmentation(
+        kp_image_pt: tuple,
+        processed_segments: list,
+        kpt_id: int = -1,
+        margin_px: float = 5.0,
+    ) -> bool:
+        """
+        Validate a keypoint by checking if it falls inside any segmentation
+        contour polygon. Keypoints outside all pitch region contours are
+        likely incorrect model predictions.
+
+        Uses cv2.pointPolygonTest which returns:
+            +1 if point is inside
+             0 if point is on the edge
+            -1 if point is outside
+
+        Args:
+            kp_image_pt: (x, y) in image pixel coordinates.
+            processed_segments: list from Segmentor.extract().
+            kpt_id: Keypoint ID for debug logging.
+            margin_px: Tolerance in pixels for pointPolygonTest.
+
+        Returns:
+            True if the keypoint is inside or on the edge of any segment.
+        """
+        if not processed_segments:
+            return True  # no segmentation data → accept (fallback)
+
+        point = (float(kp_image_pt[0]), float(kp_image_pt[1]))
+
+        for seg in processed_segments:
+            contour = seg.get('image_contour', None)
+            if contour is None:
+                continue
+            # contour from YOLO is (N, 1, 2), pointPolygonTest expects that
+            result = cv2.pointPolygonTest(contour, point, measureDist=False)
+            # result >= 0 means inside or on edge
+            if result >= 0:
+                return True
+
+        # Keypoint is outside all segments — log for debugging
+        kpt_name = PitchKeypointMapper.get_keypoint_name(kpt_id)
+        return False
 
     def compute_homography(
         self,
         frame: np.ndarray,
         last_H: np.ndarray = None,
-        ransac_reproj_threshold: float = 3.0,
+        processed_segments: list = None,
     ):
         """
         Run keypoint inference and compute homography from valid keypoint
@@ -253,30 +301,22 @@ class KeypointHomographyComputer:
 
         Pipeline:
             1. Run YOLO-Pose inference on frame.
-            2. Extract all 29 keypoints with (x, y, visibility).
-            3. Filter: keep keypoints with confidence >= conf_threshold AND
-               visibility >= visibility_threshold.
-            4. Map kept keypoints to real-world pitch coordinates.
-            5. Compute H via cv2.findHomography(RANSAC) if >= 4 correspondences.
-            6. Fall back to last_H if insufficient keypoints and
-               REUSE_LAST_HOMOGRAPHY is set.
+            2. Extract all 29 keypoints with (x, y, confidence).
+            3. Filter by confidence threshold (KEYPOINT_MIN_CONF).
+            4. Validate keypoints against segmentation contours (if provided):
+               only keep keypoints that fall inside a pitch segment polygon.
+            5. Map validated keypoints to real-world pitch coordinates.
+            6. Compute H via cv2.findHomography(DLT) using all valid keypoints.
+            7. Fall back to last_H if computation fails.
 
         Args:
             frame: BGR image np.ndarray (H, W, 3).
             last_H: Previously computed homography matrix for fallback.
-            ransac_reproj_threshold: RANSAC reprojection error threshold.
+            processed_segments: list from Segmentor.extract() — used to
+                                validate keypoints are on the pitch.
 
         Returns:
             (H, info_dict)
-                H: 3x3 homography matrix or None.
-                info_dict: {
-                    'H': H or None,
-                    'mode': str - 'keypoint-ransac' | 'fallback-last' | 'insufficient' | 'none',
-                    'used_keypoints': list of {kpt_id, name, confidence, visibility, image_pt, pitch_pt},
-                    'inliers': int,
-                    'total_points': int,
-                    'confidences': list of floats,
-                }
         """
         # Default info
         info = {
@@ -300,21 +340,27 @@ class KeypointHomographyComputer:
         if kps is None or len(kps) == 0:
             return self._fallback_or_none(last_H, info, 'no-keypoints')
 
-        # ---- Step 3: Filter & rank keypoints ----
-        # Collect all keypoints that pass the low visibility threshold
+        # ---- Step 3: Collect & validate keypoints ----
         candidates = []
 
         for kpt_id in range(len(kps)):
-            # Skip excluded collinear keypoints (e.g., center-line points)
+            # Skip excluded keypoints (e.g., field_center which is collinear)
             if kpt_id in self.exclude_kpt_ids:
                 continue
 
             x_img = float(kps[kpt_id, 0])
             y_img = float(kps[kpt_id, 1])
-            visibility = float(kps[kpt_id, 2])
+            confidence = float(kps[kpt_id, 2])
 
-            if visibility < self.visibility_threshold:
+            if confidence < self.min_conf_threshold:
                 continue
+
+            # Validate against segmentation contours
+            if processed_segments is not None and len(processed_segments) > 0:
+                if not self._validate_keypoint_with_segmentation(
+                    (x_img, y_img), processed_segments, kpt_id=kpt_id
+                ):
+                    continue  # keypoint is outside all pitch segments → discard
 
             pitch_coords = PitchKeypointMapper.get_pitch_coords(kpt_id)
             if pitch_coords is None:
@@ -327,59 +373,60 @@ class KeypointHomographyComputer:
                 'name': kpt_name,
                 'image_pt': (x_img, y_img),
                 'pitch_pt': pitch_coords,
-                'visibility': visibility,
+                'confidence': confidence,
             })
 
-        # Sort by visibility descending and take top_k
-        candidates.sort(key=lambda c: c['visibility'], reverse=True)
-        top_candidates = candidates[:self.top_k]
+        info['total_points'] = len(candidates)
+        info['used_keypoints'] = candidates
+        info['confidences'] = [c['confidence'] for c in candidates]
 
-        # Build correspondence arrays from top-k candidates only
-        image_pts = []
-        pitch_pts = []
-        used_kpts = []
+        # ---- Step 4: Build correspondence arrays ----
+        if len(candidates) < 4:
+            return self._fallback_or_none(last_H, info,
+                f'insufficient-keypoints ({len(candidates)} < 4)')
 
-        for c in top_candidates:
-            image_pts.append([c['image_pt'][0], c['image_pt'][1]])
-            pitch_pts.append([c['pitch_pt'][0], c['pitch_pt'][1]])
-            used_kpts.append(c)
+        src_pts = np.array(
+            [[c['image_pt'][0], c['image_pt'][1]] for c in candidates],
+            dtype=np.float32,
+        ).reshape(-1, 1, 2)
+        dst_pts = np.array(
+            [[c['pitch_pt'][0], c['pitch_pt'][1]] for c in candidates],
+            dtype=np.float32,
+        ).reshape(-1, 1, 2)
 
-        info['total_points'] = len(candidates)  # total that passed threshold
-        info['used_keypoints'] = used_kpts
-        info['confidences'] = [c['visibility'] for c in top_candidates]
+        # ---- Step 5: Compute homography via RANSAC ----
+        # RANSAC is robust to outliers: it randomly samples 4-point subsets,
+        # finds the one maximizing inliers, and rejects outlier correspondences.
+        # This handles low-confidence keypoints that passed the confidence filter
+        # but are still geometrically inconsistent.
+        H, mask = cv2.findHomography(
+            src_pts,
+            dst_pts,
+            method=cv2.RANSAC,
+            ransacReprojThreshold=5.0,
+        )
 
-        # ---- Step 4 & 5: Compute homography ----
-        if len(image_pts) < 4:
-            return self._fallback_or_none(last_H, info, f'insufficient-keypoints ({len(image_pts)} < 4)')
+        if H is not None:
+            # Count inliers from the RANSAC mask
+            if mask is not None:
+                inlier_mask = mask.ravel().astype(bool)
+                inliers = int(inlier_mask.sum())
+                inlier_ratio = inliers / len(candidates) if len(candidates) > 0 else 0.0
+            else:
+                inliers = len(candidates)
+                inlier_ratio = 1.0
 
-        src_pts = np.array(image_pts, dtype=np.float32).reshape(-1, 1, 2)
-        dst_pts = np.array(pitch_pts, dtype=np.float32).reshape(-1, 1, 2)
+            # Reject if insufficient inliers (degenerate geometry)
+            if inliers < 4 or inlier_ratio < 0.3:
+                return self._fallback_or_none(last_H, info,
+                    f'ransac-insufficient-inliers ({inliers}/{len(candidates)}, ratio={inlier_ratio:.2f})')
 
-        if len(src_pts) == 4:
-            # Exact solve with 4 points
-            H = cv2.getPerspectiveTransform(
-                src_pts.reshape(-1, 2).astype(np.float32),
-                dst_pts.reshape(-1, 2).astype(np.float32),
-            )
-            info['mode'] = 'keypoint-exact'
-            info['inliers'] = 4
+            info['mode'] = 'keypoint-ransac'
+            info['inliers'] = inliers
             info['H'] = H
             return H, info
         else:
-            # RANSAC with > 4 points
-            H, mask = cv2.findHomography(
-                src_pts,
-                dst_pts,
-                method=cv2.RANSAC,
-                ransacReprojThreshold=ransac_reproj_threshold,
-            )
-            if H is not None:
-                info['mode'] = 'keypoint-ransac'
-                info['inliers'] = int(mask.sum()) if mask is not None else 0
-                info['H'] = H
-                return H, info
-            else:
-                return self._fallback_or_none(last_H, info, 'ransac-failed')
+            return self._fallback_or_none(last_H, info, 'ransac-failed')
 
     def _fallback_or_none(self, last_H, info, reason: str):
         """Try fallback to last_H or return None."""

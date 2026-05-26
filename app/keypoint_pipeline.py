@@ -95,10 +95,30 @@ class KeypointPipeline:
         frame_h, frame_w = frame.shape[:2]
 
         # --------------------------------------------------------------
-        # 1. Keypoint → Homography
+        # 1. Segmentation — run FIRST to validate keypoints
+        # --------------------------------------------------------------
+        processed_segments = []
+        seg_overlay_frame = frame.copy()
+
+        seg_output = self.segmentor.model.predict(
+            frame, conf=SEG_CONF, verbose=False
+        )
+        seg_op = seg_output[0]
+
+        if seg_op is not None and getattr(seg_op, 'masks', None) is not None:
+            processed_segments = self.segmentor.extract(
+                seg_op, frame_w, last_side=None
+            )
+            # Build deep analysis frame: original + seg mask overlay
+            seg_overlay_frame = self._create_seg_overlay(
+                frame, seg_op, processed_segments
+            )
+
+        # --------------------------------------------------------------
+        # 2. Keypoint → Homography (with segmentation validation)
         # --------------------------------------------------------------
         H, H_info = self.keypoint_computer.compute_homography(
-            frame, last_H=self.last_H
+            frame, last_H=self.last_H, processed_segments=processed_segments
         )
 
         if H is not None:
@@ -106,7 +126,7 @@ class KeypointPipeline:
             self.last_H_info = H_info
 
         # --------------------------------------------------------------
-        # 2. Player detection & projection
+        # 3. Player detection & projection
         # --------------------------------------------------------------
         player_results = self.player_detector.model.predict(
             frame, conf=PLAYER_CONF, verbose=False
@@ -119,29 +139,6 @@ class KeypointPipeline:
             # Fix left-right flip if camera is on opposite side
             if self.flip_projection_x and len(player_pitch_pts) > 0:
                 player_pitch_pts[:, 0] = PITCH_LENGTH - player_pitch_pts[:, 0]
-
-        # --------------------------------------------------------------
-        # 3. Segmentation — deep analysis
-        # --------------------------------------------------------------
-        seg_result = None
-        processed_segments = []
-        seg_overlay_frame = frame.copy()
-
-        seg_output = self.segmentor.model.predict(
-            frame, conf=SEG_CONF, verbose=False
-        )
-        seg_op = seg_output[0]
-        seg_result = seg_op
-
-        if seg_op is not None and getattr(seg_op, 'masks', None) is not None:
-            processed_segments = self.segmentor.extract(
-                seg_op, frame_w, last_side=None
-            )
-
-            # Build deep analysis frame: original + seg mask overlay
-            seg_overlay_frame = self._create_seg_overlay(
-                frame, seg_op, processed_segments
-            )
 
         # --------------------------------------------------------------
         # 4. Pitch canvas (top-down view)
@@ -181,7 +178,7 @@ class KeypointPipeline:
             'player_conf': player_conf,
             'player_pitch_pts': player_pitch_pts,
             'keypoints_used': used_kpts,
-            'seg_result': seg_result,
+            'seg_result': seg_op,
             'processed_segments': processed_segments,
             'pitch_canvas': pitch_canvas,
             'annotated_frame': annotated_frame,
@@ -191,13 +188,36 @@ class KeypointPipeline:
     # ------------------------------------------------------------------
     # Visualization helpers
     # ------------------------------------------------------------------
-    # Keypoint skeleton connections from data.yaml
+    # Keypoint skeleton connections (from reference Soccer_Analysis repo)
     _KPT_CONNECTIONS = [
-        (0, 1), (1, 2), (2, 3), (3, 4),   # left penalty area
-        (9, 0),                             # left sideline
-        (16, 26),                           # top-right → right D-box
-        (11, 12),                           # center line
-        (13, 14),                           # center circle
+        # Field boundary
+        (0, 16),   # top-left → top-right (top sideline)
+        (0, 9),    # top-left → bottom-left (left sideline)
+        (16, 25),  # top-right → bottom-right (right sideline)
+        (9, 25),   # bottom-left → bottom-right (bottom sideline)
+        # Left penalty area
+        (1, 2),    # top edge
+        (3, 4),    # bottom edge
+        (1, 3),    # outer vertical (sideline side)
+        (2, 4),    # inner vertical (center side)
+        # Left goal area
+        (5, 6),    # top edge
+        (7, 8),    # bottom edge
+        (5, 7),    # outer vertical
+        (6, 8),    # inner vertical
+        # Right penalty area
+        (17, 18),  # top edge
+        (19, 20),  # bottom edge
+        (17, 19),  # outer vertical (sideline side)
+        (18, 20),  # inner vertical (center side)
+        # Right goal area
+        (21, 22),  # top edge
+        (23, 24),  # bottom edge
+        (21, 23),  # outer vertical
+        (22, 24),  # inner vertical
+        # Center line & circle
+        (11, 12),  # center line
+        (13, 14),  # center circle vertical
     ]
 
     def _draw_keypoints_on_frame(self, frame, used_keypoints, radius=6):
