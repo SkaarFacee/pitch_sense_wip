@@ -1,4 +1,4 @@
 runs/*
 outputs/*
 datasets/*
-data/*
+*/train
