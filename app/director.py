@@ -2,7 +2,8 @@ import cv2
 class Director:
     @staticmethod
     def make_video_writer(path, fps, size):
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        # Use avc1 (H.264) for browser-compatible MP4 playback
+        fourcc = cv2.VideoWriter_fourcc(*"avc1")
         writer = cv2.VideoWriter(str(path), fourcc, fps, size)
 
         if not writer.isOpened():
