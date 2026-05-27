@@ -558,6 +558,8 @@ class KeypointPipeline:
             - annotated_video.mp4: Original frame with keypoints + team bboxes + ball bbox
             - deep_analysis.mp4: Original frame with segmentation overlay + ball
             - final_draft.mp4: Original frame with pitch debug map overlayed (PIP)
+            - keypoint_annotations.mp4: Original frame with keypoint skeleton overlays only
+                (no team bboxes, no ball bbox) — debug view for keypoint quality inspection
 
         Args:
             source_video_path: Path to input video.
@@ -577,6 +579,7 @@ class KeypointPipeline:
         annotated_path = output_path / "annotated_video.mp4"
         deep_analysis_path = output_path / "deep_analysis.mp4"
         final_draft_path = output_path / "final_draft.mp4"
+        keypoint_annotations_path = output_path / "keypoint_annotations.mp4"
 
         cap = cv2.VideoCapture(source_video_path)
         if not cap.isOpened():
@@ -607,6 +610,13 @@ class KeypointPipeline:
         final_draft_writer = Director.make_video_writer(
             final_draft_path, actual_fps, (frame_w, frame_h)
         )
+        keypoint_annotations_writer = Director.make_video_writer(
+            keypoint_annotations_path, actual_fps, (frame_w, frame_h)
+        )
+
+        # Reset analyzer state for clean video-level processing
+        if self.team_analyzer is not None:
+            self.team_analyzer.reset()
 
         frame_idx = 0
         processed_count = 0
@@ -636,6 +646,11 @@ class KeypointPipeline:
                     annotated_writer.write(result['annotated_frame'])
                 if result['deep_analysis_frame'] is not None:
                     deep_writer.write(result['deep_analysis_frame'])
+
+                # Keypoint annotations: original frame + keypoints only (debug view)
+                used_kpts = result.get('keypoints_used', [])
+                keypoint_frame = self._draw_keypoints_on_frame(frame.copy(), used_kpts)
+                keypoint_annotations_writer.write(keypoint_frame)
 
                 # Build final_draft frame: overlay pitch canvas onto original frame
                 if result['pitch_canvas'] is not None:
@@ -685,8 +700,10 @@ class KeypointPipeline:
             annotated_writer.release()
             deep_writer.release()
             final_draft_writer.release()
+            keypoint_annotations_writer.release()
             print(f"\nDone. Processed {processed_count} frames.")
-            print(f"  Pitch canvas:  {full_pitch_path}")
-            print(f"  Annotated:     {annotated_path}")
-            print(f"  Deep analysis: {deep_analysis_path}")
-            print(f"  Final draft:   {final_draft_path}")
+            print(f"  Pitch canvas:           {full_pitch_path}")
+            print(f"  Annotated:              {annotated_path}")
+            print(f"  Deep analysis:          {deep_analysis_path}")
+            print(f"  Final draft:            {final_draft_path}")
+            print(f"  Keypoint annotations:   {keypoint_annotations_path}")

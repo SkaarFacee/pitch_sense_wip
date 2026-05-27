@@ -189,6 +189,12 @@ class KeypointHomographyComputer:
         # Re-included: 13=center_circle_top, 14=center_circle_bottom (vertical constraint)
         # Keeping 27 (center_circle_left) and 28 (center_circle_right) since
         # they provide horizontal constraint on y=CENTER_Y.
+        # Excluded keypoints:
+        #   11 (center_line_top), 12 (center_line_bottom): collinear on x=CENTER_X —
+        #       with center-circle points also near x=CENTER_X, they create a
+        #       degenerate constraint that biases the homography.
+        #   15 (field_center): redundant with intersection of center circle features
+        #       (13, 14, 27, 28).
         self.exclude_kpt_ids = exclude_kpt_ids if exclude_kpt_ids is not None else {11, 12, 15}
 
     def print_model_metadata(self):
@@ -390,19 +396,19 @@ class KeypointHomographyComputer:
                 'confidence': confidence,
             })
 
-        # ---- Step 4: Keep only the top 4 most confident keypoints ----
-        # The model may predict keypoints for features not actually in the
-        # frame (hallucinations). Using exactly the 4 highest-confidence
-        # correspondences gives the minimal DLT solution and avoids
-        # hallucinated points from corrupting the homography.
+        # ---- Step 4: Use all valid keypoints for RANSAC ----
+        # RANSAC handles outlier rejection naturally by sampling 4-point
+        # subsets and finding the one maximizing inlier count. With more
+        # keypoints, RANSAC can discard hallucinated/inaccurate detections
+        # while retaining geometrically consistent ones. Sort by confidence
+        # for deterministic behavior.
         candidates.sort(key=lambda c: c['confidence'], reverse=True)
-        candidates = candidates[:4]
 
         info['total_points'] = len(candidates)
         info['used_keypoints'] = candidates
         info['confidences'] = [c['confidence'] for c in candidates]
 
-        # ---- Step 5: Build correspondence arrays ----
+        # ---- Step 6: Build correspondence arrays ----
         if len(candidates) < 4:
             return self._fallback_or_none(last_H, info,
                 f'insufficient-keypoints ({len(candidates)} < 4)')
@@ -416,11 +422,11 @@ class KeypointHomographyComputer:
             dtype=np.float32,
         ).reshape(-1, 1, 2)
 
-        # ---- Step 6: Compute homography via RANSAC ----
+        # ---- Step 7: Compute homography via RANSAC ----
         # RANSAC is robust to outliers: it randomly samples 4-point subsets,
         # finds the one maximizing inliers, and rejects outlier correspondences.
-        # This handles low-confidence keypoints that passed the confidence filter
-        # but are still geometrically inconsistent.
+        # With more than 4 points, RANSAC can identify and discard inaccurate
+        # keypoints automatically.
         H, mask = cv2.findHomography(
             src_pts,
             dst_pts,
@@ -439,7 +445,9 @@ class KeypointHomographyComputer:
                 inlier_ratio = 1.0
 
             # Reject if insufficient inliers (degenerate geometry)
-            if inliers < 4 or inlier_ratio < 0.3:
+            # Require at least 4 inliers AND inlier ratio > 0.3
+            min_inliers = min(4, len(candidates))
+            if inliers < min_inliers or inlier_ratio < 0.3:
                 return self._fallback_or_none(last_H, info,
                     f'ransac-insufficient-inliers ({inliers}/{len(candidates)}, ratio={inlier_ratio:.2f})')
 
@@ -451,6 +459,7 @@ class KeypointHomographyComputer:
             H = self._apply_homography_smoothing(H, last_H)
 
             info['H'] = H
+
             return H, info
         else:
             return self._fallback_or_none(last_H, info, 'ransac-failed')

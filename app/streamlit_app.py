@@ -61,6 +61,7 @@ OUTPUT_VIDEOS = [
     ("annotated_video.mp4", "🎯 Annotated (Keypoints + Team Bboxes + Ball)"),
     ("deep_analysis.mp4", "🔬 Deep Analysis (Segmentation Overlay + Ball)"),
     ("full_pitch_debug_map.mp4", "🗺️ Full Pitch Map (Top-Down View + Ball Trail)"),
+    ("keypoint_annotations.mp4", "🔑 Keypoint Annotations (Keypoints on Original)"),
 ]
 
 # ---------------------------------------------------------------------------

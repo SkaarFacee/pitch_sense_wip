@@ -62,16 +62,20 @@ class TeamColorAnalyzer:
     # Helps stable tracks resist noise from occasional misclassifications.
     RECENCY_WEIGHT = 1.5
 
-    def __init__(self, n_clusters: int = TEAM_N_CLUSTERS):
+    def __init__(self, n_clusters: int = TEAM_N_CLUSTERS, lock_centroids: bool = True):
         """
         Args:
             n_clusters: Number of teams to cluster (typically 2).
+            lock_centroids: If True, team centroids are computed ONCE on first frame and
+                            then locked for the entire video. Prevents color flickering
+                            caused by periodic K-means re-clustering.
         """
         self.n_clusters = n_clusters
         self.team_centroids_hsv = None   # Cached HSV centroids (n_clusters, 2) — hue+sat only
         self.team_centroids_bgr = None   # Cached BGR centroids for visualization
         self.frame_counter = 0
         self.initialized = False
+        self.lock_centroids = lock_centroids
 
         # Per-track team assignment history for cross-frame consistency
         self.track_team_history = {}      # track_id -> deque of recent team IDs
@@ -122,7 +126,9 @@ class TeamColorAnalyzer:
         player_bgr = np.array(player_bgr, dtype=np.float32)   # (N, 3)
 
         # ---- Step 2: Cluster or re-assign ----
-        if (not self.initialized) or (self.frame_counter % COLOR_CACHE_REFRESH_N == 0):
+        # When lock_centroids is True, only cluster once (on first frame).
+        # Otherwise, re-cluster periodically based on COLOR_CACHE_REFRESH_N.
+        if not self.initialized:
             team_ids, centroids_hsv, centroids_bgr = self._cluster_teams(
                 player_hsv, player_bgr
             )
@@ -130,6 +136,17 @@ class TeamColorAnalyzer:
                 self.team_centroids_hsv = centroids_hsv
                 self.team_centroids_bgr = centroids_bgr
                 self.initialized = True
+        elif self.lock_centroids:
+            # Centroids are locked — always use nearest-centroid assignment
+            team_ids = self._assign_to_nearest_team(player_hsv)
+        elif self.frame_counter % COLOR_CACHE_REFRESH_N == 0:
+            # Periodic re-clustering (only when lock_centroids=False)
+            team_ids, centroids_hsv, centroids_bgr = self._cluster_teams(
+                player_hsv, player_bgr
+            )
+            if centroids_bgr is not None:
+                self.team_centroids_hsv = centroids_hsv
+                self.team_centroids_bgr = centroids_bgr
         else:
             team_ids = self._assign_to_nearest_team(player_hsv)
 
