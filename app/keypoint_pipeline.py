@@ -1,157 +1,51 @@
-"""
-KeypointPipeline — End-to-end pipeline orchestrator.
-
-Pipeline flow per frame:
-    Keypoint detection → Homography matrix
-    Player detection → Bottom-center projection via H
-    Team color analysis → Team segregation via K-means on jersey colors
-    Ball detection (dedicated ball model) → Projection via H → Trajectory trail
-    Segmentation → Deep analysis overlay (on original frame + pitch canvas)
-
-Outputs:
-    - Annotated original frame (keypoints + seg masks + team-colored bboxes + ball bbox)
-    - Top-down pitch canvas (players projected + team-colored dots + legend + ball + trail)
-    - Deep analysis frame (seg overlay + team colors + ball)
-"""
-
+"""KeypointPipeline — End-to-end pipeline: keypoint→homography→player projection→team colors→ball→segmentation→5 output videos."""
 import cv2
 import numpy as np
 from pathlib import Path
 from typing import Optional
-
 from constants import (
-    PLAYER_CONF,
-    SEG_CONF,
-    REUSE_LAST_HOMOGRAPHY,
-    CANVAS_W,
-    CANVAS_H,
-    PITCH_LENGTH,
-    PITCH_WIDTH,
-    BALL_CONF,
-    BALL_TRAIL_LENGTH,
-    BALL_BBOX_COLOR,
-    BALL_DOT_COLOR,
+    PLAYER_CONF, SEG_CONF, CANVAS_W, CANVAS_H, PITCH_LENGTH, PITCH_WIDTH,
+    BALL_CONF, BALL_TRAIL_LENGTH, BALL_BBOX_COLOR, BALL_DOT_COLOR,
 )
-from keypoint_service import KeypointHomographyComputer, PitchKeypointMapper
+from keypoint_service import KeypointHomographyComputer
 from player_service import PlayerDetector
 from ball_service import BallDetector
-from segmentation import Segmentor, BboxManipulor, GeometryManipulor
-from seg_helpers import CanvasMapper
+from segmentation import Segmentor
 from pitch import PitchArtist
-from seg_plural import BestSegmentPicker
 from director import Director
 from team_analyzer import TeamColorAnalyzer
 
 
 class KeypointPipeline:
-    """
-    Orchestrates the full keypoint → homography → player projection →
-    team color analysis → ball detection → segmentation analysis pipeline
-    for each video frame.
-    """
-
-    def __init__(
-        self,
-        keypoint_model_path: str,
-        player_model_path: str,
-        seg_model_path: str,
-        ball_model_path: str = "",
-        flip_projection_x: bool = False,
-        enable_team_colors: bool = True,
-    ):
-        """
-        Args:
-            keypoint_model_path: Path to YOLO-Pose keypoint model.
-            player_model_path: Path to YOLO player detection model.
-            seg_model_path: Path to YOLO segmentation model.
-            ball_model_path: Path to YOLO ball detection model. If empty string,
-                             ball detection is disabled.
-            flip_projection_x: If True, mirror the x-axis of projected player
-                                positions (PITCH_LENGTH - x). Fixes left-right
-                                flip caused by camera being on opposite side.
-            enable_team_colors: If True, run team color analysis per frame.
-        """
-        # Models
+    def __init__(self, keypoint_model_path: str, player_model_path: str, seg_model_path: str,
+                 ball_model_path: str = "", flip_projection_x: bool = False, enable_team_colors: bool = True):
         self.keypoint_computer = KeypointHomographyComputer(keypoint_model_path)
         self.player_detector = PlayerDetector(player_model_path)
         self.segmentor = Segmentor(seg_model_path)
         self.team_analyzer = TeamColorAnalyzer() if enable_team_colors else None
         self.ball_detector = BallDetector(ball_model_path, conf=BALL_CONF) if ball_model_path else None
-
-        # State
         self.last_H = None
-        self.last_H_info = None
         self.pitch_artist = PitchArtist()
         self.flip_projection_x = flip_projection_x
-        self.ball_trajectory = []  # List of (x, y) pitch-coords for trajectory trail
+        self.ball_trajectory = []
 
-    # ------------------------------------------------------------------
-    # Core pipeline
-    # ------------------------------------------------------------------
     def process_frame(self, frame: np.ndarray, frame_idx: int = 0):
-        """
-        Run the full pipeline on a single frame.
-
-        Args:
-            frame: BGR image (H, W, 3).
-            frame_idx: Frame index for logging.
-
-        Returns:
-            dict with keys:
-                'H'               : 3x3 homography or None
-                'H_info'          : dict from KeypointHomographyComputer
-                'player_xyxy'     : player bboxes in image coords (N,4)
-                'player_conf'     : player confidences (N,)
-                'track_ids'       : (N,) int — ByteTrack track IDs per detection
-                'player_pitch_pts': player bottom-center in pitch coords (M,2)
-                'keypoints_used'  : list of used keypoint dicts
-                'seg_result'      : raw YOLO seg result
-                'processed_segments': list from Segmentor.extract()
-                'pitch_canvas'    : np.ndarray — top-down pitch with players + ball
-                'annotated_frame' : np.ndarray — original frame with overlays + ball
-                'deep_analysis_frame': np.ndarray — frame with seg mask overlay
-                'ball_xyxy'       : (1,4) or empty — ball bbox in image coords
-                'ball_conf'       : (1,) or empty — ball confidence
-                'ball_pitch_pt'   : (2,) or None — ball on pitch in meters
-                'ball_trajectory' : list of past ball pitch positions
-        """
         frame_h, frame_w = frame.shape[:2]
-
-        # --------------------------------------------------------------
-        # 1. Segmentation — run FIRST to validate keypoints
-        # --------------------------------------------------------------
         processed_segments = []
         seg_overlay_frame = frame.copy()
 
-        seg_output = self.segmentor.model.predict(
-            frame, conf=SEG_CONF, verbose=False
-        )
-        seg_op = seg_output[0]
-
+        # 1. Segmentation
+        seg_op = self.segmentor.model.predict(frame, conf=SEG_CONF, verbose=False)[0]
         if seg_op is not None and getattr(seg_op, 'masks', None) is not None:
-            processed_segments = self.segmentor.extract(
-                seg_op, frame_w, last_side=None
-            )
-            # Build deep analysis frame: original + seg mask overlay
-            seg_overlay_frame = self._create_seg_overlay(
-                frame, seg_op, processed_segments
-            )
+            processed_segments = self.segmentor.extract(seg_op, frame_w, last_side=None)
+            seg_overlay_frame = self._create_seg_overlay(frame, seg_op, processed_segments)
 
-        # --------------------------------------------------------------
-        # 2. Keypoint → Homography (with segmentation validation)
-        # --------------------------------------------------------------
-        H, H_info = self.keypoint_computer.compute_homography(
-            frame, last_H=self.last_H, processed_segments=processed_segments
-        )
-
+        # 2. Keypoint → Homography
+        H, H_info = self.keypoint_computer.compute_homography(frame, last_H=self.last_H)
         if H is not None:
             self.last_H = H
-            self.last_H_info = H_info
 
-        # --------------------------------------------------------------
-        # 3. Player detection & projection (with ByteTrack tracking)
-        # --------------------------------------------------------------
-        # Use model.track() with persist=True for cross-frame track IDs
+        # 3a. Player detection & projection
         formatted = self.player_detector.track_players(frame, conf=PLAYER_CONF)
         if formatted is not None:
             player_xyxy, player_conf, _, track_ids = formatted
@@ -162,548 +56,206 @@ class KeypointPipeline:
         player_pitch_pts = np.empty((0, 2), dtype=np.float32)
         if H is not None and len(player_xyxy) > 0:
             player_pitch_pts = self.player_detector.project_points(player_xyxy, H)
-            # Fix left-right flip if camera is on opposite side
             if self.flip_projection_x and len(player_pitch_pts) > 0:
                 player_pitch_pts[:, 0] = PITCH_LENGTH - player_pitch_pts[:, 0]
 
-        # --------------------------------------------------------------
-        # 3b. Team color analysis (with per-track majority voting)
-        # --------------------------------------------------------------
+        # 3b. Team colors
         team_info = None
         if self.team_analyzer is not None and len(player_xyxy) > 0:
-            team_info = self.team_analyzer.assign_team_colors(
-                frame, player_xyxy, player_conf, track_ids=track_ids
-            )
+            team_info = self.team_analyzer.assign_team_colors(frame, player_xyxy, player_conf, track_ids=track_ids)
 
-        # --------------------------------------------------------------
-        # 3c. Ball detection & projection (dedicated ball model)
-        # --------------------------------------------------------------
+        # 3c. Ball detection
         ball_xyxy = np.empty((0, 4), dtype=np.float32)
         ball_conf = np.empty((0,), dtype=np.float32)
         ball_pitch_pt = None
-
         if self.ball_detector is not None:
             ball_xyxy, ball_conf = self.ball_detector.detect_ball(frame)
             if len(ball_xyxy) > 0 and H is not None:
-                ball_pitch_pt = self.ball_detector.project_ball_to_pitch(
-                    ball_xyxy, H,
-                    flip_x=self.flip_projection_x,
-                    pitch_length=PITCH_LENGTH,
-                )
-                # Update trajectory
+                ball_pitch_pt = self.ball_detector.project_ball_to_pitch(ball_xyxy, H, flip_x=self.flip_projection_x, pitch_length=PITCH_LENGTH)
                 self.ball_trajectory.append(ball_pitch_pt.copy())
-                # Keep only the last N positions
                 if len(self.ball_trajectory) > BALL_TRAIL_LENGTH:
                     self.ball_trajectory.pop(0)
 
-        # --------------------------------------------------------------
-        # 4. Pitch canvas (top-down view) with players + ball + trail
-        # --------------------------------------------------------------
+        # 4. Pitch canvas (top-down)
         pitch_canvas = self.pitch_artist.draw_pitch_base()
-
-        # Draw ball trajectory trail FIRST (behind players & ball)
         if len(self.ball_trajectory) > 1:
-            pitch_canvas = self.pitch_artist.draw_ball_trajectory(
-                pitch_canvas, self.ball_trajectory, max_trail=BALL_TRAIL_LENGTH
-            )
-
-        # Draw players
+            pitch_canvas = self.pitch_artist.draw_ball_trajectory(pitch_canvas, self.ball_trajectory, max_trail=BALL_TRAIL_LENGTH)
         if len(player_pitch_pts) > 0:
-            # Filter points that are within pitch bounds
-            valid_mask = (
-                (player_pitch_pts[:, 0] >= -5)
-                & (player_pitch_pts[:, 0] <= PITCH_LENGTH + 5)
-                & (player_pitch_pts[:, 1] >= -5)
-                & (player_pitch_pts[:, 1] <= PITCH_WIDTH + 5)
-            )
-            valid_pts = player_pitch_pts[valid_mask]
+            mask = ((player_pitch_pts[:, 0] >= -5) & (player_pitch_pts[:, 0] <= PITCH_LENGTH + 5)
+                    & (player_pitch_pts[:, 1] >= -5) & (player_pitch_pts[:, 1] <= PITCH_WIDTH + 5))
+            valid_pts = player_pitch_pts[mask]
             if len(valid_pts) > 0:
-                # Get per-player team colors for valid points only
                 colors = None
                 if team_info is not None:
-                    colors = team_info['team_colors']
-                    # Filter colors to match valid_mask
-                    colors = [colors[i] for i in range(len(colors)) if valid_mask[i]] if len(colors) == len(valid_mask) else None
-
-                pitch_canvas = self.pitch_artist.draw_players_on_pitch(
-                    pitch_canvas, valid_pts, colors=colors, default_color=(0, 0, 255)
-                )
-
-            # Add team legend
+                    c = team_info['team_colors']
+                    colors = [c[i] for i in range(len(c)) if mask[i]] if len(c) == len(mask) else None
+                pitch_canvas = self.pitch_artist.draw_players_on_pitch(pitch_canvas, valid_pts, colors=colors, default_color=(0, 0, 255))
             if team_info is not None:
-                pitch_canvas = self.pitch_artist.draw_team_legend(
-                    pitch_canvas,
-                    team_info['team1_bgr'],
-                    team_info['team2_bgr'],
-                    team1_label="Team 1",
-                    team2_label="Team 2",
-                )
-
-        # Draw ball dot on pitch canvas (on top of players)
+                pitch_canvas = self.pitch_artist.draw_team_legend(pitch_canvas, team_info['team1_bgr'], team_info['team2_bgr'])
         if ball_pitch_pt is not None:
-            pitch_canvas = self.pitch_artist.draw_ball_on_pitch(
-                pitch_canvas, ball_pitch_pt, ball_color=BALL_DOT_COLOR
-            )
+            pitch_canvas = self.pitch_artist.draw_ball_on_pitch(pitch_canvas, ball_pitch_pt, ball_color=BALL_DOT_COLOR)
 
-        # --------------------------------------------------------------
-        # 5. Annotated frames with keypoints + team-colored bboxes + ball bbox
-        # --------------------------------------------------------------
+        # 5. Annotated frames
         used_kpts = H_info.get('used_keypoints', [])
         annotated_frame = self._draw_keypoints_on_frame(frame, used_kpts)
-        # Overlay team-colored player bounding boxes with confidence scores
         if team_info is not None and len(player_xyxy) > 0:
-            annotated_frame = self._draw_team_bboxes(
-                annotated_frame, player_xyxy, team_info['team_colors'],
-                player_conf=player_conf,
-            )
-
-        # Draw ball bounding box on annotated frame
+            annotated_frame = self._draw_team_bboxes(annotated_frame, player_xyxy, team_info['team_colors'], player_conf=player_conf)
         if len(ball_xyxy) > 0:
-            annotated_frame = self._draw_ball_bbox(
-                annotated_frame, ball_xyxy, ball_conf, color=BALL_BBOX_COLOR
-            )
-
-        # Deep analysis frame with seg overlay + keypoints + team bboxes + ball
-        if used_kpts:
-            deep_analysis_frame = self._draw_keypoints_on_frame(
-                seg_overlay_frame, used_kpts
-            )
-        else:
-            deep_analysis_frame = seg_overlay_frame
+            annotated_frame = self._draw_ball_bbox(annotated_frame, ball_xyxy, ball_conf, color=BALL_BBOX_COLOR)
+        deep_analysis_frame = self._draw_keypoints_on_frame(seg_overlay_frame, used_kpts) if used_kpts else seg_overlay_frame
         if team_info is not None and len(player_xyxy) > 0:
-            deep_analysis_frame = self._draw_team_bboxes(
-                deep_analysis_frame, player_xyxy, team_info['team_colors'],
-                player_conf=player_conf,
-            )
+            deep_analysis_frame = self._draw_team_bboxes(deep_analysis_frame, player_xyxy, team_info['team_colors'], player_conf=player_conf)
         if len(ball_xyxy) > 0:
-            deep_analysis_frame = self._draw_ball_bbox(
-                deep_analysis_frame, ball_xyxy, ball_conf, color=BALL_BBOX_COLOR
-            )
+            deep_analysis_frame = self._draw_ball_bbox(deep_analysis_frame, ball_xyxy, ball_conf, color=BALL_BBOX_COLOR)
 
-        return {
-            'H': H,
-            'H_info': H_info,
-            'player_xyxy': player_xyxy,
-            'player_conf': player_conf,
-            'track_ids': track_ids,
-            'player_pitch_pts': player_pitch_pts,
-            'keypoints_used': used_kpts,
-            'seg_result': seg_op,
-            'processed_segments': processed_segments,
-            'pitch_canvas': pitch_canvas,
-            'annotated_frame': annotated_frame,
-            'deep_analysis_frame': deep_analysis_frame,
-            'team_info': team_info,
-            # Ball detection outputs
-            'ball_xyxy': ball_xyxy,
-            'ball_conf': ball_conf,
-            'ball_pitch_pt': ball_pitch_pt,
-            'ball_trajectory': list(self.ball_trajectory),
-        }
+        return {'H': H, 'H_info': H_info, 'player_xyxy': player_xyxy, 'player_conf': player_conf,
+                'track_ids': track_ids, 'player_pitch_pts': player_pitch_pts, 'keypoints_used': used_kpts,
+                'seg_result': seg_op, 'processed_segments': processed_segments, 'pitch_canvas': pitch_canvas,
+                'annotated_frame': annotated_frame, 'deep_analysis_frame': deep_analysis_frame, 'team_info': team_info,
+                'ball_xyxy': ball_xyxy, 'ball_conf': ball_conf, 'ball_pitch_pt': ball_pitch_pt,
+                'ball_trajectory': list(self.ball_trajectory)}
 
     # ------------------------------------------------------------------
-    # Visualization helpers
+    # Drawing helpers
     # ------------------------------------------------------------------
-    # Keypoint skeleton connections (from reference Soccer_Analysis repo)
     _KPT_CONNECTIONS = [
-        # Field boundary
-        (0, 16),   # top-left → top-right (top sideline)
-        (0, 9),    # top-left → bottom-left (left sideline)
-        (16, 25),  # top-right → bottom-right (right sideline)
-        (9, 25),   # bottom-left → bottom-right (bottom sideline)
-        # Left penalty area
-        (1, 2),    # top edge
-        (3, 4),    # bottom edge
-        (1, 3),    # outer vertical (sideline side)
-        (2, 4),    # inner vertical (center side)
-        # Left goal area
-        (5, 6),    # top edge
-        (7, 8),    # bottom edge
-        (5, 7),    # outer vertical
-        (6, 8),    # inner vertical
-        # Right penalty area
-        (17, 18),  # top edge
-        (19, 20),  # bottom edge
-        (17, 19),  # outer vertical (sideline side)
-        (18, 20),  # inner vertical (center side)
-        # Right goal area
-        (21, 22),  # top edge
-        (23, 24),  # bottom edge
-        (21, 23),  # outer vertical
-        (22, 24),  # inner vertical
-        # Center line & circle
-        (11, 12),  # center line
-        (13, 14),  # center circle vertical
+        (0, 16), (0, 9), (16, 25), (9, 25),
+        (1, 2), (3, 4), (1, 3), (2, 4),
+        (5, 6), (7, 8), (5, 7), (6, 8),
+        (17, 18), (19, 20), (17, 19), (18, 20),
+        (21, 22), (23, 24), (21, 23), (22, 24),
+        (11, 12), (13, 14),
     ]
 
     def _draw_keypoints_on_frame(self, frame, used_keypoints, radius=6):
-        """
-        Draw used keypoints on the frame with labels and skeleton connections.
-        Also builds a lookup for fast skeleton drawing.
-        """
         out = frame.copy()
-
-        # Build dict: kpt_id → (x, y) for used keypoints
-        kpt_positions = {}
-        for kp in used_keypoints:
-            kid = kp['kpt_id']
-            kpt_positions[kid] = (int(kp['image_pt'][0]), int(kp['image_pt'][1]))
-
-        # Draw skeleton connections between keypoints
-        for start_id, end_id in self._KPT_CONNECTIONS:
-            if start_id in kpt_positions and end_id in kpt_positions:
-                cv2.line(out, kpt_positions[start_id], kpt_positions[end_id],
-                         (0, 255, 255), 2, cv2.LINE_AA)
-
-        # Draw keypoint circles + labels
+        kpt_pos = {kp['kpt_id']: (int(kp['image_pt'][0]), int(kp['image_pt'][1])) for kp in used_keypoints}
+        for s, e in self._KPT_CONNECTIONS:
+            if s in kpt_pos and e in kpt_pos:
+                cv2.line(out, kpt_pos[s], kpt_pos[e], (0, 255, 255), 2, cv2.LINE_AA)
         for kp in used_keypoints:
             x, y = int(kp['image_pt'][0]), int(kp['image_pt'][1])
-            # Draw circle
             cv2.circle(out, (x, y), radius, (0, 255, 255), -1)
             cv2.circle(out, (x, y), radius + 2, (255, 255, 0), 2)
-            # Label
-            label = f"{kp['kpt_id']}:{kp['name'][:15]}"
-            cv2.putText(
-                out, label, (x + 10, y - 5),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA,
-            )
+            cv2.putText(out, f"{kp['kpt_id']}:{kp['name'][:15]}", (x + 10, y - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
         return out
 
     def _create_seg_overlay(self, frame, seg_op, processed_segments):
-        """Create a frame with segmentation masks overlaid."""
-        # We use a simple approach: draw filled polygons for each segment
         out = frame.copy()
         overlay = frame.copy()
-
-        for segment in processed_segments:
-            contour = segment.get('image_contour', None)
-            if contour is None:
-                continue
-            # Draw contour fill (semi-transparent)
-            color_map = {
-                '18Yard': (255, 0, 0),
-                '18Yard Circle': (0, 255, 0),
-                '5Yard': (0, 0, 255),
-                'Half Central Circle': (255, 255, 0),
-                'Half Field': (255, 0, 255),
-            }
-            color = color_map.get(segment['class_name'], (128, 128, 128))
-            cv2.drawContours(overlay, [contour], -1, color, -1)
-
-        # Blend
+        color_map = {'18Yard': (255, 0, 0), '18Yard Circle': (0, 255, 0), '5Yard': (0, 0, 255),
+                     'Half Central Circle': (255, 255, 0), 'Half Field': (255, 0, 255)}
+        for seg in processed_segments:
+            contour = seg.get('image_contour')
+            if contour is not None:
+                cv2.drawContours(overlay, [contour], -1, color_map.get(seg['class_name'], (128, 128, 128)), -1)
         cv2.addWeighted(overlay, 0.35, out, 0.65, 0, out)
-
-        # Add labels
-        for segment in processed_segments:
-            bbox = segment.get('image_bbox', None)
+        for seg in processed_segments:
+            bbox = seg.get('image_bbox')
             if bbox is not None:
-                cx = float(bbox[:, 0].mean())
-                cy = float(bbox[:, 1].mean())
-                label = f"{segment['class_name']} {segment['confidence']:.2f}"
-                cv2.putText(
-                    out, label, (int(cx) - 30, int(cy)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2, cv2.LINE_AA,
-                )
-
+                cx, cy = float(bbox[:, 0].mean()), float(bbox[:, 1].mean())
+                cv2.putText(out, f"{seg['class_name']} {seg['confidence']:.2f}", (int(cx) - 30, int(cy)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2, cv2.LINE_AA)
         return out
 
-    def _draw_team_bboxes(
-        self,
-        frame: np.ndarray,
-        player_xyxy: np.ndarray,
-        team_colors: list,
-        player_conf: np.ndarray = None,
-    ) -> np.ndarray:
-        """
-        Draw team-colored bounding boxes around detected players, with
-        confidence scores displayed above each bbox.
-
-        Args:
-            frame: BGR image (H, W, 3).
-            player_xyxy: (N, 4) array of bboxes in [x1, y1, x2, y2].
-            team_colors: List of N BGR tuples, one per player.
-            player_conf: (N,) array of confidence scores for each player.
-                         If None, no confidence text is drawn.
-
-        Returns:
-            Frame with bounding boxes and confidence labels drawn.
-        """
+    def _draw_team_bboxes(self, frame, player_xyxy, team_colors, player_conf=None):
         out = frame.copy()
-        n = min(len(player_xyxy), len(team_colors))
-        for i in range(n):
-            x1, y1, x2, y2 = map(int, player_xyxy[i])
-            # Clamp to frame bounds
-            x1 = max(0, x1)
-            y1 = max(0, y1)
-            x2 = min(frame.shape[1] - 1, x2)
-            y2 = min(frame.shape[0] - 1, y2)
-
+        h, w = frame.shape[:2]
+        for i in range(min(len(player_xyxy), len(team_colors))):
+            x1, y1, x2, y2 = max(0, int(player_xyxy[i][0])), max(0, int(player_xyxy[i][1])), min(w - 1, int(player_xyxy[i][2])), min(h - 1, int(player_xyxy[i][3]))
             color = team_colors[i]
-            # Draw filled rectangle with low opacity for the bbox
-            overlay = out.copy()
-            cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
-            cv2.addWeighted(overlay, 0.25, out, 0.75, 0, out)
-            # Draw border
+            ov = out.copy()
+            cv2.rectangle(ov, (x1, y1), (x2, y2), color, -1)
+            cv2.addWeighted(ov, 0.25, out, 0.75, 0, out)
             cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-
-            # Draw confidence score above the bounding box
             if player_conf is not None and i < len(player_conf):
-                conf = player_conf[i]
-                label = f"{conf:.2f}"
-                # Choose text color: bright white with a dark outline for readability
-                text_color = (255, 255, 255)
-                outline_color = (0, 0, 0)
-                font_scale = 0.5
-                thickness = 2
-                (tw, th), baseline = cv2.getTextSize(
-                    label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness
-                )
-                # Position: centered above the bbox top edge
-                tx = (x1 + x2 - tw) // 2
-                ty = y1 - 5  # 5px above the bbox
-
-                # If the text would go above the frame, place it just inside the bbox top
+                label = f"{player_conf[i]:.2f}"
+                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+                tx, ty = (x1 + x2 - tw) // 2, y1 - 5
                 if ty - th < 0:
                     ty = y1 + th + 2
-
-                # Draw text outline for readability
-                for dx, dy in [(-1, -1), (-1, 1), (1, -1), (1, 1)]:
-                    cv2.putText(
-                        out, label, (tx + dx, ty + dy),
-                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, outline_color, thickness, cv2.LINE_AA,
-                    )
-                # Draw the actual text
-                cv2.putText(
-                    out, label, (tx, ty),
-                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_color, thickness, cv2.LINE_AA,
-                )
-
+                cv2.putText(out, label, (tx + 1, ty + 1), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2, cv2.LINE_AA)
+                cv2.putText(out, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2, cv2.LINE_AA)
         return out
 
-    def _draw_ball_bbox(
-        self,
-        frame: np.ndarray,
-        ball_xyxy: np.ndarray,
-        ball_conf: np.ndarray,
-        color: tuple = BALL_BBOX_COLOR,
-    ) -> np.ndarray:
-        """
-        Draw ball bounding box on the frame with a "Ball" label.
-
-        Args:
-            frame: BGR image (H, W, 3).
-            ball_xyxy: (1, 4) array [x1, y1, x2, y2].
-            ball_conf: (1,) confidence array.
-            color: BGR tuple for the ball bbox.
-
-        Returns:
-            Frame with ball bbox drawn.
-        """
+    def _draw_ball_bbox(self, frame, ball_xyxy, ball_conf, color=BALL_BBOX_COLOR):
         if len(ball_xyxy) == 0:
             return frame
-
         out = frame.copy()
-        x1, y1, x2, y2 = map(int, ball_xyxy[0])
-        # Clamp to frame bounds
-        x1 = max(0, x1)
-        y1 = max(0, y1)
-        x2 = min(frame.shape[1] - 1, x2)
-        y2 = min(frame.shape[0] - 1, y2)
-
-        # Draw solid bounding box with high opacity (more visible for small ball)
+        h, w = frame.shape[:2]
+        x1, y1, x2, y2 = max(0, int(ball_xyxy[0, 0])), max(0, int(ball_xyxy[0, 1])), min(w - 1, int(ball_xyxy[0, 2])), min(h - 1, int(ball_xyxy[0, 3]))
         cv2.rectangle(out, (x1, y1), (x2, y2), color, 3)
-
-        # Draw label with confidence
         conf = ball_conf[0] if len(ball_conf) > 0 else 0.0
         label = f"Ball {conf:.2f}"
-        font_scale = 0.6
-        thickness = 2
-        (tw, th), baseline = cv2.getTextSize(
-            label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness
-        )
-
-        # Position label above the bbox
-        tx = x1
-        ty = y1 - 5
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        tx, ty = x1, y1 - 5
         if ty - th < 0:
             ty = y2 + th + 5
-
-        # Draw background rectangle for label text
-        cv2.rectangle(out, (tx - 2, ty - th - 2), (tx + tw + 2, ty + 2),
-                      (0, 0, 0), -1)
-
-        # Draw text
-        cv2.putText(out, label, (tx, ty),
-                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness, cv2.LINE_AA)
-
+        cv2.rectangle(out, (tx - 2, ty - th - 2), (tx + tw + 2, ty + 2), (0, 0, 0), -1)
+        cv2.putText(out, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
         return out
 
     # ------------------------------------------------------------------
     # Video processing
     # ------------------------------------------------------------------
-    def process_video(
-        self,
-        source_video_path: str,
-        output_dir: str = "output",
-        fps: float = 30.0,
-        start_frame: int = 0,
-        max_frames: Optional[int] = None,
-        process_every_n: int = 1,
-    ):
-        """
-        Process an entire video and produce output videos.
-
-        Outputs:
-            - full_pitch_debug_map.mp4: Top-down pitch view (with ball + trajectory)
-            - annotated_video.mp4: Original frame with keypoints + team bboxes + ball bbox
-            - deep_analysis.mp4: Original frame with segmentation overlay + ball
-            - final_draft.mp4: Original frame with pitch debug map overlayed (PIP)
-            - keypoint_annotations.mp4: Original frame with keypoint skeleton overlays only
-                (no team bboxes, no ball bbox) — debug view for keypoint quality inspection
-
-        Args:
-            source_video_path: Path to input video.
-            output_dir: Directory for output files.
-            fps: Output video FPS.
-            start_frame: Frame index to start from.
-            max_frames: Maximum frames to process (None = all).
-            process_every_n: Process every Nth frame.
-
-        Yields:
-            dict results from process_frame() for each processed frame.
-        """
+    def process_video(self, source_video_path: str, output_dir: str = "output", fps: float = 30.0,
+                      start_frame: int = 0, max_frames: Optional[int] = None, process_every_n: int = 1):
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
-
-        full_pitch_path = output_path / "full_pitch_debug_map.mp4"
-        annotated_path = output_path / "annotated_video.mp4"
-        deep_analysis_path = output_path / "deep_analysis.mp4"
-        final_draft_path = output_path / "final_draft.mp4"
-        keypoint_annotations_path = output_path / "keypoint_annotations.mp4"
-
+        paths = {k: output_path / v for k, v in [("pitch", "full_pitch_debug_map.mp4"), ("annotated", "annotated_video.mp4"),
+                                                   ("deep", "deep_analysis.mp4"), ("draft", "final_draft.mp4"),
+                                                   ("keypoint", "keypoint_annotations.mp4")]}
         cap = cv2.VideoCapture(source_video_path)
         if not cap.isOpened():
             raise RuntimeError(f"Could not open video: {source_video_path}")
-
-        # Seek to start frame
         if start_frame > 0:
             cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-
         actual_fps = cap.get(cv2.CAP_PROP_FPS) or fps
-        frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-        print(f"Video: {actual_fps:.1f}FPS, {frame_w}x{frame_h}, {total_frames} frames")
-        print(f"Processing from frame {start_frame}, max_frames={max_frames}")
-
-        # Video writers
-        pitch_writer = Director.make_video_writer(
-            full_pitch_path, actual_fps, (CANVAS_W, CANVAS_H)
-        )
-        annotated_writer = Director.make_video_writer(
-            annotated_path, actual_fps, (frame_w, frame_h)
-        )
-        deep_writer = Director.make_video_writer(
-            deep_analysis_path, actual_fps, (frame_w, frame_h)
-        )
-        final_draft_writer = Director.make_video_writer(
-            final_draft_path, actual_fps, (frame_w, frame_h)
-        )
-        keypoint_annotations_writer = Director.make_video_writer(
-            keypoint_annotations_path, actual_fps, (frame_w, frame_h)
-        )
-
-        # Reset analyzer state for clean video-level processing
+        frame_w, frame_h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        pw = Director.make_video_writer(paths["pitch"], actual_fps, (CANVAS_W, CANVAS_H))
+        aw = Director.make_video_writer(paths["annotated"], actual_fps, (frame_w, frame_h))
+        dw = Director.make_video_writer(paths["deep"], actual_fps, (frame_w, frame_h))
+        fw = Director.make_video_writer(paths["draft"], actual_fps, (frame_w, frame_h))
+        kw = Director.make_video_writer(paths["keypoint"], actual_fps, (frame_w, frame_h))
         if self.team_analyzer is not None:
             self.team_analyzer.reset()
-
-        frame_idx = 0
-        processed_count = 0
-        # Reset ball trajectory for new video
+        frame_idx = processed_count = 0
         self.ball_trajectory = []
-
         try:
             while True:
                 ret, frame = cap.read()
                 if not ret or frame is None:
                     break
-
                 if max_frames is not None and processed_count >= max_frames:
                     break
-
                 if frame_idx % process_every_n != 0:
                     frame_idx += 1
                     continue
-
                 result = self.process_frame(frame, frame_idx)
                 processed_count += 1
-
-                # Write outputs
                 if result['pitch_canvas'] is not None:
-                    pitch_writer.write(result['pitch_canvas'])
+                    pw.write(result['pitch_canvas'])
                 if result['annotated_frame'] is not None:
-                    annotated_writer.write(result['annotated_frame'])
+                    aw.write(result['annotated_frame'])
                 if result['deep_analysis_frame'] is not None:
-                    deep_writer.write(result['deep_analysis_frame'])
-
-                # Keypoint annotations: original frame + keypoints only (debug view)
-                used_kpts = result.get('keypoints_used', [])
-                keypoint_frame = self._draw_keypoints_on_frame(frame.copy(), used_kpts)
-                keypoint_annotations_writer.write(keypoint_frame)
-
-                # Build final_draft frame: overlay pitch canvas onto original frame
+                    dw.write(result['deep_analysis_frame'])
+                kpts = result.get('keypoints_used', [])
+                kw.write(self._draw_keypoints_on_frame(frame.copy(), kpts))
                 if result['pitch_canvas'] is not None:
-                    # Make a copy of the raw (non-annotated) original frame
-                    final_draft_frame = frame.copy()
-                    # Resize pitch canvas to ~25% of frame width, place bottom-right
-                    pip_width = frame_w // 4
-                    pip_height = int(pip_width * CANVAS_H / CANVAS_W)
-                    pip_canvas = cv2.resize(result['pitch_canvas'], (pip_width, pip_height))
-                    # Overlay with a semi-transparent border background
-                    x_offset = frame_w - pip_width - 15
-                    y_offset = frame_h - pip_height - 15
-                    # Dark semi-transparent background behind the PIP
-                    overlay = final_draft_frame.copy()
-                    cv2.rectangle(overlay,
-                        (x_offset - 5, y_offset - 5),
-                        (x_offset + pip_width + 5, y_offset + pip_height + 5),
-                        (0, 0, 0), -1)
-                    cv2.addWeighted(overlay, 0.4, final_draft_frame, 0.6, 0, final_draft_frame)
-                    # Paste the resized pitch canvas
-                    final_draft_frame[y_offset:y_offset + pip_height, x_offset:x_offset + pip_width] = pip_canvas
-                    # Add a white border
-                    cv2.rectangle(final_draft_frame,
-                        (x_offset - 2, y_offset - 2),
-                        (x_offset + pip_width + 2, y_offset + pip_height + 2),
-                        (255, 255, 255), 2)
-                    final_draft_writer.write(final_draft_frame)
-
-                # Log every 30 frames
-                if processed_count % 30 == 0:
-                    mode = result['H_info'].get('mode', '?')
-                    n_kpts = len(result['H_info'].get('used_keypoints', []))
-                    n_players = len(result['player_pitch_pts'])
-                    has_ball = len(result.get('ball_xyxy', [])) > 0
-                    ball_str = f", ball={'YES' if has_ball else 'no'}"
-                    print(
-                        f"  Frame {frame_idx}: H={mode}, "
-                        f"kpts={n_kpts}, players={n_players}{ball_str}"
-                    )
-
+                    pip_w, pip_h = frame_w // 4, int((frame_w // 4) * CANVAS_H / CANVAS_W)
+                    pip = cv2.resize(result['pitch_canvas'], (pip_w, pip_h))
+                    ox, oy = frame_w - pip_w - 15, frame_h - pip_h - 15
+                    draft = frame.copy()
+                    ov = draft.copy()
+                    cv2.rectangle(ov, (ox - 5, oy - 5), (ox + pip_w + 5, oy + pip_h + 5), (0, 0, 0), -1)
+                    cv2.addWeighted(ov, 0.4, draft, 0.6, 0, draft)
+                    draft[oy:oy + pip_h, ox:ox + pip_w] = pip
+                    cv2.rectangle(draft, (ox - 2, oy - 2), (ox + pip_w + 2, oy + pip_h + 2), (255, 255, 255), 2)
+                    fw.write(draft)
                 yield result
                 frame_idx += 1
-
         finally:
             cap.release()
-            pitch_writer.release()
-            annotated_writer.release()
-            deep_writer.release()
-            final_draft_writer.release()
-            keypoint_annotations_writer.release()
-            print(f"\nDone. Processed {processed_count} frames.")
-            print(f"  Pitch canvas:           {full_pitch_path}")
-            print(f"  Annotated:              {annotated_path}")
-            print(f"  Deep analysis:          {deep_analysis_path}")
-            print(f"  Final draft:            {final_draft_path}")
-            print(f"  Keypoint annotations:   {keypoint_annotations_path}")
+            for w in [pw, aw, dw, fw, kw]:
+                w.release()

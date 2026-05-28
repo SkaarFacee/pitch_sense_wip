@@ -9,11 +9,6 @@ class PlayerDetector():
         self._tracking_active = False
 
     
-    def print_model_metadate(self) -> None:
-        print("Player classes:")
-        for class_id, class_name in self.model.names.items():
-            print(f"  {class_id}: {class_name}")
-
     def format_results(self, result, has_track_ids: bool = False):
         """
         Format YOLO detection results.
@@ -76,8 +71,6 @@ class PlayerDetector():
             class_name = str(class_names[cls_id]).lower()
             keep.append(class_name not in self.remove_names)
         keep = np.array(keep, dtype=bool)
-        if len(conf[keep]) == len(conf):
-            print('NOTHING REMOVED')
         return xyxy[keep], conf[keep], classes[keep], track_ids[keep]
     
     def get_player_bottom_center_points(self,xyxy):

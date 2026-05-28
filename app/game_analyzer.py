@@ -1,53 +1,18 @@
-"""
-GameAnalyzer — Derives match intelligence from pipeline tracking data.
-
-Uses per-frame player positions, team assignments, and ball position to
-compute:
-  - Ball possession percentages
-  - Pitch heatmaps (player density per team)
-  - Formation & positioning (center of mass, spread, defensive depth)
-  - Territory control (9-zone grid analysis)
-  - Match stats summary
-
-All positions are in pitch coordinates (meters) with the pitch dimensions:
-  Length: 105m (x-axis: 0 → 105)
-  Width:  68m  (y-axis: 0 → 68)
-"""
-
+"""GameAnalyzer — match intelligence from pipeline tracking data (possession, heatmaps, formation, territory, stats)."""
 import numpy as np
 import matplotlib
-matplotlib.use("Agg")  # Non-interactive backend for Streamlit
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-from typing import List, Dict, Optional, Tuple
+from typing import List, Tuple
+from constants import (
+    PITCH_LENGTH, PITCH_WIDTH, CENTER_X, CENTER_Y, CENTER_CIRCLE_RADIUS,
+    PENALTY_AREA_DEPTH, PENALTY_AREA_WIDTH, GOAL_AREA_DEPTH, GOAL_AREA_WIDTH,
+    PENALTY_SPOT_DISTANCE, PENALTY_ARC_RADIUS,
+    LEFT_PENALTY_X, RIGHT_PENALTY_X, LEFT_GOAL_AREA_X, RIGHT_GOAL_AREA_X,
+    PENALTY_Y_TOP, PENALTY_Y_BOTTOM, GOAL_AREA_Y_TOP, GOAL_AREA_Y_BOTTOM,
+    LEFT_PENALTY_SPOT_X, RIGHT_PENALTY_SPOT_X,
+)
 
-# ---------------------------------------------------------------------------
-# Pitch constants (same as constants.py)
-# ---------------------------------------------------------------------------
-PITCH_LENGTH = 105.0
-PITCH_WIDTH = 68.0
-CENTER_X = PITCH_LENGTH / 2.0
-CENTER_Y = PITCH_WIDTH / 2.0
-CENTER_CIRCLE_RADIUS = 9.15
-PENALTY_AREA_DEPTH = 16.5
-PENALTY_AREA_WIDTH = 40.32
-GOAL_AREA_DEPTH = 5.5
-GOAL_AREA_WIDTH = 18.32
-PENALTY_SPOT_DISTANCE = 11.0
-PENALTY_ARC_RADIUS = 9.15
-LEFT_PENALTY_X = PENALTY_AREA_DEPTH
-RIGHT_PENALTY_X = PITCH_LENGTH - PENALTY_AREA_DEPTH
-LEFT_GOAL_AREA_X = GOAL_AREA_DEPTH
-RIGHT_GOAL_AREA_X = PITCH_LENGTH - GOAL_AREA_DEPTH
-PENALTY_Y_TOP = (PITCH_WIDTH - PENALTY_AREA_WIDTH) / 2.0
-PENALTY_Y_BOTTOM = (PITCH_WIDTH + PENALTY_AREA_WIDTH) / 2.0
-GOAL_AREA_Y_TOP = (PITCH_WIDTH - GOAL_AREA_WIDTH) / 2.0
-GOAL_AREA_Y_BOTTOM = (PITCH_WIDTH + GOAL_AREA_WIDTH) / 2.0
-LEFT_PENALTY_SPOT_X = PENALTY_SPOT_DISTANCE
-RIGHT_PENALTY_SPOT_X = PITCH_LENGTH - PENALTY_SPOT_DISTANCE
-
-# Zone definitions for territory control (9 zones)
-# Columns: Defensive third (0-35m), Middle third (35-70m), Attacking third (70-105m)
 ZONE_X_EDGES = [0.0, 35.0, 70.0, PITCH_LENGTH]
 ZONE_Y_EDGES = [0.0, PITCH_WIDTH / 3.0, 2.0 * PITCH_WIDTH / 3.0, PITCH_WIDTH]
 ZONE_NAMES = [
@@ -58,242 +23,91 @@ ZONE_NAMES = [
 
 
 class GameAnalyzer:
-    """
-    Analyzes game data collected from the KeypointPipeline.
-    All methods are static — pass the list of per-frame data dicts.
-    """
+    """All methods are static — pass the list of per-frame data dicts."""
 
     # ------------------------------------------------------------------
-    # 1. POSSESSION ANALYSIS
+    # Shared data helper
     # ------------------------------------------------------------------
     @staticmethod
-    def compute_possession(
-        game_data: List[dict],
-        team1_label: str = "Team 1",
-        team2_label: str = "Team 2",
-    ) -> dict:
-        """
-        Determine possession by ball proximity to each team's players.
+    def _split_teams(entry):
+        positions = entry.get("player_positions")
+        team_ids = entry.get("team_ids")
+        if positions is None or team_ids is None:
+            return None, None, None, None
+        team_ids = np.asarray(team_ids)
+        positions = np.asarray(positions)
+        valid = team_ids >= 0
+        if not np.any(valid):
+            return None, None, None, None
+        valid_pos = positions[valid]
+        valid_tid = team_ids[valid]
+        t1 = valid_pos[valid_tid == 0]
+        t2 = valid_pos[valid_tid == 1]
+        return valid_pos, valid_tid, t1, t2
 
-        For each frame where ball is detected:
-          - Exclude goalkeepers (team_id == -1)
-          - Compute average distance from ball to Team 1 players
-          - Compute average distance from ball to Team 2 players
-          - Team with smaller average distance gets possession credit
-
-        Args:
-            game_data: List of per-frame dicts with 'player_positions',
-                       'team_ids', 'ball_position'
-            team1_label: Display name for Team 1
-            team2_label: Display name for Team 2
-
-        Returns:
-            dict: {
-                'team1_possession_pct': float,
-                'team2_possession_pct': float,
-                'team1_frames': int,
-                'team2_frames': int,
-                'total_ball_frames': int,
-                'team1_label': str,
-                'team2_label': str,
-            }
-        """
-        team1_frames = 0
-        team2_frames = 0
-        total_ball_frames = 0
-
+    # ------------------------------------------------------------------
+    # 1. POSSESSION
+    # ------------------------------------------------------------------
+    @staticmethod
+    def compute_possession(game_data: List[dict], team1_label="Team 1", team2_label="Team 2") -> dict:
+        t1_frames = t2_frames = total_ball = 0
         for entry in game_data:
             ball = entry.get("ball_position")
             if ball is None:
                 continue
-
-            positions = entry.get("player_positions")
-            team_ids = entry.get("team_ids")
-
-            if positions is None or team_ids is None or len(positions) == 0:
+            valid_pos, valid_tid, t1, t2 = GameAnalyzer._split_teams(entry)
+            if valid_pos is None or (len(t1) == 0 and len(t2) == 0):
                 continue
-
-            # Ensure team_ids is a numpy array
-            team_ids = np.asarray(team_ids)
-            positions = np.asarray(positions)
-
-            # Filter out goalkeepers (team_id == -1) and referees (team_id == -2)
-            valid_mask = (team_ids >= 0)
-            if not np.any(valid_mask):
-                continue
-
-            valid_positions = positions[valid_mask]
-            valid_team_ids = team_ids[valid_mask]
-
-            # Split by team
-            team1_mask = valid_team_ids == 0
-            team2_mask = valid_team_ids == 1
-
-            if not np.any(team1_mask) and not np.any(team2_mask):
-                continue
-
-            # Compute average distance from ball to each team
             ball_arr = np.asarray(ball, dtype=np.float32).reshape(1, 2)
-            dists = np.linalg.norm(valid_positions - ball_arr, axis=1)
-
-            avg_dist_team1 = np.mean(dists[team1_mask]) if np.any(team1_mask) else float("inf")
-            avg_dist_team2 = np.mean(dists[team2_mask]) if np.any(team2_mask) else float("inf")
-
-            total_ball_frames += 1
-            if avg_dist_team1 <= avg_dist_team2:
-                team1_frames += 1
-            else:
-                team2_frames += 1
-
-        if total_ball_frames == 0:
-            return {
-                "team1_possession_pct": 0.0,
-                "team2_possession_pct": 0.0,
-                "team1_frames": 0,
-                "team2_frames": 0,
-                "total_ball_frames": 0,
-                "team1_label": team1_label,
-                "team2_label": team2_label,
-            }
-
-        team1_pct = round(team1_frames / total_ball_frames * 100, 1)
-        team2_pct = round(team2_frames / total_ball_frames * 100, 1)
-
-        return {
-            "team1_possession_pct": team1_pct,
-            "team2_possession_pct": team2_pct,
-            "team1_frames": team1_frames,
-            "team2_frames": team2_frames,
-            "total_ball_frames": total_ball_frames,
-            "team1_label": team1_label,
-            "team2_label": team2_label,
-        }
+            dists = np.linalg.norm(valid_pos - ball_arr, axis=1)
+            avg1 = np.mean(dists[valid_tid == 0]) if len(t1) > 0 else float("inf")
+            avg2 = np.mean(dists[valid_tid == 1]) if len(t2) > 0 else float("inf")
+            total_ball += 1
+            t1_frames += avg1 <= avg2
+            t2_frames += avg2 < avg1
+        pct1 = round(t1_frames / max(total_ball, 1) * 100, 1)
+        pct2 = round(t2_frames / max(total_ball, 1) * 100, 1)
+        return {"team1_possession_pct": pct1, "team2_possession_pct": pct2,
+                "team1_frames": t1_frames, "team2_frames": t2_frames,
+                "total_ball_frames": total_ball, "team1_label": team1_label, "team2_label": team2_label}
 
     # ------------------------------------------------------------------
-    # 2. PITCH HEATMAPS
+    # 2. HEATMAPS
     # ------------------------------------------------------------------
     @staticmethod
-    def compute_heatmaps(
-        game_data: List[dict],
-        bins: Tuple[int, int] = (21, 14),
-    ) -> dict:
-        """
-        Build 2D player-density histograms per team across all frames.
-
-        Args:
-            game_data: List of per-frame dicts
-            bins: (x_bins, y_bins) for the histogram grid
-
-        Returns:
-            dict: {
-                'team1_heatmap': (H, W) np.ndarray,
-                'team2_heatmap': (H, W) np.ndarray,
-                'x_edges': np.ndarray,
-                'y_edges': np.ndarray,
-                'team1_count': int (total player samples),
-                'team2_count': int (total player samples),
-            }
-        """
-        team1_positions = []
-        team2_positions = []
-
+    def compute_heatmaps(game_data: List[dict], bins: Tuple[int, int] = (21, 14)) -> dict:
+        t1_all, t2_all = [], []
         for entry in game_data:
-            positions = entry.get("player_positions")
-            team_ids = entry.get("team_ids")
-            if positions is None or team_ids is None:
-                continue
-
-            team_ids = np.asarray(team_ids)
-            positions = np.asarray(positions)
-
-            # Filter valid players (not GK, not referee)
-            valid_mask = (team_ids >= 0)
-
-            t1_mask = valid_mask & (team_ids == 0)
-            t2_mask = valid_mask & (team_ids == 1)
-
-            if np.any(t1_mask):
-                team1_positions.append(positions[t1_mask])
-            if np.any(t2_mask):
-                team2_positions.append(positions[t2_mask])
-
-        t1_all = np.vstack(team1_positions) if team1_positions else np.empty((0, 2))
-        t2_all = np.vstack(team2_positions) if team2_positions else np.empty((0, 2))
-
-        # Remove points clearly outside pitch bounds
+            _, _, t1, t2 = GameAnalyzer._split_teams(entry)
+            if t1 is not None and len(t1) > 0:
+                t1_all.append(t1)
+            if t2 is not None and len(t2) > 0:
+                t2_all.append(t2)
+        t1_all = np.vstack(t1_all) if t1_all else np.empty((0, 2))
+        t2_all = np.vstack(t2_all) if t2_all else np.empty((0, 2))
         if len(t1_all) > 0:
-            t1_all = t1_all[(t1_all[:, 0] >= -5) & (t1_all[:, 0] <= PITCH_LENGTH + 5) &
-                            (t1_all[:, 1] >= -5) & (t1_all[:, 1] <= PITCH_WIDTH + 5)]
+            mask = (t1_all[:, 0] >= -5) & (t1_all[:, 0] <= PITCH_LENGTH + 5) & (t1_all[:, 1] >= -5) & (t1_all[:, 1] <= PITCH_WIDTH + 5)
+            t1_all = t1_all[mask]
         if len(t2_all) > 0:
-            t2_all = t2_all[(t2_all[:, 0] >= -5) & (t2_all[:, 0] <= PITCH_LENGTH + 5) &
-                            (t2_all[:, 1] >= -5) & (t2_all[:, 1] <= PITCH_WIDTH + 5)]
-
+            mask = (t2_all[:, 0] >= -5) & (t2_all[:, 0] <= PITCH_LENGTH + 5) & (t2_all[:, 1] >= -5) & (t2_all[:, 1] <= PITCH_WIDTH + 5)
+            t2_all = t2_all[mask]
         x_edges = np.linspace(0, PITCH_LENGTH, bins[0] + 1)
         y_edges = np.linspace(0, PITCH_WIDTH, bins[1] + 1)
-
-        if len(t1_all) > 0:
-            h1, _, _ = np.histogram2d(t1_all[:, 0], t1_all[:, 1], bins=(x_edges, y_edges))
-        else:
-            h1 = np.zeros((bins[0], bins[1]))
-
-        if len(t2_all) > 0:
-            h2, _, _ = np.histogram2d(t2_all[:, 0], t2_all[:, 1], bins=(x_edges, y_edges))
-        else:
-            h2 = np.zeros((bins[0], bins[1]))
-
-        return {
-            "team1_heatmap": h1,
-            "team2_heatmap": h2,
-            "x_edges": x_edges,
-            "y_edges": y_edges,
-            "team1_count": len(t1_all),
-            "team2_count": len(t2_all),
-        }
+        h1 = np.histogram2d(t1_all[:, 0], t1_all[:, 1], bins=(x_edges, y_edges))[0] if len(t1_all) > 0 else np.zeros((bins[0], bins[1]))
+        h2 = np.histogram2d(t2_all[:, 0], t2_all[:, 1], bins=(x_edges, y_edges))[0] if len(t2_all) > 0 else np.zeros((bins[0], bins[1]))
+        return {"team1_heatmap": h1, "team2_heatmap": h2, "x_edges": x_edges, "y_edges": y_edges,
+                "team1_count": len(t1_all), "team2_count": len(t2_all)}
 
     @staticmethod
-    def draw_pitch_heatmap(
-        heatmap: np.ndarray,
-        x_edges: np.ndarray,
-        y_edges: np.ndarray,
-        title: str,
-        team_color: Tuple[int, int, int],
-        cmap: str = "Reds",
-    ) -> plt.Figure:
-        """
-        Draw a pitch soccer field with a heatmap overlay.
-
-        Args:
-            heatmap: (H, W) density array
-            x_edges: Bin edges for x (pitch length)
-            y_edges: Bin edges for y (pitch width)
-            title: Plot title
-            team_color: BGR tuple for accent
-            cmap: Matplotlib colormap name
-
-        Returns:
-            matplotlib Figure ready for st.pyplot()
-        """
+    def draw_pitch_heatmap(heatmap: np.ndarray, x_edges: np.ndarray, y_edges: np.ndarray,
+                           title: str, team_color: Tuple[int, int, int], cmap: str = "Reds") -> plt.Figure:
         fig, ax = plt.subplots(1, 1, figsize=(8, 5.5))
-
-        # Draw pitch outline
         GameAnalyzer._draw_pitch_outline(ax)
-
-        # Normalize heatmap to 0-1 for display
         h = heatmap.copy()
         if h.max() > 0:
-            h = h / h.max()
-
-        # Transpose for imshow (imshow expects rows=y, cols=x)
-        extent = [x_edges[0], x_edges[-1], y_edges[0], y_edges[-1]]
-        ax.imshow(
-            h.T,
-            extent=extent,
-            origin="lower",
-            cmap=cmap,
-            alpha=0.65,
-            aspect="auto",
-        )
-
+            h /= h.max()
+        ax.imshow(h.T, extent=[x_edges[0], x_edges[-1], y_edges[0], y_edges[-1]],
+                  origin="lower", cmap=cmap, alpha=0.65, aspect="auto")
         ax.set_xlim(-2, PITCH_LENGTH + 2)
         ax.set_ylim(-2, PITCH_WIDTH + 2)
         ax.set_title(title, fontsize=14, fontweight="bold", pad=10)
@@ -304,133 +118,57 @@ class GameAnalyzer:
         return fig
 
     # ------------------------------------------------------------------
-    # 3. FORMATION & POSITIONING
+    # 3. FORMATION
     # ------------------------------------------------------------------
     @staticmethod
     def compute_formation(game_data: List[dict]) -> dict:
-        """
-        Compute per-frame and aggregate formation metrics.
-
-        Returns:
-            dict: {
-                'team1_centers': list of (mean_x, mean_y) per frame,
-                'team2_centers': list of (mean_x, mean_y) per frame,
-                'team1_spreads': list of float (mean dist from center) per frame,
-                'team2_spreads': list of float,
-                'team1_avg_center': (mean_x, mean_y),
-                'team2_avg_center': (mean_x, mean_y),
-                'team1_avg_spread': float,
-                'team2_avg_spread': float,
-                'team1_defensive_depth': float (avg min x),
-                'team2_defensive_depth': float,
-                'frames_with_players': int,
-            }
-        """
-        t1_centers = []
-        t2_centers = []
-        t1_spreads = []
-        t2_spreads = []
-        t1_min_x = []  # defensive depth
-        t2_min_x = []
-        frames_with_players = 0
-
+        t1_centers, t2_centers = [], []
+        t1_spreads, t2_spreads = [], []
+        t1_min_x, t2_min_x = [], []
+        frames = 0
         for entry in game_data:
-            positions = entry.get("player_positions")
-            team_ids = entry.get("team_ids")
-            if positions is None or team_ids is None or len(positions) == 0:
+            _, _, t1, t2 = GameAnalyzer._split_teams(entry)
+            if t1 is None and t2 is None:
                 continue
-
-            team_ids = np.asarray(team_ids)
-            positions = np.asarray(positions)
-            valid_mask = team_ids >= 0
-            if not np.any(valid_mask):
-                continue
-
-            valid_pos = positions[valid_mask]
-            valid_tid = team_ids[valid_mask]
-
-            t1_mask = valid_tid == 0
-            t2_mask = valid_tid == 1
-
-            if np.any(t1_mask):
-                t1_pts = valid_pos[t1_mask]
-                center = np.mean(t1_pts, axis=0)
-                t1_centers.append(center)
-                spread = np.mean(np.linalg.norm(t1_pts - center, axis=1))
-                t1_spreads.append(spread)
-                t1_min_x.append(np.min(t1_pts[:, 0]))
-
-            if np.any(t2_mask):
-                t2_pts = valid_pos[t2_mask]
-                center = np.mean(t2_pts, axis=0)
-                t2_centers.append(center)
-                spread = np.mean(np.linalg.norm(t2_pts - center, axis=1))
-                t2_spreads.append(spread)
-                t2_min_x.append(np.min(t2_pts[:, 0]))
-
-            if np.any(t1_mask) or np.any(t2_mask):
-                frames_with_players += 1
-
-        return {
-            "team1_centers": t1_centers,
-            "team2_centers": t2_centers,
-            "team1_spreads": t1_spreads,
-            "team2_spreads": t2_spreads,
-            "team1_avg_center": np.mean(t1_centers, axis=0).tolist() if t1_centers else None,
-            "team2_avg_center": np.mean(t2_centers, axis=0).tolist() if t2_centers else None,
-            "team1_avg_spread": float(np.mean(t1_spreads)) if t1_spreads else 0.0,
-            "team2_avg_spread": float(np.mean(t2_spreads)) if t2_spreads else 0.0,
-            "team1_defensive_depth": float(np.mean(t1_min_x)) if t1_min_x else 0.0,
-            "team2_defensive_depth": float(np.mean(t2_min_x)) if t2_min_x else 0.0,
-            "frames_with_players": frames_with_players,
-        }
+            frames += 1
+            if len(t1) > 0:
+                c = np.mean(t1, axis=0)
+                t1_centers.append(c)
+                t1_spreads.append(np.mean(np.linalg.norm(t1 - c, axis=1)))
+                t1_min_x.append(np.min(t1[:, 0]))
+            if len(t2) > 0:
+                c = np.mean(t2, axis=0)
+                t2_centers.append(c)
+                t2_spreads.append(np.mean(np.linalg.norm(t2 - c, axis=1)))
+                t2_min_x.append(np.min(t2[:, 0]))
+        return {"team1_centers": t1_centers, "team2_centers": t2_centers,
+                "team1_spreads": t1_spreads, "team2_spreads": t2_spreads,
+                "team1_avg_center": np.mean(t1_centers, axis=0).tolist() if t1_centers else None,
+                "team2_avg_center": np.mean(t2_centers, axis=0).tolist() if t2_centers else None,
+                "team1_avg_spread": float(np.mean(t1_spreads)) if t1_spreads else 0.0,
+                "team2_avg_spread": float(np.mean(t2_spreads)) if t2_spreads else 0.0,
+                "team1_defensive_depth": float(np.mean(t1_min_x)) if t1_min_x else 0.0,
+                "team2_defensive_depth": float(np.mean(t2_min_x)) if t2_min_x else 0.0,
+                "frames_with_players": frames}
 
     @staticmethod
-    def draw_formation_scatter(
-        game_data: List[dict],
-        team1_color: Tuple[float, float, float] = (0.2, 0.4, 0.9),
-        team2_color: Tuple[float, float, float] = (0.9, 0.2, 0.2),
-        team1_label: str = "Team 1",
-        team2_label: str = "Team 2",
-        max_frames: int = 100,
-    ) -> plt.Figure:
-        """
-        Scatter all player positions on a pitch, colored by team.
-        Samples up to max_frames to avoid overplotting.
-
-        Returns:
-            matplotlib Figure
-        """
+    def draw_formation_scatter(game_data: List[dict], team1_color=(0.2, 0.4, 0.9),
+                               team2_color=(0.9, 0.2, 0.2), team1_label="Team 1",
+                               team2_label="Team 2", max_frames: int = 100) -> plt.Figure:
         fig, ax = plt.subplots(1, 1, figsize=(8, 5.5))
         GameAnalyzer._draw_pitch_outline(ax)
-
-        # Collect sampled positions
-        t1_pts = []
-        t2_pts = []
+        t1_pts, t2_pts = [], []
         step = max(1, len(game_data) // max_frames)
         for entry in game_data[::step]:
-            positions = entry.get("player_positions")
-            team_ids = entry.get("team_ids")
-            if positions is None or team_ids is None:
-                continue
-            team_ids = np.asarray(team_ids)
-            positions = np.asarray(positions)
-            valid = team_ids >= 0
-            if not np.any(valid):
-                continue
-            t1_pts.extend(positions[valid & (team_ids == 0)])
-            t2_pts.extend(positions[valid & (team_ids == 1)])
-
-        t1_arr = np.array(t1_pts) if t1_pts else np.empty((0, 2))
-        t2_arr = np.array(t2_pts) if t2_pts else np.empty((0, 2))
-
-        if len(t1_arr) > 0:
-            ax.scatter(t1_arr[:, 0], t1_arr[:, 1], c=[team1_color],
-                       alpha=0.5, s=15, label=team1_label, edgecolors="none")
-        if len(t2_arr) > 0:
-            ax.scatter(t2_arr[:, 0], t2_arr[:, 1], c=[team2_color],
-                       alpha=0.5, s=15, label=team2_label, edgecolors="none")
-
+            _, _, t1, t2 = GameAnalyzer._split_teams(entry)
+            if t1 is not None and len(t1) > 0:
+                t1_pts.extend(t1)
+            if t2 is not None and len(t2) > 0:
+                t2_pts.extend(t2)
+        for pts, c, lbl in [(np.array(t1_pts) if t1_pts else np.empty((0, 2)), team1_color, team1_label),
+                            (np.array(t2_pts) if t2_pts else np.empty((0, 2)), team2_color, team2_label)]:
+            if len(pts) > 0:
+                ax.scatter(pts[:, 0], pts[:, 1], c=[c], alpha=0.5, s=15, label=lbl, edgecolors="none")
         ax.set_xlim(-2, PITCH_LENGTH + 2)
         ax.set_ylim(-2, PITCH_WIDTH + 2)
         ax.set_title("Player Positioning Scatter", fontsize=14, fontweight="bold")
@@ -441,261 +179,95 @@ class GameAnalyzer:
         fig.tight_layout()
         return fig
 
-    @staticmethod
-    def draw_formation_center_chart(
-        formation_data: dict,
-        team1_label: str = "Team 1",
-        team2_label: str = "Team 2",
-    ) -> plt.Figure:
-        """
-        Line chart showing team center-of-mass x-position across frames.
-        Higher x = more attacking, lower x = more defensive.
-
-        Returns:
-            matplotlib Figure
-        """
-        fig, ax = plt.subplots(1, 1, figsize=(9, 4))
-
-        t1_centers = formation_data.get("team1_centers", [])
-        t2_centers = formation_data.get("team2_centers", [])
-
-        if t1_centers:
-            t1_x = [c[0] for c in t1_centers]
-            ax.plot(t1_x, label=team1_label, alpha=0.8, linewidth=0.8)
-        if t2_centers:
-            t2_x = [c[0] for c in t2_centers]
-            ax.plot(t2_x, label=team2_label, alpha=0.8, linewidth=0.8)
-
-        # Draw pitch thirds reference lines
-        ax.axhline(35.0, color="gray", linestyle="--", alpha=0.3, linewidth=0.5)
-        ax.axhline(70.0, color="gray", linestyle="--", alpha=0.3, linewidth=0.5)
-        ax.fill_between([0, len(t1_centers or t2_centers or [0])], 0, 35, alpha=0.05, color="blue")
-        ax.fill_between([0, len(t1_centers or t2_centers or [0])], 70, 105, alpha=0.05, color="red")
-
-        ax.set_ylim(0, PITCH_LENGTH)
-        ax.set_ylabel("Attack → X Position on Pitch (m)")
-        ax.set_xlabel("Frame")
-        ax.set_title("Team Positioning (Center of Mass X) — Higher = More Attacking", fontsize=12)
-        ax.legend(fontsize=10)
-        fig.tight_layout()
-        return fig
-
     # ------------------------------------------------------------------
-    # 4. TERRITORY CONTROL
+    # 4. TERRITORY
     # ------------------------------------------------------------------
     @staticmethod
     def compute_territory(game_data: List[dict]) -> dict:
-        """
-        Divide pitch into 9 zones and count player presence per team.
-
-        Returns:
-            dict: {
-                'zone_grid': 3×3 list of dicts:
-                    { 'zone_name': str, 'team1_pct': float, 'team2_pct': float,
-                      'team1_frames': int, 'team2_frames': int, 'total_frames': int,
-                      'dominant_team': 0 | 1 | -1 (neutral) }
-                'team1_total_presence': int (total player-zone occurrences)
-                'team2_total_presence': int
-            }
-        """
-        # Initialize zone counters: zone_grid[row][col]
-        zone_counts = [[{"team1": 0, "team2": 0} for _ in range(3)] for _ in range(3)]
-
+        counts = [[{"t1": 0, "t2": 0} for _ in range(3)] for _ in range(3)]
         for entry in game_data:
-            positions = entry.get("player_positions")
-            team_ids = entry.get("team_ids")
-            if positions is None or team_ids is None:
+            _, valid_tid, t1, t2 = GameAnalyzer._split_teams(entry)
+            if valid_tid is None:
                 continue
-
-            team_ids = np.asarray(team_ids)
-            positions = np.asarray(positions)
-            valid = team_ids >= 0
-            if not np.any(valid):
-                continue
-
-            valid_pos = positions[valid]
-            valid_tid = team_ids[valid]
-
-            for i in range(len(valid_pos)):
-                x, y = valid_pos[i]
-                tid = valid_tid[i]
-
-                # Determine zone
-                col = np.searchsorted(ZONE_X_EDGES[1:], x, side="right")
-                row = np.searchsorted(ZONE_Y_EDGES[1:], y, side="right")
-                col = min(col, 2)
-                row = min(row, 2)
-
-                if tid == 0:
-                    zone_counts[row][col]["team1"] += 1
-                elif tid == 1:
-                    zone_counts[row][col]["team2"] += 1
-
-        # Build output
-        zone_grid = []
-        team1_total = 0
-        team2_total = 0
+            positions = np.asarray(entry["player_positions"])[np.asarray(entry["team_ids"]) >= 0]
+            for i in range(len(positions)):
+                x, y = positions[i]
+                col = min(np.searchsorted(ZONE_X_EDGES[1:], x, side="right"), 2)
+                row = min(np.searchsorted(ZONE_Y_EDGES[1:], y, side="right"), 2)
+                if valid_tid[i] == 0:
+                    counts[row][col]["t1"] += 1
+                elif valid_tid[i] == 1:
+                    counts[row][col]["t2"] += 1
+        zone_grid, t1_total, t2_total = [], 0, 0
         for row in range(3):
             zone_row = []
             for col in range(3):
-                t1 = zone_counts[row][col]["team1"]
-                t2 = zone_counts[row][col]["team2"]
+                t1, t2 = counts[row][col]["t1"], counts[row][col]["t2"]
                 total = t1 + t2
-                team1_total += t1
-                team2_total += t2
-
-                if total == 0:
-                    dominant = -1
-                    t1_pct = 0.0
-                    t2_pct = 0.0
-                else:
-                    t1_pct = round(t1 / total * 100, 1)
-                    t2_pct = round(t2 / total * 100, 1)
-                    dominant = 0 if t1 >= t2 else 1
-
-                zone_row.append({
-                    "zone_name": ZONE_NAMES[row][col],
-                    "team1_pct": t1_pct,
-                    "team2_pct": t2_pct,
-                    "team1_frames": t1,
-                    "team2_frames": t2,
-                    "total_frames": total,
-                    "dominant_team": dominant,
-                })
+                t1_total += t1
+                t2_total += t2
+                dominant = -1 if total == 0 else (0 if t1 >= t2 else 1)
+                t1_pct = round(t1 / max(total, 1) * 100, 1) if total > 0 else 0.0
+                t2_pct = round(t2 / max(total, 1) * 100, 1) if total > 0 else 0.0
+                zone_row.append({"zone_name": ZONE_NAMES[row][col], "team1_pct": t1_pct, "team2_pct": t2_pct,
+                                 "team1_frames": t1, "team2_frames": t2, "total_frames": total, "dominant_team": dominant})
             zone_grid.append(zone_row)
-
-        return {
-            "zone_grid": zone_grid,
-            "team1_total_presence": team1_total,
-            "team2_total_presence": team2_total,
-        }
+        return {"zone_grid": zone_grid, "team1_total_presence": t1_total, "team2_total_presence": t2_total}
 
     # ------------------------------------------------------------------
-    # 5. MATCH STATS SUMMARY
+    # 5. MATCH STATS
     # ------------------------------------------------------------------
     @staticmethod
     def compute_match_stats(game_data: List[dict]) -> dict:
-        """
-        Compute aggregate match statistics.
-
-        Returns:
-            dict with keys:
-                total_frames, ball_detection_rate, avg_players_total,
-                avg_players_team1, avg_players_team2, avg_player_spread,
-                ball_progression_m (approximate)
-        """
-        total_frames = len(game_data)
+        total = len(game_data)
         ball_frames = sum(1 for e in game_data if e.get("ball_position") is not None)
-        ball_detection_rate = (ball_frames / max(total_frames, 1)) * 100
-
-        # Player counts per frame
-        t1_counts = []
-        t2_counts = []
-        all_spreads = []
-
-        for entry in game_data:
-            positions = entry.get("player_positions")
-            team_ids = entry.get("team_ids")
-            if positions is None or team_ids is None or len(positions) == 0:
-                t1_counts.append(0)
-                t2_counts.append(0)
-                continue
-
-            team_ids = np.asarray(team_ids)
-            positions = np.asarray(positions)
-            valid = team_ids >= 0
-            t1_counts.append(int(np.sum(valid & (team_ids == 0))))
-            t2_counts.append(int(np.sum(valid & (team_ids == 1))))
-
-            # Spread
-            valid_pos = positions[valid]
-            if len(valid_pos) > 1:
-                center = np.mean(valid_pos, axis=0)
-                spread = float(np.mean(np.linalg.norm(valid_pos - center, axis=1)))
-                all_spreads.append(spread)
-
-        # Ball progression: approximate total distance ball moved
+        t1_counts, t2_counts, spreads = [], [], []
         ball_path = []
         for entry in game_data:
+            _, valid_tid, _, _ = GameAnalyzer._split_teams(entry)
+            if valid_tid is not None:
+                t1_counts.append(int(np.sum(valid_tid == 0)))
+                t2_counts.append(int(np.sum(valid_tid == 1)))
+                positions = np.asarray(entry["player_positions"])[valid_tid]
+                if len(positions) > 1:
+                    c = np.mean(positions, axis=0)
+                    spreads.append(float(np.mean(np.linalg.norm(positions - c, axis=1))))
+            else:
+                t1_counts.append(0)
+                t2_counts.append(0)
             bp = entry.get("ball_position")
             if bp is not None:
                 ball_path.append(np.asarray(bp))
-        if len(ball_path) > 1:
-            ball_progression = float(np.sum(np.linalg.norm(np.diff(ball_path, axis=0), axis=1)))
-        else:
-            ball_progression = 0.0
-
-        return {
-            "total_frames": total_frames,
-            "ball_detection_frames": ball_frames,
-            "ball_detection_rate": round(ball_detection_rate, 1),
-            "avg_players_total": round(np.mean([a + b for a, b in zip(t1_counts, t2_counts)]), 1),
-            "avg_players_team1": round(np.mean(t1_counts), 1),
-            "avg_players_team2": round(np.mean(t2_counts), 1),
-            "avg_player_spread": round(np.mean(all_spreads), 2) if all_spreads else 0.0,
-            "ball_progression_m": round(ball_progression, 1),
-        }
+        ball_prog = float(np.sum(np.linalg.norm(np.diff(ball_path, axis=0), axis=1))) if len(ball_path) > 1 else 0.0
+        return {"total_frames": total, "ball_detection_frames": ball_frames,
+                "ball_detection_rate": round(ball_frames / max(total, 1) * 100, 1),
+                "avg_players_total": round(np.mean([a + b for a, b in zip(t1_counts, t2_counts)]), 1),
+                "avg_players_team1": round(np.mean(t1_counts), 1),
+                "avg_players_team2": round(np.mean(t2_counts), 1),
+                "avg_player_spread": round(np.mean(spreads), 2) if spreads else 0.0,
+                "ball_progression_m": round(ball_prog, 1)}
 
     # ------------------------------------------------------------------
     # Pitch Drawing Utility
     # ------------------------------------------------------------------
     @staticmethod
     def _draw_pitch_outline(ax: plt.Axes) -> None:
-        """Draw a soccer pitch outline on the given matplotlib Axes."""
-        # Pitch boundary
-        ax.plot([0, PITCH_LENGTH, PITCH_LENGTH, 0, 0],
-                [0, 0, PITCH_WIDTH, PITCH_WIDTH, 0],
-                color="black", linewidth=1.5)
-
-        # Halfway line
+        ax.plot([0, PITCH_LENGTH, PITCH_LENGTH, 0, 0], [0, 0, PITCH_WIDTH, PITCH_WIDTH, 0], color="black", linewidth=1.5)
         ax.plot([CENTER_X, CENTER_X], [0, PITCH_WIDTH], color="black", linewidth=1.0)
-
-        # Center circle
-        center_circle = plt.Circle((CENTER_X, CENTER_Y), CENTER_CIRCLE_RADIUS,
-                                    fill=False, color="black", linewidth=1.0)
-        ax.add_patch(center_circle)
+        circ = plt.Circle((CENTER_X, CENTER_Y), CENTER_CIRCLE_RADIUS, fill=False, color="black", linewidth=1.0)
+        ax.add_patch(circ)
         ax.plot(CENTER_X, CENTER_Y, "ko", markersize=3)
-
-        # Left penalty area
-        ax.plot([0, LEFT_PENALTY_X, LEFT_PENALTY_X, 0],
-                [PENALTY_Y_TOP, PENALTY_Y_TOP, PENALTY_Y_BOTTOM, PENALTY_Y_BOTTOM],
-                color="black", linewidth=1.0)
-
-        # Right penalty area
-        ax.plot([PITCH_LENGTH, RIGHT_PENALTY_X, RIGHT_PENALTY_X, PITCH_LENGTH],
-                [PENALTY_Y_TOP, PENALTY_Y_TOP, PENALTY_Y_BOTTOM, PENALTY_Y_BOTTOM],
-                color="black", linewidth=1.0)
-
-        # Left goal area
-        ax.plot([0, LEFT_GOAL_AREA_X, LEFT_GOAL_AREA_X, 0],
-                [GOAL_AREA_Y_TOP, GOAL_AREA_Y_TOP, GOAL_AREA_Y_BOTTOM, GOAL_AREA_Y_BOTTOM],
-                color="black", linewidth=1.0)
-
-        # Right goal area
-        ax.plot([PITCH_LENGTH, RIGHT_GOAL_AREA_X, RIGHT_GOAL_AREA_X, PITCH_LENGTH],
-                [GOAL_AREA_Y_TOP, GOAL_AREA_Y_TOP, GOAL_AREA_Y_BOTTOM, GOAL_AREA_Y_BOTTOM],
-                color="black", linewidth=1.0)
-
-        # Penalty spots
+        for pts in [
+            ([0, LEFT_PENALTY_X, LEFT_PENALTY_X, 0], [PENALTY_Y_TOP, PENALTY_Y_TOP, PENALTY_Y_BOTTOM, PENALTY_Y_BOTTOM]),
+            ([PITCH_LENGTH, RIGHT_PENALTY_X, RIGHT_PENALTY_X, PITCH_LENGTH], [PENALTY_Y_TOP, PENALTY_Y_TOP, PENALTY_Y_BOTTOM, PENALTY_Y_BOTTOM]),
+            ([0, LEFT_GOAL_AREA_X, LEFT_GOAL_AREA_X, 0], [GOAL_AREA_Y_TOP, GOAL_AREA_Y_TOP, GOAL_AREA_Y_BOTTOM, GOAL_AREA_Y_BOTTOM]),
+            ([PITCH_LENGTH, RIGHT_GOAL_AREA_X, RIGHT_GOAL_AREA_X, PITCH_LENGTH], [GOAL_AREA_Y_TOP, GOAL_AREA_Y_TOP, GOAL_AREA_Y_BOTTOM, GOAL_AREA_Y_BOTTOM]),
+        ]:
+            ax.plot(pts[0], pts[1], color="black", linewidth=1.0)
         ax.plot(LEFT_PENALTY_SPOT_X, CENTER_Y, "ko", markersize=3)
         ax.plot(RIGHT_PENALTY_SPOT_X, CENTER_Y, "ko", markersize=3)
-
-        # Penalty arcs (simplified as arc patches)
-        left_arc = mpatches.Arc((LEFT_PENALTY_SPOT_X, CENTER_Y),
-                                 PENALTY_ARC_RADIUS * 2, PENALTY_ARC_RADIUS * 2,
-                                 angle=0, theta1=0, theta2=0,  # Invisible by default
-                                 color="black", linewidth=1.0)
-        # We approximate arcs with a few line segments
         theta = np.arccos((LEFT_PENALTY_X - LEFT_PENALTY_SPOT_X) / PENALTY_ARC_RADIUS)
-        arc_angles = np.linspace(-theta, theta, 20)
-        arc_x = LEFT_PENALTY_SPOT_X + PENALTY_ARC_RADIUS * np.cos(arc_angles)
-        arc_y = CENTER_Y + PENALTY_ARC_RADIUS * np.sin(arc_angles)
-        ax.plot(arc_x, arc_y, color="black", linewidth=1.0)
-
-        arc_angles2 = np.linspace(np.pi - theta, np.pi + theta, 20)
-        arc_x2 = RIGHT_PENALTY_SPOT_X + PENALTY_ARC_RADIUS * np.cos(arc_angles2)
-        arc_y2 = CENTER_Y + PENALTY_ARC_RADIUS * np.sin(arc_angles2)
-        ax.plot(arc_x2, arc_y2, color="black", linewidth=1.0)
-
-        # Set pitch background
-        ax.set_facecolor("#e8f5e9")  # Light green
+        for cx, a1, a2 in [(LEFT_PENALTY_SPOT_X, -theta, theta), (RIGHT_PENALTY_SPOT_X, np.pi - theta, np.pi + theta)]:
+            ang = np.linspace(a1, a2, 20)
+            ax.plot(cx + PENALTY_ARC_RADIUS * np.cos(ang), CENTER_Y + PENALTY_ARC_RADIUS * np.sin(ang), color="black", linewidth=1.0)
+        ax.set_facecolor("#e8f5e9")

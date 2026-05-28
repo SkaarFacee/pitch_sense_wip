@@ -23,11 +23,6 @@ class Segmentor():
         self.model=YOLO(model_path)
         self.classes=self.model.names
 
-    def print_model_metadata(self) -> None:
-        print("Segmentation classes:")
-        for class_id, class_name in self.model.names.items():
-            print(f"  {class_id}: {class_name}")
-
     def process_class_name(self, class_name):
         class_name = class_name.strip()
         class_name = class_name.replace("First ", "").replace("Second ", "")
@@ -48,7 +43,6 @@ class Segmentor():
 
             bbox,contour=self.extract_arc_box(mask)
             if contour is None:
-                print('LOG THIS EDGE CASE')
                 continue
             area = cv2.contourArea(contour)
             

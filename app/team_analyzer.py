@@ -430,17 +430,6 @@ class TeamColorAnalyzer:
         # Return Euclidean distance in hue-sat space with circular hue
         return np.sqrt(dh * dh + ds * ds)
 
-    @staticmethod
-    def _hsv_dist_matrix(centroids, points):
-        """Compute distance matrix between centroids and points using circular hue."""
-        n_centroids = len(centroids)
-        n_points = len(points)
-        dists = np.zeros((n_points, n_centroids), dtype=np.float32)
-        for i in range(n_points):
-            for j in range(n_centroids):
-                dists[i, j] = TeamColorAnalyzer._hsv_distance(points[i], centroids[j])
-        return dists
-
     def _cluster_teams(self, player_hsv, player_bgr):
         """
         Cluster players into teams using K-means on HSV (hue, saturation).

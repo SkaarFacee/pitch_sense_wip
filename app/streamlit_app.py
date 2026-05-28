@@ -13,7 +13,7 @@ Usage:
 
 import sys
 from pathlib import Path
-from collections import Counter, defaultdict
+from collections import Counter
 
 # Ensure the project root is on sys.path so app modules can be imported
 _HERE = Path(__file__).resolve().parent
@@ -56,7 +56,7 @@ MODEL_PATHS = {
     "ball": str(_PROJECT_ROOT / "models" / "ball_model" / "yolo_11_best.pt"),
 }
 
-SUPPORTED_EXTENSIONS = (".webm", ".mp4", ".avi", ".mov")
+SUPPORTED_EXTENSIONS = (".webm", ".mp4", ".avi", ".mov", ".mkv")
 
 OUTPUT_VIDEOS = [
     ("final_draft.mp4", "🎬 Final Draft (Main + Pitch PIP)"),
@@ -123,56 +123,22 @@ def check_models() -> dict:
 
 
 def build_seg_analytics(analytics_data: list) -> dict:
-    """
-    Aggregate per-frame segmentation data into summary analytics.
-
-    Args:
-        analytics_data: list of dicts, each with keys:
-            - 'frame_idx': int
-            - 'segments': list of segment dicts from ProcessSegmentor.extract()
-
-    Returns:
-        dict with keys:
-            - 'class_frequency': {class_name: count_across_all_frames}
-            - 'class_confidence': {class_name: [conf1, conf2, ...]}
-            - 'class_side': {class_name: {'left': N, 'right': N}}
-            - 'frames_with_seg': int
-            - 'total_frames': int
-            - 'per_frame_classes': {frame_idx: [class_names]}
-    """
     class_counter = Counter()
-    class_confidences = defaultdict(list)
-    class_side = defaultdict(lambda: Counter({"left": 0, "right": 0}))
     per_frame = {}
     frames_with_seg = 0
-
     for entry in analytics_data:
         frame_idx = entry["frame_idx"]
         segments = entry.get("segments", [])
         if segments:
             frames_with_seg += 1
-
         frame_classes = []
         for seg in segments:
             cn = seg.get("class_name", "unknown")
             frame_classes.append(cn)
             class_counter[cn] += 1
-            class_confidences[cn].append(seg.get("confidence", 0.0))
-
-            side = seg.get("side_hint", "unknown")
-            if side in ("left", "right"):
-                class_side[cn][side] += 1
-
         per_frame[frame_idx] = frame_classes
-
-    return {
-        "class_frequency": dict(class_counter),
-        "class_confidences": {k: list(v) for k, v in class_confidences.items()},
-        "class_side": {k: dict(v) for k, v in class_side.items()},
-        "frames_with_seg": frames_with_seg,
-        "total_frames": len(analytics_data),
-        "per_frame_classes": per_frame,
-    }
+    return {"class_frequency": dict(class_counter), "frames_with_seg": frames_with_seg,
+            "total_frames": len(analytics_data), "per_frame_classes": per_frame}
 
 
 # ---------------------------------------------------------------------------
@@ -528,61 +494,6 @@ with tab_analytics:
 
         st.markdown("---")
 
-        # --- Confidence Distribution ---
-        st.markdown("### 📈 Per-Region Confidence Distribution")
-
-        confidences = analytics["class_confidences"]
-        if confidences:
-            for cls_name, confs in confidences.items():
-                display = SEG_CLASS_INFO.get(cls_name, {}).get("label", cls_name)
-                if confs:
-                    mean_conf = np.mean(confs)
-                    std_conf = np.std(confs)
-                    rc1, rc2, rc3, rc4 = st.columns(4)
-                    with rc1:
-                        st.markdown(f"**{display}**")
-                    with rc2:
-                        st.metric("Mean", f"{mean_conf:.3f}")
-                    with rc3:
-                        st.metric("Min–Max", f"{min(confs):.2f} – {max(confs):.2f}")
-                    with rc4:
-                        st.metric("Std Dev", f"{std_conf:.3f}")
-
-            most_common_cls = max(confidences.items(), key=lambda x: len(x[1]))[0]
-            trend_data = confidences[most_common_cls]
-            if len(trend_data) > 1:
-                st.markdown(f"**Confidence trend** for `{SEG_CLASS_INFO.get(most_common_cls, {}).get('label', most_common_cls)}` across frames:")
-                st.line_chart({"Confidence": trend_data}, use_container_width=True)
-        else:
-            st.warning("No confidence data available.")
-
-        st.markdown("---")
-
-        # --- Side Distribution ---
-        st.markdown("### ↔️ Side Distribution (Left vs Right Pitch Half)")
-
-        side_data = analytics["class_side"]
-        if side_data:
-            for cls_name, sides in side_data.items():
-                display = SEG_CLASS_INFO.get(cls_name, {}).get("label", cls_name)
-                left_count = sides.get("left", 0)
-                right_count = sides.get("right", 0)
-                if left_count + right_count > 0:
-                    left_pct = left_count / (left_count + right_count) * 100
-                    right_pct = right_count / (left_count + right_count) * 100
-
-                    sc1, sc2, sc3 = st.columns([2, 3, 2])
-                    with sc1:
-                        st.markdown(f"**{display}**")
-                    with sc2:
-                        st.progress(left_pct / 100, text=f"Left: {left_pct:.0f}%")
-                    with sc3:
-                        st.markdown(f"Right: {right_pct:.0f}%")
-        else:
-            st.markdown("_No side data recorded._")
-
-        st.markdown("---")
-
         with st.expander("📋 Raw Frame-by-Frame Data"):
             per_frame = analytics["per_frame_classes"]
             st.json({str(k): v for k, v in per_frame.items()})
@@ -738,12 +649,6 @@ with tab_game:
                 team2_label=team2_label,
             )
             st.pyplot(scatter_fig)
-
-            # Center-of-mass x-position chart
-            center_fig = GameAnalyzer.draw_formation_center_chart(
-                formation, team1_label=team1_label, team2_label=team2_label
-            )
-            st.pyplot(center_fig)
 
         st.markdown("---")
 

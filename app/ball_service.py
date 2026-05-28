@@ -124,9 +124,3 @@ class BallDetector:
 
         return pitch_pt
 
-    def print_model_metadata(self) -> None:
-        """Print ball model class names for debugging."""
-        print("Ball model classes:")
-        for cid, cname in self.model.names.items():
-            print(f"  {cid}: {cname}")
-        print(f"  Using ball_class_id={self.ball_class_id}")
