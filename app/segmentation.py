@@ -45,8 +45,6 @@ class Segmentor():
             if contour is None:
                 continue
             area = cv2.contourArea(contour)
-            
-
             processed_segments.append({
                 "class_name": class_name,
                 "confidence": conf,
@@ -73,7 +71,7 @@ class BboxManipulor():
         if mask.xy is None or len(mask.xy) == 0:
             return None
         contour=max(mask.xy, key=cv2.contourArea)
-        return contour.astype(np.int32).reshape(-1, 1, 2) # Opencv is (N,1,2) Yolo is (N,2)
+        return contour.astype(np.int32).reshape(-1, 1, 2) # Opencv is (N,1,2) Yolo is (N,2) yoloy to opencv format
 
     @staticmethod
     def contour_to_bbox(contour):

@@ -25,9 +25,7 @@ ZONE_NAMES = [
 class GameAnalyzer:
     """All methods are static — pass the list of per-frame data dicts."""
 
-    # ------------------------------------------------------------------
     # Shared data helper
-    # ------------------------------------------------------------------
     @staticmethod
     def _split_teams(entry):
         positions = entry.get("player_positions")
@@ -45,9 +43,7 @@ class GameAnalyzer:
         t2 = valid_pos[valid_tid == 1]
         return valid_pos, valid_tid, t1, t2
 
-    # ------------------------------------------------------------------
     # 1. POSSESSION
-    # ------------------------------------------------------------------
     @staticmethod
     def compute_possession(game_data: List[dict], team1_label="Team 1", team2_label="Team 2") -> dict:
         t1_frames = t2_frames = total_ball = 0
@@ -73,7 +69,6 @@ class GameAnalyzer:
 
     # ------------------------------------------------------------------
     # 2. HEATMAPS
-    # ------------------------------------------------------------------
     @staticmethod
     def compute_heatmaps(game_data: List[dict], bins: Tuple[int, int] = (21, 14)) -> dict:
         t1_all, t2_all = [], []
@@ -85,6 +80,7 @@ class GameAnalyzer:
                 t2_all.append(t2)
         t1_all = np.vstack(t1_all) if t1_all else np.empty((0, 2))
         t2_all = np.vstack(t2_all) if t2_all else np.empty((0, 2))
+        # Removing points outside the pitch with +-5
         if len(t1_all) > 0:
             mask = (t1_all[:, 0] >= -5) & (t1_all[:, 0] <= PITCH_LENGTH + 5) & (t1_all[:, 1] >= -5) & (t1_all[:, 1] <= PITCH_WIDTH + 5)
             t1_all = t1_all[mask]
@@ -117,9 +113,7 @@ class GameAnalyzer:
         fig.tight_layout()
         return fig
 
-    # ------------------------------------------------------------------
     # 3. FORMATION
-    # ------------------------------------------------------------------
     @staticmethod
     def compute_formation(game_data: List[dict]) -> dict:
         t1_centers, t2_centers = [], []
@@ -179,9 +173,7 @@ class GameAnalyzer:
         fig.tight_layout()
         return fig
 
-    # ------------------------------------------------------------------
     # 4. TERRITORY
-    # ------------------------------------------------------------------
     @staticmethod
     def compute_territory(game_data: List[dict]) -> dict:
         counts = [[{"t1": 0, "t2": 0} for _ in range(3)] for _ in range(3)]
@@ -214,9 +206,9 @@ class GameAnalyzer:
             zone_grid.append(zone_row)
         return {"zone_grid": zone_grid, "team1_total_presence": t1_total, "team2_total_presence": t2_total}
 
-    # ------------------------------------------------------------------
+
     # 5. MATCH STATS
-    # ------------------------------------------------------------------
+
     @staticmethod
     def compute_match_stats(game_data: List[dict]) -> dict:
         total = len(game_data)
@@ -247,9 +239,7 @@ class GameAnalyzer:
                 "avg_player_spread": round(np.mean(spreads), 2) if spreads else 0.0,
                 "ball_progression_m": round(ball_prog, 1)}
 
-    # ------------------------------------------------------------------
     # Pitch Drawing Utility
-    # ------------------------------------------------------------------
     @staticmethod
     def _draw_pitch_outline(ax: plt.Axes) -> None:
         ax.plot([0, PITCH_LENGTH, PITCH_LENGTH, 0, 0], [0, 0, PITCH_WIDTH, PITCH_WIDTH, 0], color="black", linewidth=1.5)

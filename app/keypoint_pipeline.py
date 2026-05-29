@@ -115,9 +115,7 @@ class KeypointPipeline:
                 'ball_xyxy': ball_xyxy, 'ball_conf': ball_conf, 'ball_pitch_pt': ball_pitch_pt,
                 'ball_trajectory': list(self.ball_trajectory)}
 
-    # ------------------------------------------------------------------
     # Drawing helpers
-    # ------------------------------------------------------------------
     _KPT_CONNECTIONS = [
         (0, 16), (0, 9), (16, 25), (9, 25),
         (1, 2), (3, 4), (1, 3), (2, 4),
@@ -145,18 +143,18 @@ class KeypointPipeline:
         out = frame.copy()
         overlay = frame.copy()
         color_map = {'18Yard': (255, 0, 0), '18Yard Circle': (0, 255, 0), '5Yard': (0, 0, 255),
-                     'Half Central Circle': (255, 255, 0), 'Half Field': (255, 0, 255)}
+                     'Half Central Circle': (255, 255, 0), 'Half Field': (255, 0, 255)} #BGR format
         for seg in processed_segments:
             contour = seg.get('image_contour')
             if contour is not None:
                 cv2.drawContours(overlay, [contour], -1, color_map.get(seg['class_name'], (128, 128, 128)), -1)
-        cv2.addWeighted(overlay, 0.35, out, 0.65, 0, out)
+        cv2.addWeighted(overlay, 0.35, out, 0.65, 0, out) #adds that transparency
         for seg in processed_segments:
             bbox = seg.get('image_bbox')
             if bbox is not None:
                 cx, cy = float(bbox[:, 0].mean()), float(bbox[:, 1].mean())
                 cv2.putText(out, f"{seg['class_name']} {seg['confidence']:.2f}", (int(cx) - 30, int(cy)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2, cv2.LINE_AA)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         return out
 
     def _draw_team_bboxes(self, frame, player_xyxy, team_colors, player_conf=None):

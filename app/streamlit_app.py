@@ -33,9 +33,7 @@ from app.constants import (
 from app.keypoint_pipeline import KeypointPipeline
 from app.game_analyzer import GameAnalyzer
 
-# ---------------------------------------------------------------------------
 # Page config
-# ---------------------------------------------------------------------------
 st.set_page_config(
     page_title="PitchSense - Ball Detection & Analysis",
     page_icon="⚽",
@@ -43,9 +41,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ---------------------------------------------------------------------------
 # Constants
-# ---------------------------------------------------------------------------
 TEST_DATA_DIR = _PROJECT_ROOT / "data" / "matches"
 OUTPUT_BASE = _PROJECT_ROOT / "output"
 
@@ -59,11 +55,11 @@ MODEL_PATHS = {
 SUPPORTED_EXTENSIONS = (".webm", ".mp4", ".avi", ".mov", ".mkv")
 
 OUTPUT_VIDEOS = [
-    ("final_draft.mp4", "🎬 Final Draft (Main + Pitch PIP)"),
-    ("annotated_video.mp4", "🎯 Annotated (Keypoints + Team Bboxes + Ball)"),
-    ("deep_analysis.mp4", "🔬 Deep Analysis (Segmentation Overlay + Ball)"),
-    ("full_pitch_debug_map.mp4", "🗺️ Full Pitch Map (Top-Down View + Ball Trail)"),
-    ("keypoint_annotations.mp4", "🔑 Keypoint Annotations (Keypoints on Original)"),
+    ("final_draft.mp4", "Final Draft (Main + Pitch PIP)"),
+    ("annotated_video.mp4", "Annotated (Keypoints + Team Bboxes + Ball)"),
+    ("deep_analysis.mp4", "Deep Analysis (Segmentation Overlay + Ball)"),
+    ("full_pitch_debug_map.mp4", "Full Pitch Map (Top-Down View + Ball Trail)"),
+    ("keypoint_annotations.mp4", "Keypoint Annotations (Keypoints on Original)"),
 ]
 
 # Segmentation class display names and colors (BGR)
@@ -75,9 +71,7 @@ SEG_CLASS_INFO = {
     "Half Field": {"label": "Half Field", "color": (255, 0, 255)},
 }
 
-# ---------------------------------------------------------------------------
 # Session state initialisation
-# ---------------------------------------------------------------------------
 if "analytics_data" not in st.session_state:
     st.session_state.analytics_data = None  # Will hold seg data after processing
 if "game_data" not in st.session_state:
@@ -85,9 +79,12 @@ if "game_data" not in st.session_state:
 if "processing_done" not in st.session_state:
     st.session_state.processing_done = False
 
-# ---------------------------------------------------------------------------
 # Helper functions
-# ---------------------------------------------------------------------------
+import re
+
+def remove_emojis(text):
+    return re.sub(r"[^\w\s.-]", "", text).strip()
+
 def get_video_files() -> list:
     """Return sorted list of supported video files in TEST_DATA_DIR."""
     files = []
@@ -141,9 +138,7 @@ def build_seg_analytics(analytics_data: list) -> dict:
             "total_frames": len(analytics_data), "per_frame_classes": per_frame}
 
 
-# ---------------------------------------------------------------------------
 # Sidebar — Configuration (shared across all tabs)
-# ---------------------------------------------------------------------------
 with st.sidebar:
     st.header("⚙️ Configuration")
 
@@ -153,7 +148,6 @@ with st.sidebar:
     for name, exists in model_status.items():
         emoji = "✅" if exists else "❌"
         st.markdown(f"{emoji} **{name.capitalize()}**: {'Loaded' if exists else 'Missing'}")
-
     st.markdown("---")
 
     # Processing options
@@ -166,38 +160,21 @@ with st.sidebar:
         step=100,
         help="Limit processing to N frames for faster testing. 0 = process entire video.",
     )
-    process_every_n = st.number_input(
-        "Process every N frames",
-        min_value=1,
-        max_value=10,
-        value=1,
-        step=1,
-        help="Process every Nth frame. Higher values = faster but less smooth video.",
-    )
     enable_team_colors = st.checkbox("Enable team color analysis", value=True)
 
-    st.markdown("---")
-    st.markdown(
-        "<small>Built with Streamlit + YOLO + OpenCV</small>",
-        unsafe_allow_html=True,
-    )
 
-# ---------------------------------------------------------------------------
 # UI — Header
-# ---------------------------------------------------------------------------
+
 st.title("⚽ PitchSense — Ball Detection & Analysis")
 st.markdown("---")
 
-# ---------------------------------------------------------------------------
 # Main area — Tabs
-# ---------------------------------------------------------------------------
+
 tab_processing, tab_analytics, tab_game = st.tabs(
-    ["🎬 Processing", "📊 Pitch Analytics", "🎮 Game Analysis"]
+    ["Processing", "Pitch Analytics", "Game Analysis"]
 )
 
-# ===========================================================================
-# TAB 1: PROCESSING (existing functionality)
-# ===========================================================================
+# TAB 1: PROCESSING 
 with tab_processing:
     col1, col2 = st.columns([2, 1])
 
@@ -207,26 +184,27 @@ with tab_processing:
             st.warning(f"No video files found in `{TEST_DATA_DIR}`.")
             st.stop()
 
-        video_options = {f.name: str(f) for f in video_files}
+        video_options = {remove_emojis(f.stem): str(f) for f in video_files}
+
         selected_name = st.selectbox(
-            "📁 Select a video to process",
+            "Select a video to process",
             options=list(video_options.keys()),
             index=0,
         )
-        selected_path = video_options[selected_name]
 
+        selected_path = video_options[selected_name]
     with col2:
         st.markdown("#### &nbsp;")  # vertical spacing
         process_btn = st.button(
-            "▶️ Process Video",
+            "▶Process Video",
             type="primary",
             use_container_width=True,
             disabled=not all(model_status.values()),
         )
 
-    # ------------------------------------------------------------------
+
     # Processing
-    # ------------------------------------------------------------------
+
     if process_btn:
         # Reset analytics + game data for this run
         st.session_state.analytics_data = []
@@ -244,7 +222,7 @@ with tab_processing:
         total_frames = get_total_frames(selected_path)
         if max_frames > 0:
             total_frames = min(total_frames, max_frames)
-        actual_process_every = process_every_n
+        actual_process_every = 1
 
         st.markdown("---")
         st.subheader("📊 Processing Progress")
@@ -288,7 +266,6 @@ with tab_processing:
                 output_dir=str(output_dir),
                 start_frame=0,
                 max_frames=max_frames if max_frames > 0 else None,
-                process_every_n=actual_process_every,
             ):
                 processed_count += 1
                 has_ball = len(result.get('ball_xyxy', [])) > 0
@@ -362,9 +339,7 @@ with tab_processing:
             st.exception(e)
             st.stop()
 
-        # ------------------------------------------------------------------
         # Display generated videos
-        # ------------------------------------------------------------------
         st.markdown("---")
         st.subheader("🎬 Generated Videos")
 
@@ -388,9 +363,8 @@ with tab_processing:
         # Also show the directory path
         st.markdown(f"📁 **Output directory**: `{output_dir}/`")
 
-    # ------------------------------------------------------------------
+
     # Landing info (before processing)
-    # ------------------------------------------------------------------
     elif not process_btn and not st.session_state.processing_done:
         st.markdown(
             """
@@ -399,51 +373,19 @@ with tab_processing:
             Select a video from the dropdown and click **Process Video** to run the
             full analysis pipeline:
 
-            - 🔑 **Keypoint detection** → Homography matrix for pitch registration
-            - 👤 **Player detection** → ByteTrack tracking + team color analysis
-            - ⚽ **Ball detection** → Dedicated YOLO ball model with trajectory trail
-            - 🎯 **Segmentation** → Pitch region segmentation overlay
-            - 🗺️ **Top-down pitch** → Projected player + ball positions with trail
-
+            - **Keypoint detection** → Homography matrix for pitch registration
+            - **Player detection** → ByteTrack tracking + team color analysis
+            - **Ball detection** → Dedicated YOLO ball model with trajectory trail
+            - **Segmentation** → Pitch region segmentation overlay
+            - **Top-down pitch** → Projected player + ball positions with trail
             **Output videos** will appear here once processing is complete.
             """,
             unsafe_allow_html=True,
         )
 
-        # Show available matches prominently
-        video_files = get_video_files()
-        if video_files:
-            st.markdown("#### 📁 Available Matches")
-            match_cards = st.columns(min(len(video_files), 3))
-            for idx, vf in enumerate(video_files):
-                col = match_cards[idx % 3]
-                if idx > 0 and idx % 3 == 0:
-                    match_cards = st.columns(min(len(video_files) - idx, 3))
-                    col = match_cards[0]
-                with col:
-                    size_mb = vf.stat().st_size / (1024 * 1024)
-                    # Extract team names from filename (remove special chars)
-                    name = vf.stem
-                    # Clean up common patterns
-                    display_name = name.replace("FULL MATCH ", "").replace("｜", " vs ").replace("|", " vs ").strip()
-                    # Truncate if too long
-                    if len(display_name) > 40:
-                        display_name = display_name[:37] + "..."
-                    st.markdown(
-                        f"""
-                        <div style="border:1px solid #ddd; border-radius:10px; padding:12px; margin-bottom:12px;
-                                    background: #f8f9fa; text-align:center;">
-                            <div style="font-size:2rem;">⚽</div>
-                            <div style="font-weight:600; font-size:0.95rem; margin:6px 0;">{display_name}</div>
-                            <div style="font-size:0.8rem; color:#666;">{size_mb:.1f} MB</div>
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
 
-# ===========================================================================
+
 # TAB 2: ANALYTICS — Pitch Segmentation Analysis
-# ===========================================================================
 with tab_analytics:
     st.subheader("📊 Pitch Segmentation Analytics")
 
@@ -498,9 +440,7 @@ with tab_analytics:
             per_frame = analytics["per_frame_classes"]
             st.json({str(k): v for k, v in per_frame.items()})
 
-# ===========================================================================
 # TAB 3: GAME ANALYSIS — Possession, Heatmaps, Formation, Territory, Stats
-# ===========================================================================
 with tab_game:
     st.subheader("🎮 Game Analysis — From Pipeline Tracking Data")
 
