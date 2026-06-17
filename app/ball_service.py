@@ -22,7 +22,7 @@ class BallDetector:
     Provides detection, center computation, and pitch projection methods.
     """
 
-    def __init__(self, model_path: str, conf: float = BALL_CONF):
+    def __init__(self, model_path: str = 'yolo26x.pt-', conf: float = BALL_CONF):
         """
         Args:
             model_path: Path to YOLO ball detection model (.pt file).

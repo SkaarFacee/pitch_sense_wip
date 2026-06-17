@@ -1,253 +1,425 @@
 """
-PitchSense Streamlit App — Interactive video processing with ball detection,
-pitch segmentation analytics, and game dynamics analysis.
+PitchSense — Streamlit dashboard (EA-FC-inspired).
 
-Tabs:
-    1. Processing  — Select video, run pipeline, view outputs
-    2. Analytics   — Pitch segmentation region analysis from processed video
-    3. Game Analysis — Possession, heatmaps, formation, territory & match stats
+Tabs
+    1. Processing       — Pipeline run + ring-style progress indicator
+    2. Match Centre     — Possession, timeline, team-DNA radar, territory control
+    3. Pitch Analysis   — Interactive density heatmaps, formation scatter, region charts
+    4. Outputs          — Generated output videos
 
-Usage:
+Run:
     streamlit run app/streamlit_app.py
 """
 
+
+
+
+from __future__ import annotations
+
 import sys
+import re
 from pathlib import Path
 from collections import Counter
 
-# Ensure the project root is on sys.path so app modules can be imported
+# Project-root import shim ----------------------------------------------------
 _HERE = Path(__file__).resolve().parent
 _PROJECT_ROOT = _HERE.parent
-if str(_PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT))
+for _p in (_PROJECT_ROOT, _HERE):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 import streamlit as st
 import cv2
 import numpy as np
-from app.constants import (
-    PLAYER_CONF,
-    SEG_CONF,
-    MAX_FRAMES,
-    PROCESS_EVERY_N_FRAMES,
-)
-from app.keypoint_pipeline import KeypointPipeline
-from app.game_analyzer import GameAnalyzer
 
-# Page config
-st.set_page_config(
-    page_title="PitchSense - Ball Detection & Analysis",
-    page_icon="⚽",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+from keypoint_pipeline import KeypointPipeline
+from game_analyzer import GameAnalyzer
+import ui_theme as ui
+import charts as ch
 
-# Constants
+
+# ─── Configuration ────────────────────────────────────────────────────────────
 TEST_DATA_DIR = _PROJECT_ROOT / "data" / "matches"
 OUTPUT_BASE = _PROJECT_ROOT / "output"
 
 MODEL_PATHS = {
     "keypoint": str(_PROJECT_ROOT / "models" / "keypoint_model" / "26n_pipeline" / "no_aug" / "weights" / "best.pt"),
-    "player": str(_PROJECT_ROOT / "models" / "player_model" / "best.pt"),
-    "seg": str(_PROJECT_ROOT / "models" / "segmentation" / "best.pt"),
-    "ball": str(_PROJECT_ROOT / "models" / "ball_model" / "yolo_11_best.pt"),
+    "player":   str(_PROJECT_ROOT / "models" / "player_model" / "best.pt"),
+    "seg":      str(_PROJECT_ROOT / "models" / "segmentation" / "best.pt"),
+    "ball":     str(_PROJECT_ROOT / "models" / "ball_model" / "yolo26_best.pt"),
 }
 
 SUPPORTED_EXTENSIONS = (".webm", ".mp4", ".avi", ".mov", ".mkv")
 
 OUTPUT_VIDEOS = [
-    ("final_draft.mp4", "Final Draft (Main + Pitch PIP)"),
-    ("annotated_video.mp4", "Annotated (Keypoints + Team Bboxes + Ball)"),
-    ("deep_analysis.mp4", "Deep Analysis (Segmentation Overlay + Ball)"),
-    ("full_pitch_debug_map.mp4", "Full Pitch Map (Top-Down View + Ball Trail)"),
-    ("keypoint_annotations.mp4", "Keypoint Annotations (Keypoints on Original)"),
+    ("final_draft.mp4",          "Final Draft", "Original + PiP top-down pitch map"),
+    ("annotated_video.mp4",      "Annotated",   "Keypoints, team bboxes, ball"),
+    ("deep_analysis.mp4",        "Deep Analysis", "Segmentation overlay + ball"),
+    ("full_pitch_debug_map.mp4", "Pitch Map",   "Top-down view + ball trail"),
+    ("keypoint_annotations.mp4", "Keypoints",   "Skeleton over the original"),
 ]
 
-# Segmentation class display names and colors (BGR)
-SEG_CLASS_INFO = {
-    "18Yard": {"label": "Penalty Area (18yd)", "color": (255, 0, 0)},
-    "18Yard Circle": {"label": "Penalty Arc", "color": (0, 255, 0)},
-    "5Yard": {"label": "Goal Area (5yd)", "color": (0, 0, 255)},
-    "Half Central Circle": {"label": "Center Circle", "color": (255, 255, 0)},
-    "Half Field": {"label": "Half Field", "color": (255, 0, 255)},
+SEG_CLASS_LABELS = {
+    "18Yard":               "Penalty Area (18yd)",
+    "18Yard Circle":        "Penalty Arc",
+    "5Yard":                "Goal Area (6yd)",
+    "Half Central Circle":  "Center Circle",
+    "Half Field":           "Half Field",
 }
 
-# Session state initialisation
+
+# ─── Page setup ───────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="PitchSense — Match Intelligence",
+    page_icon="⚽",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+if "theme" not in st.session_state:
+    st.session_state.theme = "dark"
 if "analytics_data" not in st.session_state:
-    st.session_state.analytics_data = None  # Will hold seg data after processing
+    st.session_state.analytics_data = None
 if "game_data" not in st.session_state:
-    st.session_state.game_data = None      # Will hold player/ball tracking data
+    st.session_state.game_data = None
 if "processing_done" not in st.session_state:
     st.session_state.processing_done = False
+if "last_output_dir" not in st.session_state:
+    st.session_state.last_output_dir = None
+if "last_video_name" not in st.session_state:
+    st.session_state.last_video_name = None
 
-# Helper functions
-import re
+# Inject theme CSS (re-injected every rerun)
+st.markdown(ui.inject_css(st.session_state.theme), unsafe_allow_html=True)
+# Inject Inter font
+st.markdown(
+    "<link rel='preconnect' href='https://fonts.googleapis.com'>"
+    "<link href='https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap' rel='stylesheet'>",
+    unsafe_allow_html=True,
+)
 
-def remove_emojis(text):
-    return re.sub(r"[^\w\s.-]", "", text).strip()
 
-def get_video_files() -> list:
-    """Return sorted list of supported video files in TEST_DATA_DIR."""
-    files = []
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+def _remove_emojis(text: str) -> str:
+    return re.sub(r"[^\w\s.\-]", "", text).strip()
+
+
+def get_video_files() -> list[Path]:
+    if not TEST_DATA_DIR.exists():
+        return []
+    files: list[Path] = []
     for ext in SUPPORTED_EXTENSIONS:
         files.extend(TEST_DATA_DIR.glob(f"*{ext}"))
     return sorted(files)
 
 
 def get_total_frames(video_path: str) -> int:
-    """Get total frame count for a video file."""
     cap = cv2.VideoCapture(video_path)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     cap.release()
-    return total
+    return max(total, 0)
 
 
-def get_output_videos(output_dir: Path) -> list:
-    """Return list of (path, display_name) tuples for generated videos."""
-    results = []
-    for filename, display_name in OUTPUT_VIDEOS:
-        video_path = output_dir / filename
-        if video_path.exists():
-            results.append((str(video_path), display_name))
-    return results
+def get_output_videos(output_dir: Path) -> list[tuple[Path, str, str]]:
+    out: list[tuple[Path, str, str]] = []
+    for filename, label, desc in OUTPUT_VIDEOS:
+        p = output_dir / filename
+        if p.exists():
+            out.append((p, label, desc))
+    return out
 
 
-def check_models() -> dict:
-    """Verify all model paths exist and return status dict."""
-    status = {}
-    for name, path in MODEL_PATHS.items():
-        status[name] = Path(path).exists()
-    return status
+def check_models() -> dict[str, bool]:
+    return {name: Path(path).exists() for name, path in MODEL_PATHS.items()}
 
 
 def build_seg_analytics(analytics_data: list) -> dict:
-    class_counter = Counter()
-    per_frame = {}
+    cls_counter: Counter = Counter()
     frames_with_seg = 0
     for entry in analytics_data:
-        frame_idx = entry["frame_idx"]
-        segments = entry.get("segments", [])
-        if segments:
+        segs = entry.get("segments", [])
+        if segs:
             frames_with_seg += 1
-        frame_classes = []
-        for seg in segments:
-            cn = seg.get("class_name", "unknown")
-            frame_classes.append(cn)
-            class_counter[cn] += 1
-        per_frame[frame_idx] = frame_classes
-    return {"class_frequency": dict(class_counter), "frames_with_seg": frames_with_seg,
-            "total_frames": len(analytics_data), "per_frame_classes": per_frame}
+        for seg in segs:
+            cls_counter[seg.get("class_name", "unknown")] += 1
+    total_det = sum(cls_counter.values())
+    items = [
+        {
+            "key": k,
+            "label": SEG_CLASS_LABELS.get(k, k),
+            "count": v,
+            "pct": round((v / total_det) * 100, 1) if total_det else 0.0,
+        }
+        for k, v in sorted(cls_counter.items(), key=lambda kv: kv[1], reverse=True)
+    ]
+    return {
+        "class_frequency": items,
+        "frames_with_seg": frames_with_seg,
+        "total_frames": len(analytics_data),
+        "total_detections": total_det,
+        "coverage_pct": round((frames_with_seg / max(len(analytics_data), 1)) * 100, 1),
+    }
 
 
-# Sidebar — Configuration (shared across all tabs)
+# ─── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.header("⚙️ Configuration")
+    st.markdown(
+        f"""
+        <div style="display:flex;gap:10px;align-items:center;padding:6px 2px 14px;">
+          <div style="width:42px;height:42px;border-radius:12px;
+                      background:linear-gradient(135deg,var(--ps-accent-1),var(--ps-accent-2));
+                      display:flex;align-items:center;justify-content:center;
+                      font-size:22px;box-shadow:0 8px 22px -8px var(--ps-accent-2);">⚽</div>
+          <div>
+            <div style="font-weight:800;font-size:1.05rem;">PitchSense</div>
+            <div style="font-size:0.75rem;color:var(--ps-text-dim);">Match Intelligence</div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Theme switcher
+    st.markdown("<div style='font-weight:600;font-size:0.82rem;margin-bottom:4px;color:var(--ps-text-dim);'>APPEARANCE</div>", unsafe_allow_html=True)
+    theme_cols = st.columns(2)
+    with theme_cols[0]:
+        if st.button("🌙  Dark", use_container_width=True,
+                     disabled=(st.session_state.theme == "dark")):
+            st.session_state.theme = "dark"
+            st.rerun()
+    with theme_cols[1]:
+        if st.button("☀️  Light", use_container_width=True,
+                     disabled=(st.session_state.theme == "light")):
+            st.session_state.theme = "light"
+            st.rerun()
+
+    st.markdown("---")
 
     # Model status
-    st.subheader("Model Status")
-    model_status = check_models()
-    for name, exists in model_status.items():
-        emoji = "✅" if exists else "❌"
-        st.markdown(f"{emoji} **{name.capitalize()}**: {'Loaded' if exists else 'Missing'}")
+    st.markdown("<div style='font-weight:600;font-size:0.82rem;margin-bottom:6px;color:var(--ps-text-dim);'>SYSTEM STATUS</div>", unsafe_allow_html=True)
+    statuses = check_models()
+    rows_html = "".join(
+        f'<div class="ps-status-row">'
+        f'  <span class="ps-status-row__name">{name}</span>'
+        f'  <span class="ps-status-row__state {"ok" if ok else "err"}">'
+        f'{"● READY" if ok else "● MISSING"}</span>'
+        f'</div>'
+        for name, ok in statuses.items()
+    )
+    st.markdown(rows_html, unsafe_allow_html=True)
+
     st.markdown("---")
 
     # Processing options
-    st.subheader("Processing Options")
+    st.markdown("<div style='font-weight:600;font-size:0.82rem;margin-bottom:6px;color:var(--ps-text-dim);'>OPTIONS</div>", unsafe_allow_html=True)
     max_frames = st.number_input(
-        "Max frames to process (0 = all)",
-        min_value=0,
-        max_value=10000,
-        value=0,
-        step=100,
-        help="Limit processing to N frames for faster testing. 0 = process entire video.",
+        "Max frames (0 = all)",
+        min_value=0, max_value=100000, value=0, step=100,
+        help="Limit processing for faster testing.",
     )
-    enable_team_colors = st.checkbox("Enable team color analysis", value=True)
+    enable_team_colors = st.checkbox("Team colour clustering", value=True)
 
 
-# UI — Header
+palette = ui.palette(st.session_state.theme)
 
-st.title("⚽ PitchSense — Ball Detection & Analysis")
-st.markdown("---")
 
-# Main area — Tabs
-
-tab_processing, tab_analytics, tab_game = st.tabs(
-    ["Processing", "Pitch Analytics", "Game Analysis"]
+# ─── Header ───────────────────────────────────────────────────────────────────
+st.markdown(
+    f"""
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:18px;">
+      <div>
+        <h1 style="margin:0;font-size:2rem;letter-spacing:-0.02em;">PitchSense ⚽</h1>
+        <p style="margin:0;color:var(--ps-text-dim);font-size:0.95rem;">
+          Tactical computer-vision analytics — possession, heatmaps, formation DNA.
+        </p>
+      </div>
+      <div class="ps-badge {'bad' if not all(statuses.values()) else ''}">
+        <span class="dot"></span>
+        {"All models loaded" if all(statuses.values()) else "Models missing"}
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
 )
 
-# TAB 1: PROCESSING 
+
+# ─── Tabs ─────────────────────────────────────────────────────────────────────
+tab_processing, tab_match, tab_pitch, tab_videos = st.tabs(
+    ["Processing", "Match Centre", "Pitch Analysis", "Outputs"]
+)
+
+
+
+
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TAB 1 — PROCESSING
+# ═════════════════════════════════════════════════════════════════════════════
 with tab_processing:
-    col1, col2 = st.columns([2, 1])
+    video_files = get_video_files()
 
-    with col1:
-        video_files = get_video_files()
-        if not video_files:
-            st.warning(f"No video files found in `{TEST_DATA_DIR}`.")
-            st.stop()
+    if not video_files:
+        st.warning(f"No video files found in `{TEST_DATA_DIR}`. Drop a match into that folder and refresh.")
+        st.stop()
 
-        video_options = {remove_emojis(f.stem): str(f) for f in video_files}
+    video_options = {_remove_emojis(f.stem) or f.name: str(f) for f in video_files}
 
-        selected_name = st.selectbox(
-            "Select a video to process",
-            options=list(video_options.keys()),
-            index=0,
+    cfg_cols = st.columns([2.2, 1])
+    with cfg_cols[0]:
+        st.markdown(ui.card_open("Run Pipeline",
+                                 "Select a match. The full analysis (keypoints → players → ball → segmentation → projection) will populate every tab."),
+                    unsafe_allow_html=True)
+        selected_name = st.selectbox("Match Video", options=list(video_options.keys()), index=0,
+                                     label_visibility="visible")
+        selected_path = video_options[selected_name]
+
+        size_mb = Path(selected_path).stat().st_size / 1024 / 1024
+        total_in_video = get_total_frames(selected_path)
+        st.markdown(
+            f"<div class='ps-card__sub' style='margin-top:6px;'>"
+            f"<code style='background:var(--ps-bg-alt);padding:2px 8px;border-radius:6px;'>{Path(selected_path).name}</code>"
+            f" · {size_mb:.0f} MB · {total_in_video:,} frames"
+            f"</div>",
+            unsafe_allow_html=True,
         )
 
-        selected_path = video_options[selected_name]
-    with col2:
-        st.markdown("#### &nbsp;")  # vertical spacing
         process_btn = st.button(
-            "▶Process Video",
+            "▶  Process Video",
             type="primary",
             use_container_width=True,
-            disabled=not all(model_status.values()),
+            disabled=not all(statuses.values()),
+        )
+        st.markdown(ui.card_close(), unsafe_allow_html=True)
+
+    with cfg_cols[1]:
+        st.markdown(
+            """
+            <div style="
+                display:flex;
+                flex-direction:column;
+                gap:12px;
+                margin-top:4px;
+            ">
+
+              <div style="display:flex;gap:10px;align-items:flex-start;">
+                <div style="min-width:26px;height:26px;border-radius:50%;
+                            background:var(--ps-accent-soft);
+                            color:var(--ps-accent);
+                            display:flex;align-items:center;justify-content:center;
+                            font-weight:700;font-size:0.78rem;">1</div>
+                <div>
+                  <div style="color:var(--ps-text);font-weight:700;font-size:0.9rem;">
+                    Pitch Segmentation
+                  </div>
+                  <div style="color:var(--ps-text-dim);font-size:0.82rem;line-height:1.45;">
+                    Identifies the playable pitch region and separates it from the background.
+                  </div>
+                </div>
+              </div>
+
+              <div style="display:flex;gap:10px;align-items:flex-start;">
+                <div style="min-width:26px;height:26px;border-radius:50%;
+                            background:var(--ps-accent-soft);
+                            color:var(--ps-accent);
+                            display:flex;align-items:center;justify-content:center;
+                            font-weight:700;font-size:0.78rem;">2</div>
+                <div>
+                  <div style="color:var(--ps-text);font-weight:700;font-size:0.9rem;">
+                    Keypoint Detection
+                  </div>
+                  <div style="color:var(--ps-text-dim);font-size:0.82rem;line-height:1.45;">
+                    Detects pitch landmarks and estimates the homography transform.
+                  </div>
+                </div>
+              </div>
+
+              <div style="display:flex;gap:10px;align-items:flex-start;">
+                <div style="min-width:26px;height:26px;border-radius:50%;
+                            background:var(--ps-accent-soft);
+                            color:var(--ps-accent);
+                            display:flex;align-items:center;justify-content:center;
+                            font-weight:700;font-size:0.78rem;">3</div>
+                <div>
+                  <div style="color:var(--ps-text);font-weight:700;font-size:0.9rem;">
+                    Player Tracking
+                  </div>
+                  <div style="color:var(--ps-text-dim);font-size:0.82rem;line-height:1.45;">
+                    Tracks players with ByteTrack and groups teams using kit colours.
+                  </div>
+                </div>
+              </div>
+
+              <div style="display:flex;gap:10px;align-items:flex-start;">
+                <div style="min-width:26px;height:26px;border-radius:50%;
+                            background:var(--ps-accent-soft);
+                            color:var(--ps-accent);
+                            display:flex;align-items:center;justify-content:center;
+                            font-weight:700;font-size:0.78rem;">4</div>
+                <div>
+                  <div style="color:var(--ps-text);font-weight:700;font-size:0.9rem;">
+                    Ball Detection
+                  </div>
+                  <div style="color:var(--ps-text-dim);font-size:0.82rem;line-height:1.45;">
+                    Detects the ball frame-by-frame and builds a smooth movement trail.
+                  </div>
+                </div>
+              </div>
+
+              <div style="display:flex;gap:10px;align-items:flex-start;">
+                <div style="min-width:26px;height:26px;border-radius:50%;
+                            background:var(--ps-accent-soft);
+                            color:var(--ps-accent);
+                            display:flex;align-items:center;justify-content:center;
+                            font-weight:700;font-size:0.78rem;">5</div>
+                <div>
+                  <div style="color:var(--ps-text);font-weight:700;font-size:0.9rem;">
+                    Top-down Projection
+                  </div>
+                  <div style="color:var(--ps-text-dim);font-size:0.82rem;line-height:1.45;">
+                    Projects player and ball positions onto a tactical 2D pitch view.
+                  </div>
+                </div>
+              </div>
+
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
 
-
-    # Processing
-
+        st.markdown(ui.card_close(), unsafe_allow_html=True)
+    # Run pipeline ------------------------------------------------------------
     if process_btn:
-        # Reset analytics + game data for this run
         st.session_state.analytics_data = []
         st.session_state.game_data = []
         st.session_state.processing_done = False
 
-        # Determine output directory: named after input video stem
-        video_stem = Path(selected_path).stem
-        # Sanitize filename for directory name (remove special chars)
-        safe_stem = "".join(c if c.isalnum() or c in " _-" else "_" for c in video_stem)
+        safe_stem = "".join(c if c.isalnum() or c in " _-" else "_" for c in Path(selected_path).stem)
         output_dir = OUTPUT_BASE / f"processed_{safe_stem}"
         output_dir.mkdir(parents=True, exist_ok=True)
+        st.session_state.last_output_dir = str(output_dir)
+        st.session_state.last_video_name = selected_name
 
-        # Get total frames for progress
-        total_frames = get_total_frames(selected_path)
+        total_frames = total_in_video
         if max_frames > 0:
             total_frames = min(total_frames, max_frames)
-        actual_process_every = 1
 
-        st.markdown("---")
-        st.subheader("📊 Processing Progress")
+        # Ring progress placeholder (re-rendered every frame)
+        ring_slot = st.empty()
+        ring_slot.markdown(
+            ui.ring_html(
+                pct=0.0, label="Starting…",
+                sublabel=f"Initialising pipeline on <code>{Path(selected_path).name}</code>",
+                stat_pairs=[
+                    ("Frames", f"0 / {total_frames:,}"),
+                    ("Ball Detections", "0"),
+                    ("Players/Frame", "—"),
+                    ("Homography", "—"),
+                ],
+            ),
+            unsafe_allow_html=True,
+        )
 
-        # Progress bar and status
-        progress_bar = st.progress(0, text="Initializing pipeline...")
-        status_placeholder = st.empty()
-        status_placeholder.info(f"⏳ Processing `{selected_name}` — 0 / {total_frames} frames")
-
-        # Side-by-side status metrics
-        metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
-        with metric_col1:
-            frame_metric = st.empty()
-            frame_metric.metric("Frames Processed", "0")
-        with metric_col2:
-            ball_metric = st.empty()
-            ball_metric.metric("Ball Detected", "—")
-        with metric_col3:
-            player_metric = st.empty()
-            player_metric.metric("Players/Frame", "—")
-        with metric_col4:
-            h_metric = st.empty()
-            h_metric.metric("Homography", "—")
-
-        # Initialize pipeline
         try:
             pipeline = KeypointPipeline(
                 keypoint_model_path=MODEL_PATHS["keypoint"],
@@ -257,429 +429,319 @@ with tab_processing:
                 enable_team_colors=enable_team_colors,
             )
 
-            processed_count = 0
-            ball_count_total = 0
-
-            # Process video with progress tracking
+            processed = 0
+            ball_count = 0
             for result in pipeline.process_video(
                 source_video_path=selected_path,
                 output_dir=str(output_dir),
                 start_frame=0,
                 max_frames=max_frames if max_frames > 0 else None,
             ):
-                processed_count += 1
-                has_ball = len(result.get('ball_xyxy', [])) > 0
+                processed += 1
+                has_ball = len(result.get("ball_xyxy", [])) > 0
                 if has_ball:
-                    ball_count_total += 1
+                    ball_count += 1
 
-                # --- Collect segmentation data for analytics tab ---
-                segs = result.get('processed_segments', [])
+                segs = result.get("processed_segments", [])
                 if segs:
                     st.session_state.analytics_data.append({
-                        "frame_idx": processed_count,
-                        "segments": segs,
+                        "frame_idx": processed,
+                        "segments": [
+                            {"class_name": s.get("class_name"),
+                             "confidence": float(s.get("confidence", 0.0))}
+                            for s in segs
+                        ],
                     })
 
-                # --- Collect game tracking data for game analysis tab ---
-                team_info = result.get('team_info')
-                team_ids = team_info.get('team_ids') if team_info else None
-
+                team_info = result.get("team_info")
+                team_ids = team_info.get("team_ids") if team_info else None
                 st.session_state.game_data.append({
-                    "frame_idx": processed_count,
-                    "player_positions": result.get('player_pitch_pts', np.empty((0, 2))),
+                    "frame_idx": processed,
+                    "player_positions": result.get("player_pitch_pts", np.empty((0, 2))),
                     "team_ids": team_ids,
-                    "ball_position": result.get('ball_pitch_pt'),
-                    "player_conf": result.get('player_conf', np.empty((0,))),
+                    "ball_position": result.get("ball_pitch_pt"),
+                    "player_conf": result.get("player_conf", np.empty((0,))),
                 })
 
-                # Calculate progress percentage
-                pct = min(processed_count / max(total_frames, 1), 1.0)
+                pct = (processed / max(total_frames, 1)) * 100
+                h_mode = result.get("H_info", {}).get("mode", "N/A")
+                n_players = int(len(result.get("player_pitch_pts", [])))
 
-                # Update progress bar
-                progress_bar.progress(
-                    pct,
-                    text=f"Frame {processed_count} / {total_frames} ({int(pct * 100)}%)",
-                )
+                # Update ring every 2 frames to avoid bottleneck
+                if processed % 2 == 0 or processed == total_frames:
+                    ring_slot.markdown(
+                        ui.ring_html(
+                            pct=pct,
+                            label="Processing",
+                            sublabel=f"Frame <b>{processed:,}</b> of <b>{total_frames:,}</b> · "
+                                     f"{'⚽ ball in view' if has_ball else 'no ball this frame'}",
+                            stat_pairs=[
+                                ("Frames", f"{processed:,} / {total_frames:,}"),
+                                ("Ball Detections", f"{ball_count:,}"),
+                                ("Players/Frame", f"{n_players}"),
+                                ("Homography", str(h_mode)),
+                            ],
+                        ),
+                        unsafe_allow_html=True,
+                    )
 
-                # Update metrics every frame
-                frame_metric.metric("Frames Processed", str(processed_count))
-                ball_metric.metric(
-                    "Ball Detected",
-                    f"✅ Yes (x{ball_count_total})" if has_ball else "❌ No",
-                    delta="Detected" if has_ball else None,
-                )
-
-                n_players = len(result.get('player_pitch_pts', []))
-                player_metric.metric("Players/Frame", str(n_players))
-
-                h_mode = result.get('H_info', {}).get('mode', 'N/A')
-                h_metric.metric("Homography", str(h_mode))
-
-                # Update status text
-                status_placeholder.info(
-                    f"⏳ Processing frame {processed_count} / {total_frames} "
-                    f"({int(pct * 100)}%) — "
-                    f"{'⚽ Ball!' if has_ball else 'No ball'} | "
-                    f"{n_players} players"
-                )
-
-            # Processing complete
-            progress_bar.progress(1.0, text="✅ Processing complete!")
-            status_placeholder.success(
-                f"✅ Processing complete! Processed {processed_count} frames "
-                f"in {int(processed_count / max(total_frames, 1) * 100)}% of video. "
-                f"Ball detected in {ball_count_total} frames."
+            # Done ----------------------------------------------------------
+            ring_slot.markdown(
+                ui.ring_html(
+                    pct=100.0, label="Complete",
+                    sublabel=f"✅ Processed <b>{processed:,}</b> frames · "
+                             f"Ball detected in <b>{ball_count:,}</b> ({(ball_count/max(processed,1)*100):.0f}%).",
+                    stat_pairs=[
+                        ("Frames", f"{processed:,} / {total_frames:,}"),
+                        ("Ball Detections", f"{ball_count:,}"),
+                        ("Players/Frame", "—"),
+                        ("Status", "Done"),
+                    ],
+                ),
+                unsafe_allow_html=True,
             )
             st.session_state.processing_done = True
-
+            st.success("Processing finished — open **Match Centre**, **Pitch Analysis**, or **Outputs**.")
             st.balloons()
-
         except Exception as e:
-            st.error(f"❌ Processing failed: {str(e)}")
+            st.error(f"Processing failed: {e}")
             st.exception(e)
-            st.stop()
 
-        # Display generated videos
-        st.markdown("---")
-        st.subheader("🎬 Generated Videos")
-
-        output_videos = get_output_videos(output_dir)
-
-        if not output_videos:
-            st.warning("No output videos were generated.")
-            st.stop()
-
-        # Display videos in a 2x2 grid
-        for i in range(0, len(output_videos), 2):
-            row_cols = st.columns(2)
-            for j in range(2):
-                idx = i + j
-                if idx < len(output_videos):
-                    video_path, display_name = output_videos[idx]
-                    with row_cols[j]:
-                        st.markdown(f"**{display_name}**")
-                        st.video(video_path)
-
-        # Also show the directory path
-        st.markdown(f"📁 **Output directory**: `{output_dir}/`")
-
-
-    # Landing info (before processing)
-    elif not process_btn and not st.session_state.processing_done:
+    elif not st.session_state.processing_done:
         st.markdown(
             """
-            ### 🚀 Ready to analyze
-
-            Select a video from the dropdown and click **Process Video** to run the
-            full analysis pipeline:
-
-            - **Keypoint detection** → Homography matrix for pitch registration
-            - **Player detection** → ByteTrack tracking + team color analysis
-            - **Ball detection** → Dedicated YOLO ball model with trajectory trail
-            - **Segmentation** → Pitch region segmentation overlay
-            - **Top-down pitch** → Projected player + ball positions with trail
-            **Output videos** will appear here once processing is complete.
+            <div class='ps-card' style='text-align:center;padding:36px 24px;'>
+              <div style='font-size:3rem;margin-bottom:10px;'>📊</div>
+              <h3 style='margin:0 0 8px;'>Ready to analyse</h3>
+              <p style='color:var(--ps-text-dim);max-width:560px;margin:0 auto;'>
+                Pick a match above and hit <b>Process Video</b>. The ring progress will tick up live,
+                then the Match Centre and Pitch Analysis tabs populate with interactive Plotly charts.
+              </p>
+            </div>
             """,
             unsafe_allow_html=True,
         )
 
 
-
-# TAB 2: ANALYTICS — Pitch Segmentation Analysis
-with tab_analytics:
-    st.subheader("📊 Pitch Segmentation Analytics")
-
-    if st.session_state.analytics_data is None or len(st.session_state.analytics_data) == 0:
-        st.info(
-            "ℹ️ No segmentation data available yet. "
-            "Process a video in the **Processing** tab first, then return here for analytics."
-        )
-    else:
-        analytics = build_seg_analytics(st.session_state.analytics_data)
-
-        # Overview metrics
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("Total Frames (processed)", analytics["total_frames"])
-        with col2:
-            st.metric("Frames with Segments", analytics["frames_with_seg"])
-        with col3:
-            pct_seg = (analytics["frames_with_seg"] / max(analytics["total_frames"], 1)) * 100
-            st.metric("Segmentation Coverage", f"{pct_seg:.1f}%")
-        with col4:
-            total_detections = sum(analytics["class_frequency"].values())
-            st.metric("Total Region Detections", total_detections)
-
-        st.markdown("---")
-
-        # --- Region Detection Frequency ---
-        st.markdown("### 🧩 Region Detection Frequency")
-
-        freq = analytics["class_frequency"]
-        if freq:
-            sorted_classes = sorted(freq.items(), key=lambda x: x[1], reverse=True)
-            class_names = [SEG_CLASS_INFO.get(c, {}).get("label", c) for c, _ in sorted_classes]
-            counts = [v for _, v in sorted_classes]
-
-            chart_data = {"Region": class_names, "Detections": counts}
-            st.bar_chart(chart_data, x="Region", y="Detections", use_container_width=True)
-
-            total_det = sum(counts)
-            st.markdown("**Detection breakdown:**")
-            rows = []
-            for (cls_name, count), display_name in zip(sorted_classes, class_names):
-                pct_cls = (count / max(total_det, 1)) * 100
-                rows.append(f"- **{display_name}** (`{cls_name}`): {count} detections ({pct_cls:.1f}%)")
-            st.markdown("\n".join(rows))
-        else:
-            st.warning("No pitch regions were detected in the processed frames.")
-
-        st.markdown("---")
-
-        with st.expander("📋 Raw Frame-by-Frame Data"):
-            per_frame = analytics["per_frame_classes"]
-            st.json({str(k): v for k, v in per_frame.items()})
-
-# TAB 3: GAME ANALYSIS — Possession, Heatmaps, Formation, Territory, Stats
-with tab_game:
-    st.subheader("🎮 Game Analysis — From Pipeline Tracking Data")
-
-    if st.session_state.game_data is None or len(st.session_state.game_data) == 0:
-        st.info(
-            "ℹ️ No game tracking data available yet. "
-            "Process a video in the **Processing** tab first, then return here for analysis."
+# ═════════════════════════════════════════════════════════════════════════════
+# TAB 2 — MATCH CENTRE
+# ═════════════════════════════════════════════════════════════════════════════
+with tab_match:
+    if not st.session_state.game_data:
+        st.markdown(
+            """
+            <div class='ps-card' style='text-align:center;padding:40px 24px;'>
+              <h3>No match loaded yet</h3>
+              <p style='color:var(--ps-text-dim);'>Run the pipeline on the <b>Processing</b> tab first.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
     else:
         game_data = st.session_state.game_data
-
-        # Get team labels from the team colors detected in processing
-        # (We don't have user-input names, so use defaults)
-        team1_label = "Team 1"
-        team2_label = "Team 2"
-
-        # ---- SECTION 1: POSSESSION ----
-        st.markdown("### ⚽ Ball Possession")
-        possession = GameAnalyzer.compute_possession(game_data, team1_label, team2_label)
-
-        if possession["total_ball_frames"] == 0:
-            st.warning("Ball was not detected in any frames — possession cannot be calculated.")
-        else:
-            pos_col1, pos_col2, pos_col3 = st.columns([2, 1, 2])
-            with pos_col1:
-                t1_pct = possession["team1_possession_pct"]
-                st.markdown(
-                    f"""
-                    <div style="text-align: center; padding: 1.2rem; border-radius: 10px;
-                                background: linear-gradient(135deg, #1a73e8, #0d47a1); color: white;">
-                        <h4 style="margin:0;">🔵 {possession['team1_label']}</h4>
-                        <p style="font-size: 2.5rem; font-weight: bold; margin: 0.3rem 0;">{t1_pct}%</p>
-                        <p style="margin:0; font-size:0.85rem;">{possession['team1_frames']} frames</p>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-            with pos_col2:
-                st.markdown(
-                    f"""
-                    <div style="text-align: center; padding: 1.2rem; border-radius: 10px;
-                                background: #6c757d; color: white;">
-                        <h4 style="margin:0;">🤝</h4>
-                        <p style="font-size: 2.5rem; font-weight: bold; margin: 0.3rem 0;">
-                            {100 - t1_pct - possession['team2_possession_pct']:.0f}%
-                        </p>
-                        <p style="margin:0; font-size:0.85rem;">contested</p>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-            with pos_col3:
-                t2_pct = possession["team2_possession_pct"]
-                st.markdown(
-                    f"""
-                    <div style="text-align: center; padding: 1.2rem; border-radius: 10px;
-                                background: linear-gradient(135deg, #d32f2f, #b71c1c); color: white;">
-                        <h4 style="margin:0;">🔴 {possession['team2_label']}</h4>
-                        <p style="font-size: 2.5rem; font-weight: bold; margin: 0.3rem 0;">{t2_pct}%</p>
-                        <p style="margin:0; font-size:0.85rem;">{possession['team2_frames']} frames</p>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-
-            st.caption(f"Based on {possession['total_ball_frames']} frames where ball was detected. "
-                       f"Possession = which team's players were closest to the ball (GKs excluded).")
-            st.progress(t1_pct / 100, text=f"Team 1 {t1_pct}% — Team 2 {t2_pct}%")
-
-        st.markdown("---")
-
-        # ---- SECTION 2: PITCH HEATMAPS ----
-        st.markdown("### 🔥 Player Density Heatmaps")
-
-        heatmaps = GameAnalyzer.compute_heatmaps(game_data)
-
-        heat_col1, heat_col2 = st.columns(2)
-        with heat_col1:
-            if heatmaps["team1_count"] > 0:
-                fig1 = GameAnalyzer.draw_pitch_heatmap(
-                    heatmaps["team1_heatmap"],
-                    heatmaps["x_edges"],
-                    heatmaps["y_edges"],
-                    f"Team 1 Density ({heatmaps['team1_count']} samples)",
-                    team_color=(0, 0, 255),
-                    cmap="Blues",
-                )
-                st.pyplot(fig1)
-            else:
-                st.info("No Team 1 positions recorded.")
-
-        with heat_col2:
-            if heatmaps["team2_count"] > 0:
-                fig2 = GameAnalyzer.draw_pitch_heatmap(
-                    heatmaps["team2_heatmap"],
-                    heatmaps["x_edges"],
-                    heatmaps["y_edges"],
-                    f"Team 2 Density ({heatmaps['team2_count']} samples)",
-                    team_color=(255, 0, 0),
-                    cmap="Reds",
-                )
-                st.pyplot(fig2)
-            else:
-                st.info("No Team 2 positions recorded.")
-
-        st.markdown("---")
-
-        # ---- SECTION 3: FORMATION & POSITIONING ----
-        st.markdown("### 📐 Formation & Positioning")
-
+        possession = GameAnalyzer.compute_possession(game_data, "Team 1", "Team 2")
         formation = GameAnalyzer.compute_formation(game_data)
-
-        form_col1, form_col2, form_col3, form_col4 = st.columns(4)
-        with form_col1:
-            if formation["team1_avg_center"]:
-                st.metric("Team 1 Avg Position",
-                          f"({formation['team1_avg_center'][0]:.1f}, {formation['team1_avg_center'][1]:.1f}) m")
-        with form_col2:
-            st.metric("Team 1 Spread", f"{formation['team1_avg_spread']:.1f} m")
-        with form_col3:
-            if formation["team2_avg_center"]:
-                st.metric("Team 2 Avg Position",
-                          f"({formation['team2_avg_center'][0]:.1f}, {formation['team2_avg_center'][1]:.1f}) m")
-        with form_col4:
-            st.metric("Team 2 Spread", f"{formation['team2_avg_spread']:.1f} m")
-
-        # Defensive depth
-        depth_col1, depth_col2 = st.columns(2)
-        with depth_col1:
-            st.metric("Team 1 Defensive Depth (avg min X)",
-                      f"{formation['team1_defensive_depth']:.1f} m",
-                      help="Average of each frame's deepest (minimum X) player position. Lower = more defensive.")
-        with depth_col2:
-            st.metric("Team 2 Defensive Depth (avg min X)",
-                      f"{formation['team2_defensive_depth']:.1f} m",
-                      help="Average of each frame's deepest (minimum X) player position. Lower = more defensive.")
-
-        # Formation scatter plot
-        if formation["frames_with_players"] > 0:
-            st.markdown("**Player Positioning Scatter** (sample of frames)")
-            scatter_fig = GameAnalyzer.draw_formation_scatter(
-                game_data,
-                team1_color=(0.2, 0.4, 0.9),
-                team2_color=(0.9, 0.2, 0.2),
-                team1_label=team1_label,
-                team2_label=team2_label,
-            )
-            st.pyplot(scatter_fig)
-
-        st.markdown("---")
-
-        # ---- SECTION 4: TERRITORY CONTROL ----
-        st.markdown("### 🗺️ Territory Control (9-Zone Grid)")
-
         territory = GameAnalyzer.compute_territory(game_data)
-        zone_grid = territory["zone_grid"]
-
-        # Build a visual 3x3 grid with streamlit columns
-        for row in range(3):
-            tcols = st.columns(3)
-            for col in range(3):
-                zone = zone_grid[row][col]
-                with tcols[col]:
-                    dominant = zone["dominant_team"]
-                    t1_pct_z = zone["team1_pct"]
-                    t2_pct_z = zone["team2_pct"]
-
-                    if dominant == 0:
-                        bg = "linear-gradient(135deg, #1a73e8, #0d47a1)"
-                        emoji = "🔵"
-                    elif dominant == 1:
-                        bg = "linear-gradient(135deg, #d32f2f, #b71c1c)"
-                        emoji = "🔴"
-                    else:
-                        bg = "#6c757d"
-                        emoji = "⬜"
-
-                    st.markdown(
-                        f"""
-                        <div style="text-align: center; padding: 0.8rem; border-radius: 8px;
-                                    background: {bg}; color: white; margin-bottom: 0.5rem;">
-                            <strong>{zone['zone_name']}</strong><br>
-                            T1: {t1_pct_z}% — T2: {t2_pct_z}%
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
-
-        # Summary table
-        st.markdown("**Zone Control Summary:**")
-        summary_rows = []
-        for row in range(3):
-            for col in range(3):
-                zone = zone_grid[row][col]
-                dom = "Team 1" if zone["dominant_team"] == 0 else ("Team 2" if zone["dominant_team"] == 1 else "Neutral")
-                summary_rows.append(
-                    f"| {zone['zone_name']} | {zone['team1_pct']}% | {zone['team2_pct']}% | {dom} |"
-                )
-
-        st.markdown(
-            "| Zone | Team 1 % | Team 2 % | Dominant |\n"
-            "|------|----------|----------|----------|\n"
-            + "\n".join(summary_rows)
-        )
-
-        st.caption(
-            f"Total player-zone occurrences: Team 1 = {territory['team1_total_presence']}, "
-            f"Team 2 = {territory['team2_total_presence']}"
-        )
-
-        st.markdown("---")
-
-        # ---- SECTION 5: MATCH STATS DASHBOARD ----
-        st.markdown("### 📊 Key Match Stats")
-
         stats = GameAnalyzer.compute_match_stats(game_data)
 
-        stat_col1, stat_col2, stat_col3, stat_col4, stat_col5 = st.columns(5)
-        with stat_col1:
-            st.metric("Total Frames", stats["total_frames"])
-        with stat_col2:
-            st.metric("Ball Detection Rate", f"{stats['ball_detection_rate']}%")
-        with stat_col3:
-            st.metric("Avg Players/Frame", stats["avg_players_total"])
-        with stat_col4:
-            st.metric("Avg Team 1", stats["avg_players_team1"])
-        with stat_col5:
-            st.metric("Avg Team 2", stats["avg_players_team2"])
+        t1_pct = possession["team1_possession_pct"]
+        t2_pct = possession["team2_possession_pct"]
 
-        stat_col6, stat_col7 = st.columns(2)
-        with stat_col6:
-            st.metric("Avg Player Spread", f"{stats['avg_player_spread']} m",
-                      help="Average distance of players from their team's center of mass.")
-        with stat_col7:
-            st.metric("Ball Progression", f"{stats['ball_progression_m']} m",
-                      help="Approximate total distance the ball traveled across the pitch.")
-
-        st.markdown("---")
-        st.caption(
-            "Analysis derived from player tracking (ByteTrack + homography projection), "
-            "team color clustering (K-means), and ball detection data."
+        # Hero possession bar
+        st.markdown(
+            ui.hero_possession("Team 1", "Team 2", t1_pct, t2_pct,
+                               possession["team1_frames"], possession["team2_frames"]),
+            unsafe_allow_html=True,
         )
+
+        # KPI row
+        avg_p_total = stats["avg_players_total"]
+        ball_pct = stats["ball_detection_rate"]
+        kpi_html = ui.kpi_grid([
+            ("Total Frames",       f"{stats['total_frames']:,}",          "frames analysed"),
+            ("Ball Detection",     f"{ball_pct:.1f}%",                    f"{stats['ball_detection_frames']:,} frames"),
+            ("Players / Frame",    f"{avg_p_total:.1f}",                  f"T1 {stats['avg_players_team1']:.1f} · T2 {stats['avg_players_team2']:.1f}"),
+            ("Avg Spread",         f"{stats['avg_player_spread']} m",     "distance from team centre"),
+            ("Ball Progression",   f"{stats['ball_progression_m']} m",    "total ball travel"),
+            ("Possession Lead",    f"{abs(t1_pct - t2_pct):.1f}%",        ("Team 1 leads" if t1_pct >= t2_pct else "Team 2 leads")),
+        ])
+        st.markdown(kpi_html, unsafe_allow_html=True)
+
+        # Charts -- top row
+        row1 = st.columns(2)
+        with row1[0]:
+            st.markdown(ui.card_open("Possession Distribution",
+                                     "Donut breakdown · nearest-player share"),
+                        unsafe_allow_html=True)
+            fig = ch.build_possession_donut(palette, t1_pct, t2_pct)
+            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+            st.markdown(ui.card_close(), unsafe_allow_html=True)
+
+        with row1[1]:
+            st.markdown(ui.card_open("Possession Timeline",
+                                     "Rolling 30-frame window · momentum"),
+                        unsafe_allow_html=True)
+            fig = ch.build_possession_timeline(palette, game_data, window=30)
+            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+            st.markdown(ui.card_close(), unsafe_allow_html=True)
+
+        # Charts -- bottom row
+        row2 = st.columns(2)
+        with row2[0]:
+            st.markdown(ui.card_open("Team DNA Radar",
+                                     "6-axis tactical profile (0 – 100)"),
+                        unsafe_allow_html=True)
+            fig = ch.build_team_radar(palette, formation, stats, possession)
+            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+            st.markdown(ui.card_close(), unsafe_allow_html=True)
+
+        with row2[1]:
+            st.markdown(ui.card_open("Territory Control",
+                                     "Zone dominance — hover any cell for details",
+                                     chip=f"{territory['team1_total_presence'] + territory['team2_total_presence']:,} player-frames"),
+                        unsafe_allow_html=True)
+            fig = ch.build_territory_grid(palette, territory)
+            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+            st.markdown(ui.card_close(), unsafe_allow_html=True)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TAB 3 — PITCH ANALYSIS
+# ═════════════════════════════════════════════════════════════════════════════
+with tab_pitch:
+    has_game = bool(st.session_state.game_data)
+    has_seg = bool(st.session_state.analytics_data)
+    if not has_game and not has_seg:
+        st.markdown(
+            """
+            <div class='ps-card' style='text-align:center;padding:40px 24px;'>
+              <h3>No pitch data yet</h3>
+              <p style='color:var(--ps-text-dim);'>Process a video to view interactive heatmaps and pitch analytics.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        # Density heatmaps -----------------------------------------------------
+        if has_game:
+            heat_summary = GameAnalyzer.compute_heatmaps(st.session_state.game_data)
+            heat_cols = st.columns(2)
+            with heat_cols[0]:
+                st.markdown(ui.card_open("Team 1 Density Heatmap",
+                                         "Hover any cell — sample count, pitch third, lateral band",
+                                         chip=f"{heat_summary['team1_count']:,} samples"),
+                            unsafe_allow_html=True)
+                fig = ch.build_density_heatmap(palette, st.session_state.game_data,
+                                               team_id=0, name="Team 1")
+                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+                st.markdown(ui.card_close(), unsafe_allow_html=True)
+            with heat_cols[1]:
+                st.markdown(ui.card_open("Team 2 Density Heatmap",
+                                         "Hover any cell — sample count, pitch third, lateral band",
+                                         chip=f"{heat_summary['team2_count']:,} samples"),
+                            unsafe_allow_html=True)
+                fig = ch.build_density_heatmap(palette, st.session_state.game_data,
+                                               team_id=1, name="Team 2")
+                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+                st.markdown(ui.card_close(), unsafe_allow_html=True)
+
+            # Combined positioning ---------------------------------------------
+            st.markdown(ui.card_open("Combined Positioning & Ball Trail",
+                                     "Both teams sampled across the match + the ball trajectory"),
+                        unsafe_allow_html=True)
+            fig = ch.build_formation_scatter(palette, st.session_state.game_data)
+            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+            st.markdown(ui.card_close(), unsafe_allow_html=True)
+
+            # Formation KPI cards ----------------------------------------------
+            formation = GameAnalyzer.compute_formation(st.session_state.game_data)
+            t1c = formation["team1_avg_center"] or [0, 0]
+            t2c = formation["team2_avg_center"] or [0, 0]
+            form_kpi = ui.kpi_grid([
+                ("T1 Avg Position",      f"({t1c[0]:.1f}, {t1c[1]:.1f}) m", "centre of mass"),
+                ("T1 Avg Spread",        f"{formation['team1_avg_spread']:.1f} m",  "team compactness"),
+                ("T1 Deepest Player",    f"{formation['team1_defensive_depth']:.1f} m", "avg min-X position"),
+                ("T2 Avg Position",      f"({t2c[0]:.1f}, {t2c[1]:.1f}) m", "centre of mass"),
+                ("T2 Avg Spread",        f"{formation['team2_avg_spread']:.1f} m",  "team compactness"),
+                ("T2 Deepest Player",    f"{formation['team2_defensive_depth']:.1f} m", "avg min-X position"),
+            ])
+            st.markdown(form_kpi, unsafe_allow_html=True)
+
+        # Segmentation analytics ----------------------------------------------
+        if has_seg:
+            analytics = build_seg_analytics(st.session_state.analytics_data)
+
+            seg_kpi = ui.kpi_grid([
+                ("Total Frames",         f"{analytics['total_frames']:,}",     "processed"),
+                ("Frames w/ Segments",   f"{analytics['frames_with_seg']:,}",  "with pitch regions"),
+                ("Segmentation Coverage", f"{analytics['coverage_pct']:.1f}%",  "of all frames"),
+                ("Region Detections",    f"{analytics['total_detections']:,}",  "across all regions"),
+            ])
+            st.markdown(seg_kpi, unsafe_allow_html=True)
+
+            seg_cols = st.columns(2)
+            with seg_cols[0]:
+                st.markdown(ui.card_open("Region Detection Pie",
+                                         "Pitch zones recognised by the segmentation model"),
+                            unsafe_allow_html=True)
+                fig = ch.build_region_pie(palette, analytics["class_frequency"])
+                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+                st.markdown(ui.card_close(), unsafe_allow_html=True)
+            with seg_cols[1]:
+                st.markdown(ui.card_open("Region Detection Counts",
+                                         "Per-region detection volume"),
+                            unsafe_allow_html=True)
+                fig = ch.build_region_bar(palette, analytics["class_frequency"])
+                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+                st.markdown(ui.card_close(), unsafe_allow_html=True)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TAB 4 — OUTPUTS
+# ═════════════════════════════════════════════════════════════════════════════
+with tab_videos:
+
+
+
+
+    out_dir_str = st.session_state.last_output_dir
+    if not out_dir_str:
+        st.markdown(
+            """
+            <div class='ps-card' style='text-align:center;padding:40px 24px;'>
+              <h3>No outputs yet</h3>
+              <p style='color:var(--ps-text-dim);'>Process a video to see the five generated outputs here.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        out_dir = Path(out_dir_str)
+        outputs = get_output_videos(out_dir)
+        if not outputs:
+            st.warning("No output videos were generated.")
+        else:
+            st.markdown(
+                f"<p class='ps-card__sub' style='margin-bottom:12px;'>"
+                f"Saved to <code style='background:var(--ps-bg-alt);padding:2px 8px;border-radius:6px;'>{out_dir}</code></p>",
+                unsafe_allow_html=True,
+            )
+            for i in range(0, len(outputs), 2):
+                cols = st.columns(2)
+                for j in range(2):
+                    idx = i + j
+                    if idx >= len(outputs):
+                        continue
+                    path, label, desc = outputs[idx]
+                    with cols[j]:
+                        st.markdown(ui.card_open(label, desc), unsafe_allow_html=True)
+                        st.video(str(path))
+                        st.markdown(ui.card_close(), unsafe_allow_html=True)
+
+
+# ─── Footer ───────────────────────────────────────────────────────────────────
+st.markdown(
+    "<div class='ps-footer'>PitchSense · CV pipeline · streamlit + plotly · "
+    f"theme: <b>{st.session_state.theme}</b></div>",
+    unsafe_allow_html=True,
+)
