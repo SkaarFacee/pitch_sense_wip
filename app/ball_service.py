@@ -91,7 +91,9 @@ class BallDetector:
 
     @staticmethod
     def project_ball_to_pitch(xyxy: np.ndarray, H: np.ndarray,
-                              flip_x: bool = False, pitch_length: float = 105.0) -> np.ndarray:
+                              flip_x: bool = False, flip_y: bool = False,
+                              pitch_length: float = 105.0,
+                              pitch_width: float = 68.0) -> np.ndarray:
         """
         Project ball position onto the pitch via homography H.
 
@@ -102,7 +104,9 @@ class BallDetector:
             xyxy: (1, 4) float32 array [x1, y1, x2, y2].
             H: 3x3 homography matrix.
             flip_x: If True, mirror the x-axis (PITCH_LENGTH - x).
+            flip_y: If True, mirror the y-axis (PITCH_WIDTH - y).
             pitch_length: Pitch length in meters (for flip_x correction).
+            pitch_width: Pitch width in meters (for flip_y correction).
 
         Returns:
             (2,) float32 array — (x, y) on pitch in meters, or
@@ -121,6 +125,8 @@ class BallDetector:
 
         if flip_x:
             pitch_pt[0] = pitch_length - pitch_pt[0]
+        if flip_y:
+            pitch_pt[1] = pitch_width - pitch_pt[1]
 
         return pitch_pt
 

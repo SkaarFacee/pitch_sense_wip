@@ -18,7 +18,8 @@ from team_analyzer import TeamColorAnalyzer
 
 class KeypointPipeline:
     def __init__(self, keypoint_model_path: str, player_model_path: str, seg_model_path: str,
-                 ball_model_path: str = "", flip_projection_x: bool = False, enable_team_colors: bool = True):
+                 ball_model_path: str = "", flip_projection_x: bool = False,
+                 flip_projection_y: bool = False, enable_team_colors: bool = True):
         self.keypoint_computer = KeypointHomographyComputer(keypoint_model_path)
         self.player_detector = PlayerDetector(player_model_path)
         self.segmentor = Segmentor(seg_model_path)
@@ -27,6 +28,7 @@ class KeypointPipeline:
         self.last_H = None
         self.pitch_artist = PitchArtist()
         self.flip_projection_x = flip_projection_x
+        self.flip_projection_y = flip_projection_y
         self.ball_trajectory = []
 
     def process_frame(self, frame: np.ndarray, frame_idx: int = 0):
@@ -58,11 +60,15 @@ class KeypointPipeline:
             player_pitch_pts = self.player_detector.project_points(player_xyxy, H)
             if self.flip_projection_x and len(player_pitch_pts) > 0:
                 player_pitch_pts[:, 0] = PITCH_LENGTH - player_pitch_pts[:, 0]
+            if self.flip_projection_y and len(player_pitch_pts) > 0:
+                player_pitch_pts[:, 1] = PITCH_WIDTH - player_pitch_pts[:, 1]
 
         # 3b. Team colors
         team_info = None
         if self.team_analyzer is not None and len(player_xyxy) > 0:
-            team_info = self.team_analyzer.assign_team_colors(frame, player_xyxy, player_conf, track_ids=track_ids)
+            team_info = self.team_analyzer.assign_team_colors(
+                frame, player_xyxy, player_conf, track_ids=track_ids, H=H
+            )
 
         # 3c. Ball detection
         ball_xyxy = np.empty((0, 4), dtype=np.float32)
@@ -71,7 +77,13 @@ class KeypointPipeline:
         if self.ball_detector is not None:
             ball_xyxy, ball_conf = self.ball_detector.detect_ball(frame)
             if len(ball_xyxy) > 0 and H is not None:
-                ball_pitch_pt = self.ball_detector.project_ball_to_pitch(ball_xyxy, H, flip_x=self.flip_projection_x, pitch_length=PITCH_LENGTH)
+                ball_pitch_pt = self.ball_detector.project_ball_to_pitch(
+                    ball_xyxy, H,
+                    flip_x=self.flip_projection_x,
+                    flip_y=self.flip_projection_y,
+                    pitch_length=PITCH_LENGTH,
+                    pitch_width=PITCH_WIDTH,
+                )
                 self.ball_trajectory.append(ball_pitch_pt.copy())
                 if len(self.ball_trajectory) > BALL_TRAIL_LENGTH:
                     self.ball_trajectory.pop(0)

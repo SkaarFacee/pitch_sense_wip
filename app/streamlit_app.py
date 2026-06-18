@@ -218,6 +218,10 @@ with st.sidebar:
         help="Limit processing for faster testing.",
     )
     enable_team_colors = st.checkbox("Team colour clustering", value=True)
+    flip_projection_x = st.checkbox("Flip projection (X — long axis)", value=False,
+                                    help="Mirror the long axis of the pitch if the camera is behind the opposite goal.")
+    flip_projection_y = st.checkbox("Flip projection (Y — short axis)", value=True,
+                                    help="Mirror the short axis if the ball/players appear on the wrong side of the top-down pitch canvas.")
 
 
 palette = ui.palette(st.session_state.theme)
@@ -427,6 +431,8 @@ with tab_processing:
                 seg_model_path=MODEL_PATHS["seg"],
                 ball_model_path=MODEL_PATHS["ball"],
                 enable_team_colors=enable_team_colors,
+                flip_projection_x=flip_projection_x,
+                flip_projection_y=flip_projection_y,
             )
 
             processed = 0
@@ -455,10 +461,18 @@ with tab_processing:
 
                 team_info = result.get("team_info")
                 team_ids = team_info.get("team_ids") if team_info else None
+                track_ids = result.get("track_ids", np.empty((0,), dtype=np.int32))
+                track_quality = team_info.get("track_quality") if team_info else None
+                team1_bgr = team_info.get("team1_bgr") if team_info else None
+                team2_bgr = team_info.get("team2_bgr") if team_info else None
                 st.session_state.game_data.append({
                     "frame_idx": processed,
                     "player_positions": result.get("player_pitch_pts", np.empty((0, 2))),
                     "team_ids": team_ids,
+                    "track_ids": track_ids,
+                    "track_quality": track_quality,
+                    "team1_bgr": team1_bgr,
+                    "team2_bgr": team2_bgr,
                     "ball_position": result.get("ball_pitch_pt"),
                     "player_conf": result.get("player_conf", np.empty((0,))),
                 })
@@ -544,6 +558,28 @@ with tab_match:
         territory = GameAnalyzer.compute_territory(game_data)
         stats = GameAnalyzer.compute_match_stats(game_data)
 
+        # Override the team1/team2 colours in the active palette with the
+        # BGR centroids detected by the team_analyzer. The values are
+        # EMA-blended across the match, so they reflect each team's
+        # representative jersey colour rather than a single-frame outlier.
+        detected_palette = dict(palette)
+        t1_bgr = GameAnalyzer.dominant_team_bgr(game_data, team=0)
+        t2_bgr = GameAnalyzer.dominant_team_bgr(game_data, team=1)
+        if t1_bgr is not None:
+            detected_palette["team1"] = GameAnalyzer.bgr_to_hex(t1_bgr)
+        if t2_bgr is not None:
+            detected_palette["team2"] = GameAnalyzer.bgr_to_hex(t2_bgr)
+
+        # Inject CSS variables so the hero bar / legend / cards use the
+        # detected team colours for the duration of this render.
+        st.markdown(
+            f"<style>:root {{"
+            f"  --ps-team1: {detected_palette['team1']};"
+            f"  --ps-team2: {detected_palette['team2']};"
+            f"}}</style>",
+            unsafe_allow_html=True,
+        )
+
         t1_pct = possession["team1_possession_pct"]
         t2_pct = possession["team2_possession_pct"]
 
@@ -573,7 +609,7 @@ with tab_match:
             st.markdown(ui.card_open("Possession Distribution",
                                      "Donut breakdown · nearest-player share"),
                         unsafe_allow_html=True)
-            fig = ch.build_possession_donut(palette, t1_pct, t2_pct)
+            fig = ch.build_possession_donut(detected_palette, t1_pct, t2_pct)
             st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
             st.markdown(ui.card_close(), unsafe_allow_html=True)
 
@@ -581,7 +617,7 @@ with tab_match:
             st.markdown(ui.card_open("Possession Timeline",
                                      "Rolling 30-frame window · momentum"),
                         unsafe_allow_html=True)
-            fig = ch.build_possession_timeline(palette, game_data, window=30)
+            fig = ch.build_possession_timeline(detected_palette, game_data, window=30)
             st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
             st.markdown(ui.card_close(), unsafe_allow_html=True)
 
@@ -591,7 +627,7 @@ with tab_match:
             st.markdown(ui.card_open("Team DNA Radar",
                                      "6-axis tactical profile (0 – 100)"),
                         unsafe_allow_html=True)
-            fig = ch.build_team_radar(palette, formation, stats, possession)
+            fig = ch.build_team_radar(detected_palette, formation, stats, possession)
             st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
             st.markdown(ui.card_close(), unsafe_allow_html=True)
 
@@ -600,7 +636,7 @@ with tab_match:
                                      "Zone dominance — hover any cell for details",
                                      chip=f"{territory['team1_total_presence'] + territory['team2_total_presence']:,} player-frames"),
                         unsafe_allow_html=True)
-            fig = ch.build_territory_grid(palette, territory)
+            fig = ch.build_territory_grid(detected_palette, territory)
             st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
             st.markdown(ui.card_close(), unsafe_allow_html=True)
 
@@ -622,6 +658,16 @@ with tab_pitch:
             unsafe_allow_html=True,
         )
     else:
+        # Same detected-colour override as the Match Centre tab so the
+        # heatmaps / scatter / KPIs use the live team colours.
+        detected_palette = dict(palette)
+        t1_bgr = GameAnalyzer.dominant_team_bgr(st.session_state.game_data, team=0)
+        t2_bgr = GameAnalyzer.dominant_team_bgr(st.session_state.game_data, team=1)
+        if t1_bgr is not None:
+            detected_palette["team1"] = GameAnalyzer.bgr_to_hex(t1_bgr)
+        if t2_bgr is not None:
+            detected_palette["team2"] = GameAnalyzer.bgr_to_hex(t2_bgr)
+
         # Density heatmaps -----------------------------------------------------
         if has_game:
             heat_summary = GameAnalyzer.compute_heatmaps(st.session_state.game_data)
@@ -631,7 +677,7 @@ with tab_pitch:
                                          "Hover any cell — sample count, pitch third, lateral band",
                                          chip=f"{heat_summary['team1_count']:,} samples"),
                             unsafe_allow_html=True)
-                fig = ch.build_density_heatmap(palette, st.session_state.game_data,
+                fig = ch.build_density_heatmap(detected_palette, st.session_state.game_data,
                                                team_id=0, name="Team 1")
                 st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
                 st.markdown(ui.card_close(), unsafe_allow_html=True)
@@ -640,7 +686,7 @@ with tab_pitch:
                                          "Hover any cell — sample count, pitch third, lateral band",
                                          chip=f"{heat_summary['team2_count']:,} samples"),
                             unsafe_allow_html=True)
-                fig = ch.build_density_heatmap(palette, st.session_state.game_data,
+                fig = ch.build_density_heatmap(detected_palette, st.session_state.game_data,
                                                team_id=1, name="Team 2")
                 st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
                 st.markdown(ui.card_close(), unsafe_allow_html=True)
@@ -649,7 +695,7 @@ with tab_pitch:
             st.markdown(ui.card_open("Combined Positioning & Ball Trail",
                                      "Both teams sampled across the match + the ball trajectory"),
                         unsafe_allow_html=True)
-            fig = ch.build_formation_scatter(palette, st.session_state.game_data)
+            fig = ch.build_formation_scatter(detected_palette, st.session_state.game_data)
             st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
             st.markdown(ui.card_close(), unsafe_allow_html=True)
 

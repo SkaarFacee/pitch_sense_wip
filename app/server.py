@@ -292,24 +292,43 @@ def _heatmap_payload(game_data: list, bins=(18, 12)) -> dict:
 
 
 def _formation_scatter_payload(game_data: list, max_frames: int = 200) -> dict:
+    from game_analyzer import TEAM0, TEAM1
+    registry = GameAnalyzer.build_registry(game_data)
     step = max(1, len(game_data) // max_frames)
     t1_xs, t1_ys, t1_frames = [], [], []
     t2_xs, t2_ys, t2_frames = [], [], []
     for entry in game_data[::step]:
-        _, _, t1, t2 = GameAnalyzer._split_teams(entry)
+        tids = entry.get("track_ids")
+        positions = entry.get("player_positions")
         fi = entry.get("frame_idx", 0)
-        if t1 is not None and len(t1) > 0:
-            for x, y in t1:
-                if -2 <= x <= PITCH_LENGTH + 2 and -2 <= y <= PITCH_WIDTH + 2:
-                    t1_xs.append(float(x))
-                    t1_ys.append(float(y))
-                    t1_frames.append(fi)
-        if t2 is not None and len(t2) > 0:
-            for x, y in t2:
-                if -2 <= x <= PITCH_LENGTH + 2 and -2 <= y <= PITCH_WIDTH + 2:
-                    t2_xs.append(float(x))
-                    t2_ys.append(float(y))
-                    t2_frames.append(fi)
+        if registry.has_track_ids and tids is not None and positions is not None and len(tids) == len(positions):
+            for i, tid in enumerate(np.asarray(tids)):
+                rec = registry.tracks.get(int(tid))
+                if rec is None:
+                    continue
+                if rec.canonical_team not in (TEAM0, TEAM1):
+                    continue
+                x = float(positions[i][0]); y = float(positions[i][1])
+                if not (-2 <= x <= PITCH_LENGTH + 2 and -2 <= y <= PITCH_WIDTH + 2):
+                    continue
+                if rec.canonical_team == TEAM0:
+                    t1_xs.append(x); t1_ys.append(y); t1_frames.append(fi)
+                else:
+                    t2_xs.append(x); t2_ys.append(y); t2_frames.append(fi)
+        else:
+            _, _, t1, t2 = GameAnalyzer._split_teams(entry)
+            if t1 is not None and len(t1) > 0:
+                for x, y in t1:
+                    if -2 <= x <= PITCH_LENGTH + 2 and -2 <= y <= PITCH_WIDTH + 2:
+                        t1_xs.append(float(x))
+                        t1_ys.append(float(y))
+                        t1_frames.append(fi)
+            if t2 is not None and len(t2) > 0:
+                for x, y in t2:
+                    if -2 <= x <= PITCH_LENGTH + 2 and -2 <= y <= PITCH_WIDTH + 2:
+                        t2_xs.append(float(x))
+                        t2_ys.append(float(y))
+                        t2_frames.append(fi)
     return {
         "team1": {"x": t1_xs, "y": t1_ys, "frame": t1_frames},
         "team2": {"x": t2_xs, "y": t2_ys, "frame": t2_frames},
@@ -334,29 +353,30 @@ def _ball_trail_payload(game_data: list) -> dict:
 
 
 def _possession_timeline(game_data: list, window: int = 30) -> dict:
-    """Rolling possession % over time (window in frames) for line chart."""
+    """Rolling possession % over time (window in frames) for line chart.
+
+    Track-aware: uses the canonical per-track team from the registry, so a
+    single-frame misclassification of one player cannot flip the
+    possession assignment for that frame.
+    """
+    registry = GameAnalyzer.build_registry(game_data)
     t1_rolling = []
     t2_rolling = []
     frames_axis = []
-    state_t1 = 0
-    state_t2 = 0
     buf = []  # FIFO of 0/1/-1 (team in possession of nearest player to ball)
 
     for entry in game_data:
         ball = entry.get("ball_position")
         team = -1
         if ball is not None:
-            valid_pos, valid_tid, t1, t2 = GameAnalyzer._split_teams(entry)
-            if valid_pos is not None and (len(t1) > 0 or len(t2) > 0):
-                ball_arr = np.asarray(ball, dtype=np.float32).reshape(1, 2)
-                dists = np.linalg.norm(valid_pos - ball_arr, axis=1)
-                avg1 = float(np.mean(dists[valid_tid == 0])) if len(t1) > 0 else float("inf")
-                avg2 = float(np.mean(dists[valid_tid == 1])) if len(t2) > 0 else float("inf")
-                team = 0 if avg1 <= avg2 else 1
+            ball_arr = np.asarray(ball, dtype=np.float32).reshape(1, 2)
+            winner = GameAnalyzer._nearest_team_to_ball(entry, ball_arr, registry)
+            if winner is not None:
+                team = int(winner)
         buf.append(team)
         if len(buf) > window:
             buf.pop(0)
-        valid = [b for b in buf if b != -1]
+        valid = [b for b in buf if b in (0, 1)]
         if valid:
             t1pc = round(100.0 * sum(1 for b in valid if b == 0) / len(valid), 1)
             t2pc = round(100.0 * sum(1 for b in valid if b == 1) / len(valid), 1)
@@ -441,6 +461,12 @@ def _build_full_analytics(job: dict) -> dict:
         "stats": stats,
         "segments": seg_summary,
         "radar": _team_radar_payload(formation_json, stats, possession),
+        "team_colors": {
+            "team1_bgr": list(GameAnalyzer.dominant_team_bgr(game_data, team=0))
+                          if GameAnalyzer.dominant_team_bgr(game_data, team=0) else None,
+            "team2_bgr": list(GameAnalyzer.dominant_team_bgr(game_data, team=1))
+                          if GameAnalyzer.dominant_team_bgr(game_data, team=1) else None,
+        },
         "output_videos": [
             {"file": fn, "label": lab}
             for fn, lab in OUTPUT_VIDEOS
@@ -451,7 +477,8 @@ def _build_full_analytics(job: dict) -> dict:
 
 
 # ─── Background processing thread ─────────────────────────────────────────────
-def _process_job(job_id: str, max_frames: Optional[int], enable_team_colors: bool):
+def _process_job(job_id: str, max_frames: Optional[int], enable_team_colors: bool,
+                 flip_projection_x: bool = False, flip_projection_y: bool = True):
     with JOBS_LOCK:
         job = JOBS.get(job_id)
     if job is None:
@@ -474,6 +501,8 @@ def _process_job(job_id: str, max_frames: Optional[int], enable_team_colors: boo
             seg_model_path=MODEL_PATHS["seg"],
             ball_model_path=MODEL_PATHS["ball"],
             enable_team_colors=enable_team_colors,
+            flip_projection_x=flip_projection_x,
+            flip_projection_y=flip_projection_y,
         )
 
         total = job["total_frames"]
@@ -510,10 +539,18 @@ def _process_job(job_id: str, max_frames: Optional[int], enable_team_colors: boo
 
             team_info = result.get("team_info")
             team_ids = team_info.get("team_ids") if team_info else None
+            track_ids = result.get("track_ids", np.empty((0,), dtype=np.int32))
+            track_quality = team_info.get("track_quality") if team_info else None
+            team1_bgr = team_info.get("team1_bgr") if team_info else None
+            team2_bgr = team_info.get("team2_bgr") if team_info else None
             job["game_data"].append({
                 "frame_idx": processed,
                 "player_positions": result.get("player_pitch_pts", np.empty((0, 2))),
                 "team_ids": team_ids,
+                "track_ids": track_ids,
+                "track_quality": track_quality,
+                "team1_bgr": team1_bgr,
+                "team2_bgr": team2_bgr,
                 "ball_position": result.get("ball_pitch_pt"),
                 "player_conf": result.get("player_conf", np.empty((0,))),
             })
@@ -585,6 +622,8 @@ def api_process():
     video_path = payload.get("video_path")
     max_frames = payload.get("max_frames", 0)
     enable_team_colors = bool(payload.get("enable_team_colors", True))
+    flip_projection_x = bool(payload.get("flip_projection_x", False))
+    flip_projection_y = bool(payload.get("flip_projection_y", True))
 
     if not video_path or not Path(video_path).exists():
         return jsonify({"ok": False, "error": "Invalid video_path"}), 400
@@ -601,7 +640,8 @@ def api_process():
 
     t = threading.Thread(
         target=_process_job,
-        args=(job["id"], int(max_frames) if max_frames else None, enable_team_colors),
+        args=(job["id"], int(max_frames) if max_frames else None,
+              enable_team_colors, flip_projection_x, flip_projection_y),
         daemon=True,
     )
     t.start()

@@ -182,24 +182,27 @@ def build_possession_donut(palette: dict, t1_pct: float, t2_pct: float,
 
 # ─── Possession timeline (rolling) ───────────────────────────────────────────
 def build_possession_timeline(palette: dict, game_data: list, window: int = 30) -> go.Figure:
-    """Rolling possession share line chart."""
+    """Rolling possession share line chart.
+
+    Track-aware: uses the canonical per-track team from the registry, so a
+    single-frame misclassification of one player cannot flip the
+    possession assignment for that frame.
+    """
     from game_analyzer import GameAnalyzer
+    registry = GameAnalyzer.build_registry(game_data)
     buf, t1_series, t2_series, frames_axis = [], [], [], []
     for entry in game_data:
         ball = entry.get("ball_position")
         team = -1
         if ball is not None:
-            vp, vt, t1, t2 = GameAnalyzer._split_teams(entry)
-            if vp is not None and (len(t1) > 0 or len(t2) > 0):
-                ball_arr = np.asarray(ball, dtype=np.float32).reshape(1, 2)
-                dists = np.linalg.norm(vp - ball_arr, axis=1)
-                avg1 = float(np.mean(dists[vt == 0])) if len(t1) > 0 else float("inf")
-                avg2 = float(np.mean(dists[vt == 1])) if len(t2) > 0 else float("inf")
-                team = 0 if avg1 <= avg2 else 1
+            ball_arr = np.asarray(ball, dtype=np.float32).reshape(1, 2)
+            team = GameAnalyzer._nearest_team_to_ball(entry, ball_arr, registry)
+            if team is not None:
+                team = int(team)
         buf.append(team)
         if len(buf) > window:
             buf.pop(0)
-        valid = [b for b in buf if b != -1]
+        valid = [b for b in buf if b in (0, 1)]
         if valid:
             t1pc = round(100.0 * sum(1 for b in valid if b == 0) / len(valid), 1)
             t2pc = round(100.0 * sum(1 for b in valid if b == 1) / len(valid), 1)
@@ -449,22 +452,43 @@ def build_density_heatmap(palette: dict, game_data: list, team_id: int,
 # ─── Combined formation scatter ──────────────────────────────────────────────
 def build_formation_scatter(palette: dict, game_data: list,
                             max_frames: int = 200) -> go.Figure:
-    from game_analyzer import GameAnalyzer
+    from game_analyzer import GameAnalyzer, TEAM0, TEAM1
+
+    registry = GameAnalyzer.build_registry(game_data)
 
     step = max(1, len(game_data) // max_frames)
     t1_xs, t1_ys, t1_fr = [], [], []
     t2_xs, t2_ys, t2_fr = [], [], []
     for entry in game_data[::step]:
-        _, _, t1, t2 = GameAnalyzer._split_teams(entry)
+        tids = entry.get("track_ids")
+        positions = entry.get("player_positions")
         fi = int(entry.get("frame_idx", 0))
-        if t1 is not None and len(t1) > 0:
-            for x, y in t1:
+        if registry.has_track_ids and tids is not None and positions is not None:
+            for i, tid in enumerate(np.asarray(tids)):
+                rec = registry.tracks.get(int(tid))
+                if rec is None:
+                    continue
+                if rec.canonical_team == TEAM0:
+                    x, y = float(positions[i][0]), float(positions[i][1])
+                elif rec.canonical_team == TEAM1:
+                    x, y = float(positions[i][0]), float(positions[i][1])
+                else:
+                    continue
                 if -2 <= x <= PITCH_LENGTH + 2 and -2 <= y <= PITCH_WIDTH + 2:
-                    t1_xs.append(float(x)); t1_ys.append(float(y)); t1_fr.append(fi)
-        if t2 is not None and len(t2) > 0:
-            for x, y in t2:
-                if -2 <= x <= PITCH_LENGTH + 2 and -2 <= y <= PITCH_WIDTH + 2:
-                    t2_xs.append(float(x)); t2_ys.append(float(y)); t2_fr.append(fi)
+                    if rec.canonical_team == TEAM0:
+                        t1_xs.append(x); t1_ys.append(y); t1_fr.append(fi)
+                    else:
+                        t2_xs.append(x); t2_ys.append(y); t2_fr.append(fi)
+        else:
+            _, _, t1, t2 = GameAnalyzer._split_teams(entry)
+            if t1 is not None and len(t1) > 0:
+                for x, y in t1:
+                    if -2 <= x <= PITCH_LENGTH + 2 and -2 <= y <= PITCH_WIDTH + 2:
+                        t1_xs.append(float(x)); t1_ys.append(float(y)); t1_fr.append(fi)
+            if t2 is not None and len(t2) > 0:
+                for x, y in t2:
+                    if -2 <= x <= PITCH_LENGTH + 2 and -2 <= y <= PITCH_WIDTH + 2:
+                        t2_xs.append(float(x)); t2_ys.append(float(y)); t2_fr.append(fi)
 
     ball_xs, ball_ys, ball_fr = [], [], []
     for entry in game_data:
