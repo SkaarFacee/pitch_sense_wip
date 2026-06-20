@@ -5,8 +5,24 @@ from pathlib import Path
 from typing import Optional
 from constants import (
     PLAYER_CONF, SEG_CONF, CANVAS_W, CANVAS_H, PITCH_LENGTH, PITCH_WIDTH,
+    CENTER_X, CENTER_Y,
     BALL_CONF, BALL_TRAIL_LENGTH, BALL_BBOX_COLOR, BALL_DOT_COLOR,
 )
+
+# How many frames the "PASS DETECTED" banner stays on screen after a pass.
+PASS_FLASH_FRAMES = 30
+
+# Minimum pitch-distance between the previous and the new ball-owner for
+# a transition to count as a pass. Filters out (a) detection jitter
+# between two same-team players within a few meters of the ball, and
+# (b) the ball rolling slowly past a row of teammates — each "new
+# closest" handoff would otherwise be counted as a pass.
+MIN_PASS_DISTANCE_M = 12.0
+
+# Minimum ball displacement between the two frames that bracket a pass.
+# Combined with the player-distance gate, this catches only events where
+# the ball genuinely travelled from one player to another.
+MIN_BALL_DISPLACEMENT_M = 3.0
 from keypoint_service import KeypointHomographyComputer
 from player_service import PlayerDetector
 from ball_service import BallDetector
@@ -30,6 +46,18 @@ class KeypointPipeline:
         self.flip_projection_x = flip_projection_x
         self.flip_projection_y = flip_projection_y
         self.ball_trajectory = []
+        # Pass-detection state: rolling previous-owner track id / team
+        # and a frame counter for the on-screen "PASS DETECTED" flash.
+        # We also keep the previous owner's last-known PITCH position and
+        # the previous frame's ball position so the pass gate can compare
+        # (a) player-to-player distance and (b) ball displacement between
+        # the two frames — both must clear their thresholds to count.
+        self._prev_ball_owner_tid: Optional[int] = None
+        self._prev_ball_owner_team: Optional[int] = None
+        self._prev_ball_owner_pitch: Optional[np.ndarray] = None
+        self._prev_ball_pitch: Optional[np.ndarray] = None
+        self._pass_flash_counter: int = 0
+        self._last_pass_info: dict = {}
 
     def process_frame(self, frame: np.ndarray, frame_idx: int = 0):
         frame_h, frame_w = frame.shape[:2]
@@ -41,6 +69,13 @@ class KeypointPipeline:
         if seg_op is not None and getattr(seg_op, 'masks', None) is not None:
             processed_segments = self.segmentor.extract(seg_op, frame_w, last_side=None)
             seg_overlay_frame = self._create_seg_overlay(frame, seg_op, processed_segments)
+
+        # 1b. Build a binary pitch mask from the segmentation contours so
+        # off-pitch detections (referees in the crowd, false positives in
+        # the stands, etc.) can be filtered before they're used for
+        # possession, passing, or display. Falls back to None when no
+        # segmentation is available — callers treat None as "no filter".
+        pitch_mask = self._build_pitch_mask(processed_segments, frame_h, frame_w)
 
         # 2. Keypoint → Homography
         H, H_info = self.keypoint_computer.compute_homography(frame, last_H=self.last_H)
@@ -55,6 +90,28 @@ class KeypointPipeline:
             player_xyxy = np.empty((0, 4), dtype=np.float32)
             player_conf = np.empty((0,), dtype=np.float32)
             track_ids = np.empty((0,), dtype=np.int32)
+
+        # 3a.1 Segmentation-based filtering — drop any player detection
+        # whose lower-torso anchor (closer to the feet, where the player
+        # actually touches the pitch) falls OUTSIDE the segmented pitch
+        # mask. This prevents false positives in the stands, advertising
+        # boards, or background from contaminating possession / passing /
+        # defensive-line analytics and the on-screen overlay.
+        if pitch_mask is not None and len(player_xyxy) > 0:
+            keep = self._filter_bboxes_by_mask(
+                player_xyxy, pitch_mask, anchor="lower_torso",
+            )
+            if len(keep) < len(player_xyxy):
+                player_xyxy = player_xyxy[keep]
+                if len(player_conf) == len(keep):
+                    player_conf = player_conf[keep]
+                else:
+                    player_conf = player_conf[:0]
+                if len(track_ids) == len(keep):
+                    track_ids = track_ids[keep]
+                else:
+                    track_ids = track_ids[:0]
+
         player_pitch_pts = np.empty((0, 2), dtype=np.float32)
         if H is not None and len(player_xyxy) > 0:
             player_pitch_pts = self.player_detector.project_points(player_xyxy, H)
@@ -67,7 +124,8 @@ class KeypointPipeline:
         team_info = None
         if self.team_analyzer is not None and len(player_xyxy) > 0:
             team_info = self.team_analyzer.assign_team_colors(
-                frame, player_xyxy, player_conf, track_ids=track_ids, H=H
+                frame, player_xyxy, player_conf, track_ids=track_ids, H=H,
+                player_pitch_pts=player_pitch_pts if len(player_pitch_pts) > 0 else None,
             )
 
         # 3c. Ball detection
@@ -76,6 +134,14 @@ class KeypointPipeline:
         ball_pitch_pt = None
         if self.ball_detector is not None:
             ball_xyxy, ball_conf = self.ball_detector.detect_ball(frame)
+
+            # 3c.1 Segmentation-based filtering — discard any ball detection
+            # whose center is outside the segmented pitch mask.
+            if pitch_mask is not None and len(ball_xyxy) > 0:
+                if not self._bbox_center_in_mask(ball_xyxy[0], pitch_mask):
+                    ball_xyxy = np.empty((0, 4), dtype=np.float32)
+                    ball_conf = np.empty((0,), dtype=np.float32)
+
             if len(ball_xyxy) > 0 and H is not None:
                 ball_pitch_pt = self.ball_detector.project_ball_to_pitch(
                     ball_xyxy, H,
@@ -90,6 +156,8 @@ class KeypointPipeline:
 
         # 4. Pitch canvas (top-down)
         pitch_canvas = self.pitch_artist.draw_pitch_base()
+        if processed_segments:
+            pitch_canvas = self.pitch_artist.draw_seg_zones(pitch_canvas, processed_segments, alpha=0.25)
         if len(self.ball_trajectory) > 1:
             pitch_canvas = self.pitch_artist.draw_ball_trajectory(pitch_canvas, self.ball_trajectory, max_trail=BALL_TRAIL_LENGTH)
         if len(player_pitch_pts) > 0:
@@ -107,25 +175,296 @@ class KeypointPipeline:
         if ball_pitch_pt is not None:
             pitch_canvas = self.pitch_artist.draw_ball_on_pitch(pitch_canvas, ball_pitch_pt, ball_color=BALL_DOT_COLOR)
 
+        # 4b. Pass detection.
+        # Per spec: a pass is a possession transition where the ball bbox
+        # (from the ball model) overlaps with a player bbox (from the
+        # player model). Ball-owner is therefore resolved by BBOX OVERLAP
+        # rather than nearest-pitch-distance. The previous owner is
+        # remembered across frames; if a DIFFERENT track on the SAME
+        # team is now overlapping the ball, and the player-distance and
+        # ball-displacement gates clear, the transition counts as a pass.
+        pass_info: dict = {}
+        pass_event: Optional[dict] = None
+        tids_arr = np.asarray(track_ids) if len(track_ids) > 0 else np.empty((0,), dtype=np.int32)
+        team_ids_arr = (np.asarray(team_info['team_ids'])
+                        if (team_info is not None
+                            and 'team_ids' in team_info
+                            and len(team_info['team_ids']) > 0)
+                        else np.empty((0,), dtype=np.int32))
+
+        # Resolve the new ball-owner by checking which player bbox the
+        # ball bbox overlaps. Requires BOTH the ball detector AND the
+        # player detector to have produced boxes this frame.
+        ball_owner_idx: Optional[int] = None
+        if len(ball_xyxy) > 0 and len(player_xyxy) > 0:
+            ball_owner_idx, _owner_score = self._find_ball_owner_by_bbox_overlap(
+                ball_xyxy, player_xyxy
+            )
+
+        best_tid: Optional[int] = None
+        best_team: Optional[int] = None
+        best_pitch: Optional[np.ndarray] = None
+        if ball_owner_idx is not None:
+            n = min(len(tids_arr), len(team_ids_arr), len(player_xyxy), len(player_pitch_pts))
+            if ball_owner_idx < n:
+                owner_team = int(team_ids_arr[ball_owner_idx])
+                if owner_team in (0, 1):
+                    proj_pt = player_pitch_pts[ball_owner_idx]
+                    if (-2 <= proj_pt[0] <= PITCH_LENGTH + 2
+                            and -2 <= proj_pt[1] <= PITCH_WIDTH + 2):
+                        best_tid = int(tids_arr[ball_owner_idx])
+                        best_team = owner_team
+                        best_pitch = np.asarray(proj_pt, dtype=np.float32).copy()
+
+        if (best_tid is not None
+                and self._prev_ball_owner_tid is not None
+                and best_tid != self._prev_ball_owner_tid
+                and self._prev_ball_owner_team is not None
+                and best_team == self._prev_ball_owner_team):
+            # Two gates must both pass for a real pass:
+            #   1) The two players are far enough apart in pitch space.
+            #   2) The ball has actually moved between frames — without
+            #      this, a stationary ball whose "nearest player"
+            #      assignment jitters still counts as a pass.
+            pass_dist_m = 0.0
+            if self._prev_ball_owner_pitch is not None and best_pitch is not None:
+                pass_dist_m = float(np.linalg.norm(
+                    self._prev_ball_owner_pitch - best_pitch))
+            ball_disp_m = 0.0
+            if self._prev_ball_pitch is not None and ball_pitch_pt is not None:
+                ball_disp_m = float(np.linalg.norm(
+                    np.asarray(self._prev_ball_pitch, dtype=np.float32)
+                    - np.asarray(ball_pitch_pt, dtype=np.float32)))
+            if (pass_dist_m >= MIN_PASS_DISTANCE_M
+                    and ball_disp_m >= MIN_BALL_DISPLACEMENT_M):
+                pass_info = {
+                    "from_tid": int(self._prev_ball_owner_tid),
+                    "to_tid": int(best_tid),
+                    "team": int(best_team),
+                    "distance_m": round(pass_dist_m, 1),
+                }
+                pass_event = {
+                    "from_tid": int(self._prev_ball_owner_tid),
+                    "to_tid": int(best_tid),
+                    "team": int(best_team),
+                    "distance_m": round(pass_dist_m, 1),
+                }
+                self._pass_flash_counter = PASS_FLASH_FRAMES
+                self._last_pass_info = pass_info
+
+        if best_tid is not None:
+            self._prev_ball_owner_tid = best_tid
+            self._prev_ball_owner_team = best_team
+            self._prev_ball_owner_pitch = best_pitch
+        elif ball_owner_idx is None:
+            # No player bbox overlaps the ball this frame AND we don't
+            # have a previous owner to fall back on → drop pass state so
+            # the next overlap isn't compared against a stale owner.
+            self._prev_ball_owner_tid = None
+            self._prev_ball_owner_team = None
+            self._prev_ball_owner_pitch = None
+
+        if ball_pitch_pt is not None:
+            self._prev_ball_pitch = np.asarray(ball_pitch_pt, dtype=np.float32).copy()
+        else:
+            # Ball lost from view: clear all pass-detection state so a
+            # later re-detection isn't compared against stale owners.
+            self._prev_ball_owner_tid = None
+            self._prev_ball_owner_team = None
+            self._prev_ball_owner_pitch = None
+            self._prev_ball_pitch = None
+        # Decrement the flash counter every frame so the banner fades out
+        # even when no new pass is detected.
+        if self._pass_flash_counter > 0:
+            self._pass_flash_counter = max(0, self._pass_flash_counter - 1)
+
         # 5. Annotated frames
         used_kpts = H_info.get('used_keypoints', [])
         annotated_frame = self._draw_keypoints_on_frame(frame, used_kpts)
         if team_info is not None and len(player_xyxy) > 0:
-            annotated_frame = self._draw_team_bboxes(annotated_frame, player_xyxy, team_info['team_colors'], player_conf=player_conf)
+            annotated_frame = self._draw_team_bboxes(annotated_frame, player_xyxy,
+                                                    team_info['team_colors'],
+                                                    player_conf=player_conf,
+                                                    team_ids=team_info['team_ids'])
         if len(ball_xyxy) > 0:
             annotated_frame = self._draw_ball_bbox(annotated_frame, ball_xyxy, ball_conf, color=BALL_BBOX_COLOR)
         deep_analysis_frame = self._draw_keypoints_on_frame(seg_overlay_frame, used_kpts) if used_kpts else seg_overlay_frame
         if team_info is not None and len(player_xyxy) > 0:
-            deep_analysis_frame = self._draw_team_bboxes(deep_analysis_frame, player_xyxy, team_info['team_colors'], player_conf=player_conf)
+            deep_analysis_frame = self._draw_team_bboxes(deep_analysis_frame, player_xyxy,
+                                                       team_info['team_colors'],
+                                                       player_conf=player_conf,
+                                                       team_ids=team_info['team_ids'])
         if len(ball_xyxy) > 0:
             deep_analysis_frame = self._draw_ball_bbox(deep_analysis_frame, ball_xyxy, ball_conf, color=BALL_BBOX_COLOR)
+        # Defensive-line overlay: project each team's deepest outfield
+        # player back into image coords with H⁻¹ and draw a horizontal
+        # line at that depth so the viewer can see the defensive line
+        # shift over the match.
+        if team_info is not None and H is not None and len(player_pitch_pts) > 0:
+            deep_analysis_frame = self._draw_defensive_lines(
+                deep_analysis_frame, H, tids_arr, team_ids_arr, player_pitch_pts,
+                team_info.get("team1_bgr", (255, 0, 0)),
+                team_info.get("team2_bgr", (0, 0, 255)),
+            )
+        # Pass flash overlay — drawn LAST so it sits on top of every other
+        # annotation. Only on the Deep Analysis video (per the request).
+        if self._pass_flash_counter > 0:
+            deep_analysis_frame = self._draw_pass_flash(
+                deep_analysis_frame, self._last_pass_info, self._pass_flash_counter,
+                PASS_FLASH_FRAMES,
+            )
 
         return {'H': H, 'H_info': H_info, 'player_xyxy': player_xyxy, 'player_conf': player_conf,
                 'track_ids': track_ids, 'player_pitch_pts': player_pitch_pts, 'keypoints_used': used_kpts,
                 'seg_result': seg_op, 'processed_segments': processed_segments, 'pitch_canvas': pitch_canvas,
                 'annotated_frame': annotated_frame, 'deep_analysis_frame': deep_analysis_frame, 'team_info': team_info,
                 'ball_xyxy': ball_xyxy, 'ball_conf': ball_conf, 'ball_pitch_pt': ball_pitch_pt,
-                'ball_trajectory': list(self.ball_trajectory)}
+                'ball_trajectory': list(self.ball_trajectory), 'pass_event': pass_event,
+                'pitch_mask': pitch_mask}
+
+    @staticmethod
+    def _find_ball_owner_by_bbox_overlap(ball_xyxy: np.ndarray,
+                                         player_xyxy: np.ndarray
+                                         ) -> tuple:
+        """Find the player whose bounding box overlaps the ball bounding box.
+
+        Per spec: a pass is a transition where the ball bbox overlaps a
+        player bbox. Ball-ownership for the current frame is therefore
+        resolved by BBOX overlap (NOT by nearest pitch-space distance).
+
+        Strategy (preference order):
+          1. Player bbox that contains the ball-bbox center → strongest.
+          2. Otherwise, the player bbox with the largest pixel-area
+             intersection with the ball bbox (rare; happens when the ball
+             is partially behind a player).
+
+        Args:
+            ball_xyxy: (1, 4) or (N, 4) ball bbox(es) from the ball model.
+            player_xyxy: (M, 4) player bboxes from the player model.
+
+        Returns:
+            (idx, score) — the player index into ``player_xyxy`` whose
+            bbox best matches, and the overlap score. ``(None, 0.0)`` is
+            returned when the arrays are empty or no bbox overlap exists.
+        """
+        if len(ball_xyxy) == 0 or len(player_xyxy) == 0:
+            return None, 0.0
+        bx1 = float(ball_xyxy[0, 0]); by1 = float(ball_xyxy[0, 1])
+        bx2 = float(ball_xyxy[0, 2]); by2 = float(ball_xyxy[0, 3])
+        cx = (bx1 + bx2) / 2.0
+        cy = (by1 + by2) / 2.0
+        best_idx: Optional[int] = None
+        best_score = 0.0
+        for i in range(len(player_xyxy)):
+            px1 = float(player_xyxy[i, 0]); py1 = float(player_xyxy[i, 1])
+            px2 = float(player_xyxy[i, 2]); py2 = float(player_xyxy[i, 3])
+            if px1 <= cx <= px2 and py1 <= cy <= py2:
+                return i, float("inf")
+            ix1 = max(bx1, px1); iy1 = max(by1, py1)
+            ix2 = min(bx2, px2); iy2 = min(by2, py2)
+            if ix2 > ix1 and iy2 > iy1:
+                score = (ix2 - ix1) * (iy2 - iy1)
+                if score > best_score:
+                    best_score = score
+                    best_idx = i
+        return best_idx, best_score
+
+    @staticmethod
+    def _ball_overlaps_any_player(ball_xyxy: np.ndarray,
+                                  player_xyxy: np.ndarray) -> bool:
+        """Cheap boolean check: does the ball bbox overlap ANY player bbox?
+
+        Used as an extra gate by analytics that want to confirm the ball
+        is "in play" near a player (e.g. possession / Voronoi). Mirrors
+        the containment rule used by ``_find_ball_owner_by_bbox_overlap``.
+        """
+        if len(ball_xyxy) == 0 or len(player_xyxy) == 0:
+            return False
+        bx1 = float(ball_xyxy[0, 0]); by1 = float(ball_xyxy[0, 1])
+        bx2 = float(ball_xyxy[0, 2]); by2 = float(ball_xyxy[0, 3])
+        cx = (bx1 + bx2) / 2.0
+        cy = (by1 + by2) / 2.0
+        for i in range(len(player_xyxy)):
+            px1 = float(player_xyxy[i, 0]); py1 = float(player_xyxy[i, 1])
+            px2 = float(player_xyxy[i, 2]); py2 = float(player_xyxy[i, 3])
+            if px1 <= cx <= px2 and py1 <= cy <= py2:
+                return True
+            if not (bx2 < px1 or px2 < bx1 or by2 < py1 or py2 < by1):
+                return True
+        return False
+
+    @staticmethod
+    def _build_pitch_mask(processed_segments, frame_h: int, frame_w: int
+                          ) -> Optional[np.ndarray]:
+        """Build a binary mask of the pitch from segmentation contours.
+
+        All class contours (18Yard, 5Yard, Half Central Circle, 18Yard
+        Circle, Half Field) are unioned and the result is dilated by a
+        small kernel so a player standing right at the touchline isn't
+        spuriously excluded. Returns ``None`` when no segmentation
+        output is available — callers treat ``None`` as "no filter".
+        """
+        if not processed_segments:
+            return None
+        mask = np.zeros((frame_h, frame_w), dtype=np.uint8)
+        any_drawn = False
+        for seg in processed_segments:
+            contour = seg.get("image_contour")
+            if contour is None or len(contour) < 3:
+                continue
+            cv2.drawContours(mask, [contour], -1, 255, -1)
+            any_drawn = True
+        if not any_drawn:
+            return None
+        # Dilate so a player whose feet are right at the touchline (but
+        # whose bbox slightly overhangs it) is not spuriously filtered.
+        kernel = np.ones((15, 15), dtype=np.uint8)
+        mask = cv2.dilate(mask, kernel, iterations=1)
+        return mask
+
+    @staticmethod
+    def _bbox_center_in_mask(xyxy: np.ndarray, mask: np.ndarray) -> bool:
+        """Return True iff the bbox center lies inside ``mask``.
+
+        Out-of-bounds centers are treated as off-pitch (return False).
+        """
+        if mask is None or len(xyxy) < 4:
+            return True
+        cx = (float(xyxy[0]) + float(xyxy[2])) / 2.0
+        cy = (float(xyxy[1]) + float(xyxy[3])) / 2.0
+        ix, iy = int(round(cx)), int(round(cy))
+        if ix < 0 or iy < 0 or ix >= mask.shape[1] or iy >= mask.shape[0]:
+            return False
+        return bool(mask[iy, ix] > 0)
+
+    @staticmethod
+    def _filter_bboxes_by_mask(xyxy: np.ndarray, mask: np.ndarray,
+                               anchor: str = "center") -> np.ndarray:
+        """Return indices of bboxes whose anchor point is inside ``mask``.
+
+        ``anchor="center"`` uses the bbox center (ball convention).
+        ``anchor="lower_torso"`` uses a point 30% up from the bbox bottom
+        (player convention — closer to the player's feet, which is where
+        they actually touch the pitch and where the homography projects
+        them).
+        """
+        if mask is None or len(xyxy) == 0:
+            return np.arange(len(xyxy), dtype=np.int32)
+        keep: list[int] = []
+        for i in range(len(xyxy)):
+            x1, y1, x2, y2 = (float(xyxy[i, 0]), float(xyxy[i, 1]),
+                               float(xyxy[i, 2]), float(xyxy[i, 3]))
+            if anchor == "lower_torso":
+                cx = (x1 + x2) / 2.0
+                cy = y1 + 0.70 * (y2 - y1)
+            else:
+                cx = (x1 + x2) / 2.0
+                cy = (y1 + y2) / 2.0
+            ix, iy = int(round(cx)), int(round(cy))
+            if 0 <= ix < mask.shape[1] and 0 <= iy < mask.shape[0]:
+                if mask[iy, ix] > 0:
+                    keep.append(i)
+        return np.array(keep, dtype=np.int32)
 
     # Drawing helpers
     _KPT_CONNECTIONS = [
@@ -169,7 +508,17 @@ class KeypointPipeline:
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         return out
 
-    def _draw_team_bboxes(self, frame, player_xyxy, team_colors, player_conf=None):
+    # Mapping of team_ids values (from team_analyzer.TeamColorAnalyzer) to
+    # the user-facing label drawn on each player bbox.
+    _TEAM_ID_LABELS = {
+        0:  "T1",
+        1:  "T2",
+        -1: "GK",   # GK constant from team_analyzer
+        -2: "REF",  # REF constant from team_analyzer
+    }
+
+    def _draw_team_bboxes(self, frame, player_xyxy, team_colors,
+                          player_conf=None, team_ids=None):
         out = frame.copy()
         h, w = frame.shape[:2]
         for i in range(min(len(player_xyxy), len(team_colors))):
@@ -179,21 +528,72 @@ class KeypointPipeline:
             cv2.rectangle(ov, (x1, y1), (x2, y2), color, -1)
             cv2.addWeighted(ov, 0.25, out, 0.75, 0, out)
             cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+
+            # Build the label: "T1" / "T2" / "GK" / "REF" (+ optional conf).
+            team_label = ""
+            if team_ids is not None and i < len(team_ids):
+                team_label = self._TEAM_ID_LABELS.get(int(team_ids[i]), "")
+            conf_txt = ""
             if player_conf is not None and i < len(player_conf):
-                label = f"{player_conf[i]:.2f}"
-                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
-                tx, ty = (x1 + x2 - tw) // 2, y1 - 5
-                if ty - th < 0:
-                    ty = y1 + th + 2
-                cv2.putText(out, label, (tx + 1, ty + 1), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2, cv2.LINE_AA)
-                cv2.putText(out, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2, cv2.LINE_AA)
+                conf_txt = f" {float(player_conf[i]):.2f}"
+            tag = f"{team_label}{conf_txt}".strip()
+            if tag:
+                # Filled black backing for legibility on any background.
+                (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+                tx, ty = x1, max(y1 - 6, th + 4)
+                cv2.rectangle(out, (tx - 2, ty - th - 4), (tx + tw + 2, ty + 2),
+                              (0, 0, 0), -1)
+                cv2.putText(out, tag, (tx, ty),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                            tuple(int(c) for c in color), 2, cv2.LINE_AA)
+        return out
+
+    def _draw_pass_flash(self, frame, pass_info: dict, remaining: int,
+                         total: int):
+        """Banner overlay shown on the Deep Analysis video for ~total
+        frames after a pass is detected. Fades out as remaining → 0.
+        """
+        if not pass_info:
+            return frame
+        out = frame.copy()
+        h, w = out.shape[:2]
+        # Fade in then out: alpha rises for the first 1/3 of the window,
+        # then falls back to 0.
+        progress = remaining / max(total, 1)
+        if progress > 2.0 / 3.0:
+            alpha = 1.0 - (progress - 2.0 / 3.0) / (1.0 / 3.0) * 0.3
+        else:
+            alpha = 0.3 + (progress / (2.0 / 3.0)) * 0.7
+        alpha = float(max(0.0, min(1.0, alpha)))
+
+        team_name = "T1" if int(pass_info.get("team", 0)) == 0 else "T2"
+        text = (f"PASS DETECTED  ·  {team_name}  ·  "
+                f"#{int(pass_info.get('from_tid', 0))} → "
+                f"#{int(pass_info.get('to_tid', 0))}  ·  "
+                f"{float(pass_info.get('distance_m', 0)):.1f} m")
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+        pad_x, pad_y = 16, 10
+        box_w = tw + 2 * pad_x
+        box_h = th + 2 * pad_y
+        box_x = (w - box_w) // 2
+        box_y = 18
+
+        overlay = out.copy()
+        cv2.rectangle(overlay, (box_x, box_y), (box_x + box_w, box_y + box_h),
+                      (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.55 * alpha, out, 1.0 - 0.55 * alpha, 0, out)
+        # Bright yellow text + border so it reads at a glance.
+        cv2.rectangle(out, (box_x, box_y), (box_x + box_w, box_y + box_h),
+                      (0, 255, 255), 3, cv2.LINE_AA)
+        cv2.putText(out, text, (box_x + pad_x, box_y + pad_y + th),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
         return out
 
     def _draw_ball_bbox(self, frame, ball_xyxy, ball_conf, color=BALL_BBOX_COLOR):
         if len(ball_xyxy) == 0:
             return frame
         out = frame.copy()
-        h, w = frame.shape[:2]
+        h, w = out.shape[:2]
         x1, y1, x2, y2 = max(0, int(ball_xyxy[0, 0])), max(0, int(ball_xyxy[0, 1])), min(w - 1, int(ball_xyxy[0, 2])), min(h - 1, int(ball_xyxy[0, 3]))
         cv2.rectangle(out, (x1, y1), (x2, y2), color, 3)
         conf = ball_conf[0] if len(ball_conf) > 0 else 0.0
@@ -204,6 +604,145 @@ class KeypointPipeline:
             ty = y2 + th + 5
         cv2.rectangle(out, (tx - 2, ty - th - 2), (tx + tw + 2, ty + 2), (0, 0, 0), -1)
         cv2.putText(out, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
+        return out
+
+    def _draw_defensive_lines(self, frame, H, tids_arr, team_ids_arr,
+                              player_pitch_pts, team1_color, team2_color):
+        """Project each team's deepest outfield player back into image space
+        and draw a VERTICAL line at that image-X position so the viewer
+        can see the defensive line shift up and down the pitch over the
+        match.
+
+        Args:
+            frame: Deep-analysis frame to annotate.
+            H: 3x3 homography mapping pitch (meters) → image (pixels).
+            tids_arr: per-detection track_ids (parallel to player_pitch_pts).
+            team_ids_arr: per-detection team labels (0, 1, -1, -2).
+            player_pitch_pts: (N, 2) pitch coordinates.
+            team1_color, team2_color: BGR team colours.
+
+        The "deepest" outfield player for a team is the one with the
+        SMALLEST pitch-X (closest to their own goal). The goalkeeper
+        (team_id == -1) is excluded — the defensive line should reflect
+        the back four / five, not the keeper.
+
+        Convention: in the deep-analysis video the pitch's DEPTH axis
+        (pitch-X, the long axis) is rendered HORIZONTALLY across the
+        screen. A defensive line therefore appears as a VERTICAL line on
+        the camera image — running top-to-bottom at the depth where the
+        defense is sitting.
+        """
+        out = frame.copy()
+        h, w = out.shape[:2]
+        try:
+            H_inv = np.linalg.inv(H)
+        except np.linalg.LinAlgError:
+            return out
+
+        n = min(len(tids_arr), len(team_ids_arr), len(player_pitch_pts))
+        # Stash the tids array on self so the inner helper (which closes
+        # over self) can look up a track_id for the picked defender.
+        self._tids_for_draw = tids_arr
+
+        def _team_line(team_id: int, defending_left: bool):
+            """Return (image_x, pitch_x, track_id) for the team's deepest
+            outfield player, or None.
+
+            ``defending_left`` is decided per-frame by comparing the two
+            teams' mean pitch-X: whichever team sits further LEFT (smaller
+            mean X) defends the left goal, the other defends the right.
+            This guarantees the two defensive lines are ALWAYS on opposite
+            sides of the pitch — the real-world constraint that each team
+            defends a different goal.
+            """
+            best_x = None
+            best_y = None
+            best_track = None
+            for i in range(n):
+                if int(team_ids_arr[i]) != team_id:
+                    continue
+                pt = player_pitch_pts[i]
+                if not (-2 <= pt[0] <= PITCH_LENGTH + 2
+                        and -2 <= pt[1] <= PITCH_WIDTH + 2):
+                    continue
+                if best_x is None:
+                    best_x = float(pt[0])
+                    best_y = float(pt[1])
+                    best_track = int(self._tids_for_draw[i])
+                    continue
+                # defending_left → deepest = SMALLEST pitch-X (closest to
+                # the left goal); !defending_left → deepest = LARGEST.
+                if defending_left and pt[0] < best_x:
+                    best_x = float(pt[0])
+                    best_y = float(pt[1])
+                    best_track = int(self._tids_for_draw[i])
+                elif (not defending_left) and pt[0] > best_x:
+                    best_x = float(pt[0])
+                    best_y = float(pt[1])
+                    best_track = int(self._tids_for_draw[i])
+            if best_x is None:
+                return None
+            # Project the defender's actual pitch position to image space.
+            homog = np.array([[best_x, best_y, 1.0]], dtype=np.float32)
+            proj = homog @ H_inv.T
+            proj = proj[0, :2] / proj[0, 2]
+            ix = float(proj[0])
+            # Clamp to frame so the line stays inside the video.
+            x_px = int(max(0, min(w - 1, ix)))
+            return (x_px, best_x, best_track)
+
+        # Decide per-frame which team defends the LEFT goal: the team
+        # whose outfield mean pitch-X is smaller. If only one team has
+        # outfield players on the pitch this frame, that team defaults
+        # to defending the LEFT (legacy "min X" behaviour) and the other
+        # team draws nothing this frame.
+        def _team_mean_x(tid: int) -> Optional[float]:
+            xs: list[float] = []
+            for i in range(n):
+                if int(team_ids_arr[i]) != tid:
+                    continue
+                pt = player_pitch_pts[i]
+                if -2 <= pt[0] <= PITCH_LENGTH + 2 and -2 <= pt[1] <= PITCH_WIDTH + 2:
+                    xs.append(float(pt[0]))
+            if not xs:
+                return None
+            return float(np.mean(xs))
+
+        t1_mean = _team_mean_x(0)
+        t2_mean = _team_mean_x(1)
+        if t1_mean is not None and t2_mean is not None:
+            t1_defends_left = bool(t1_mean <= t2_mean)
+        else:
+            t1_defends_left = True
+
+        for team_id, color, tag, defends_left in (
+            (0, team1_color, "T1", t1_defends_left),
+            (1, team2_color, "T2", not t1_defends_left),
+        ):
+            line = _team_line(team_id, defends_left)
+            if line is None:
+                continue
+            x_px, line_x, line_track = line
+            color_t = tuple(int(c) for c in color)
+            # Thick VERTICAL line spanning most of the frame height.
+            cv2.line(out, (x_px, int(h * 0.08)), (x_px, int(h * 0.92)),
+                     color_t, 3, cv2.LINE_AA)
+            # Filled black backing for the label so it stays readable.
+            label = f"{tag} Def Line · {line_x:.0f}m · #{line_track}"
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+            # Place the label to the LEFT of the line by default; flip to
+            # the RIGHT side when the line sits near the left edge of the
+            # frame so the label never clips off-screen.
+            if x_px >= tw + 16:
+                tx = x_px - tw - 12
+                ty = int(h * 0.08) + th + 4
+            else:
+                tx = x_px + 12
+                ty = int(h * 0.08) + th + 4
+            cv2.rectangle(out, (tx - 4, ty - th - 4),
+                          (tx + tw + 4, ty + 4), (0, 0, 0), -1)
+            cv2.putText(out, label, (tx, ty),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_t, 2, cv2.LINE_AA)
         return out
 
     # ------------------------------------------------------------------
@@ -232,6 +771,14 @@ class KeypointPipeline:
             self.team_analyzer.reset()
         frame_idx = processed_count = 0
         self.ball_trajectory = []
+        # Reset pass detection state so a re-run doesn't inherit stale
+        # owners from a previous video.
+        self._prev_ball_owner_tid = None
+        self._prev_ball_owner_team = None
+        self._prev_ball_owner_pitch = None
+        self._prev_ball_pitch = None
+        self._pass_flash_counter = 0
+        self._last_pass_info = {}
         try:
             while True:
                 ret, frame = cap.read()

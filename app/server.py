@@ -355,24 +355,18 @@ def _ball_trail_payload(game_data: list) -> dict:
 def _possession_timeline(game_data: list, window: int = 30) -> dict:
     """Rolling possession % over time (window in frames) for line chart.
 
-    Track-aware: uses the canonical per-track team from the registry, so a
-    single-frame misclassification of one player cannot flip the
-    possession assignment for that frame.
+    Uses carry-forward bbox-overlap ball ownership: possession only
+    changes when the OTHER team's player bbox overlaps the ball bbox.
     """
-    registry = GameAnalyzer.build_registry(game_data)
+    owners = GameAnalyzer.compute_ball_owner_per_frame(game_data)
     t1_rolling = []
     t2_rolling = []
     frames_axis = []
-    buf = []  # FIFO of 0/1/-1 (team in possession of nearest player to ball)
+    buf = []  # FIFO of TEAM0/TEAM1/-1 (current possession owner)
 
-    for entry in game_data:
-        ball = entry.get("ball_position")
-        team = -1
-        if ball is not None:
-            ball_arr = np.asarray(ball, dtype=np.float32).reshape(1, 2)
-            winner = GameAnalyzer._nearest_team_to_ball(entry, ball_arr, registry)
-            if winner is not None:
-                team = int(winner)
+    for i, entry in enumerate(game_data):
+        owner = owners[i]
+        team = int(owner) if owner is not None else -1
         buf.append(team)
         if len(buf) > window:
             buf.pop(0)
@@ -546,13 +540,16 @@ def _process_job(job_id: str, max_frames: Optional[int], enable_team_colors: boo
             job["game_data"].append({
                 "frame_idx": processed,
                 "player_positions": result.get("player_pitch_pts", np.empty((0, 2))),
+                "player_xyxy": result.get("player_xyxy", np.empty((0, 4))),
                 "team_ids": team_ids,
                 "track_ids": track_ids,
                 "track_quality": track_quality,
                 "team1_bgr": team1_bgr,
                 "team2_bgr": team2_bgr,
                 "ball_position": result.get("ball_pitch_pt"),
+                "ball_xyxy": result.get("ball_xyxy", np.empty((0, 4))),
                 "player_conf": result.get("player_conf", np.empty((0,))),
+                "pass_event": result.get("pass_event"),
             })
 
             job["processed"] = processed

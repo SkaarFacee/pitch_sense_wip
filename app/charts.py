@@ -12,6 +12,15 @@ Charts produced:
     • build_formation_scatter      — Combined positioning scatter on a pitch
     • build_region_pie             — Pie of pitch region detection frequency
     • build_region_bar             — Horizontal bar of region detection counts
+    • build_zone_time_bar          — Horizontal bar of seconds in each pitch region
+    • build_zone_timeline          — Multi-line timeline of region detections
+    • build_attacking_direction_diagram — Two-arrow pitch diagram showing attack direction
+    • build_passing_network        — Directed player→player pass graph on a pitch
+    • build_pressing_timeline      — Rolling nearest-opponent distance to ball
+    • build_defensive_line_timeline — Defensive line height (excluding GK)
+    • build_xt_heatmap             — Pitch-value heatmap (danger-weighted)
+    • build_voronoi_control        — Per-cell pitch control heatmap
+    • build_chain_length_histogram — Histogram of possession chain lengths
 """
 from __future__ import annotations
 import numpy as np
@@ -184,21 +193,17 @@ def build_possession_donut(palette: dict, t1_pct: float, t2_pct: float,
 def build_possession_timeline(palette: dict, game_data: list, window: int = 30) -> go.Figure:
     """Rolling possession share line chart.
 
-    Track-aware: uses the canonical per-track team from the registry, so a
-    single-frame misclassification of one player cannot flip the
-    possession assignment for that frame.
+    Possession is determined by bbox overlap between the ball and a
+    player's bounding box, with carry-forward so the chart is sticky
+    (possession only changes when the OTHER team's player bbox overlaps
+    the ball bbox).
     """
     from game_analyzer import GameAnalyzer
-    registry = GameAnalyzer.build_registry(game_data)
+    owners = GameAnalyzer.compute_ball_owner_per_frame(game_data)
     buf, t1_series, t2_series, frames_axis = [], [], [], []
-    for entry in game_data:
-        ball = entry.get("ball_position")
-        team = -1
-        if ball is not None:
-            ball_arr = np.asarray(ball, dtype=np.float32).reshape(1, 2)
-            team = GameAnalyzer._nearest_team_to_ball(entry, ball_arr, registry)
-            if team is not None:
-                team = int(team)
+    for i, entry in enumerate(game_data):
+        owner = owners[i]
+        team = int(owner) if owner is not None else -1
         buf.append(team)
         if len(buf) > window:
             buf.pop(0)
@@ -579,6 +584,115 @@ def build_region_bar(palette: dict, region_items: list[dict]) -> go.Figure:
     return fig
 
 
+# ─── Zone time bar + zone timeline (deeper segmentation analytics) ───────────
+SEG_LABELS = {
+    "18Yard":               "Penalty Area (18yd)",
+    "18Yard Circle":        "Penalty Arc",
+    "5Yard":                "Goal Area (6yd)",
+    "Half Central Circle":  "Center Circle",
+    "Half Field":           "Half Field",
+}
+
+
+def build_zone_time_bar(palette: dict, summary: dict) -> go.Figure:
+    """Horizontal bar of seconds in each pitch region (from compute_zone_summary)."""
+    region_time = (summary or {}).get("region_time_s", {}) or {}
+    if not region_time:
+        return _empty_fig(palette, "No region detections recorded")
+    items = sorted(region_time.items(), key=lambda kv: kv[1], reverse=True)
+    labels = [SEG_LABELS.get(k, k) for k, _ in items]
+    values = [v for _, v in items]
+    colors = _categorical_palette(palette, len(labels))
+
+    fig = go.Figure(go.Bar(
+        x=values, y=labels, orientation="h",
+        name="",
+        showlegend=False,
+        hoverlabel=dict(namelength=0),
+        marker=dict(color=colors, line=dict(width=0)),
+        text=[f"{v:.1f}s" for v in values], textposition="outside",
+        textfont=dict(color=palette["text"]),
+        hovertemplate="<b>%{y}</b><br>%{x:.2f} seconds<extra></extra>",
+    ))
+    layout = _base_layout(palette, height=320)
+    layout.update(dict(
+        xaxis=dict(title="Time in zone (s)", gridcolor=palette["grid"],
+                   zerolinecolor=palette["grid"]),
+        yaxis=dict(autorange="reversed", showgrid=False),
+    ))
+    fig.update_layout(layout)
+    fig.update_layout(legend_title_text="", showlegend=False)
+    return fig
+
+
+def build_zone_timeline(palette: dict, timeline: dict) -> go.Figure:
+    """Multi-line timeline of rolling-window region detection counts."""
+    if not timeline or not timeline.get("x") or not timeline.get("region_names"):
+        return _empty_fig(palette, "No region detections recorded")
+    cycle = _categorical_palette(palette, len(timeline["region_names"]))
+    fig = go.Figure()
+    for rname, color in zip(timeline["region_names"], cycle):
+        y = timeline["series"].get(rname, [])
+        fig.add_trace(go.Scatter(
+            x=timeline["x"], y=y, mode="lines",
+            name=SEG_LABELS.get(rname, rname),
+            line=dict(color=color, width=2.2),
+            hovertemplate=f"<b>{SEG_LABELS.get(rname, rname)}</b><br>"
+                          "Frame %{x}<br>Detections: %{y}<extra></extra>",
+        ))
+    layout = _base_layout(palette, height=340)
+    layout.update(dict(
+        xaxis=dict(title="Frame", gridcolor=palette["grid"],
+                   zerolinecolor=palette["grid"]),
+        yaxis=dict(title="Detections in window", rangemode="tozero",
+                   gridcolor=palette["grid"], zerolinecolor=palette["grid"]),
+    ))
+    fig.update_layout(layout)
+    fig.update_layout(legend_title_text="")
+    return fig
+
+
+# ─── Attacking direction diagram ─────────────────────────────────────────────
+def build_attacking_direction_diagram(palette: dict, direction_info: dict,
+                                      team1_color: str, team2_color: str) -> go.Figure:
+    """Two-arrow pitch diagram showing each team's attacking direction."""
+    t1_dir = (direction_info or {}).get("team1_attacks")
+    t2_dir = (direction_info or {}).get("team2_attacks")
+    if not t1_dir or not t2_dir:
+        return _empty_fig(palette, "Attacking direction could not be inferred")
+
+    fig = go.Figure()
+    arrow_y_t1 = PITCH_WIDTH * 0.30
+    arrow_y_t2 = PITCH_WIDTH * 0.70
+
+    def _arrow(y: float, direction: str, color: str, label: str):
+        if direction == "right":
+            x0, x1 = PITCH_LENGTH * 0.10, PITCH_LENGTH * 0.90
+        else:
+            x0, x1 = PITCH_LENGTH * 0.90, PITCH_LENGTH * 0.10
+        fig.add_annotation(
+            x=x1, y=y, ax=x0, ay=y, xref="x", yref="y", axref="x", ayref="y",
+            showarrow=True, arrowhead=3, arrowsize=1.6, arrowwidth=4,
+            arrowcolor=color, text="",
+        )
+        fig.add_annotation(
+            x=(x0 + x1) / 2, y=y + 4, showarrow=False,
+            text=f"<b>{label}</b> → {'Right' if direction == 'right' else 'Left'}",
+            font=dict(color=color, size=14),
+        )
+
+    _arrow(arrow_y_t1, t1_dir, team1_color, "Team 1")
+    _arrow(arrow_y_t2, t2_dir, team2_color, "Team 2")
+
+    layout = _pitch_axes(palette, height=380)
+    layout.pop("legend", None)
+    layout["showlegend"] = False
+    layout["xaxis"].update(dict(showticklabels=False))
+    layout["yaxis"].update(dict(showticklabels=False))
+    fig.update_layout(layout)
+    return fig
+
+
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 def _alpha(hex_color: str, a: float) -> str:
@@ -606,4 +720,234 @@ def _empty_fig(palette: dict, msg: str) -> go.Figure:
     fig.update_layout(_base_layout(palette, height=300))
     fig.update_xaxes(visible=False)
     fig.update_yaxes(visible=False)
+    return fig
+
+
+# ─── Passing network ─────────────────────────────────────────────────────────
+def build_passing_network(palette: dict, network: dict, team_label: str,
+                          team_color: str) -> go.Figure:
+    """Draw a directed passing graph on a pitch layout."""
+    nodes = (network or {}).get("nodes", [])
+    edges = (network or {}).get("edges", [])
+    if not nodes:
+        return _empty_fig(palette, f"No track data for {team_label}")
+    fig = go.Figure()
+    # Edges (drawn first so they sit under nodes)
+    max_w = max((e["count"] for e in edges), default=1) or 1
+    for e in edges:
+        a = next((n for n in nodes if n["track_id"] == e["from"]), None)
+        b = next((n for n in nodes if n["track_id"] == e["to"]), None)
+        if a is None or b is None:
+            continue
+        w = max(1.0, 6.0 * e["count"] / max_w)
+        fig.add_trace(go.Scatter(
+            x=[a["x"], b["x"]], y=[a["y"], b["y"]],
+            mode="lines",
+            line=dict(color=team_color, width=w),
+            opacity=0.55,
+            hoverinfo="skip",
+            showlegend=False,
+        ))
+    # Nodes
+    nx = [n["x"] for n in nodes]
+    ny = [n["y"] for n in nodes]
+    nlabels = [f"#{n['track_id']}" for n in nodes]
+    fig.add_trace(go.Scatter(
+        x=nx, y=ny, mode="markers+text",
+        marker=dict(color=team_color, size=18, line=dict(color="#ffffff", width=2)),
+        text=nlabels, textposition="top center",
+        textfont=dict(color=palette["text"], size=10),
+        name=team_label,
+        hovertemplate=f"<b>{team_label}</b><br>Track #%{{text}}<br>"
+                      "x %{x:.1f} · y %{y:.1f}<extra></extra>",
+    ))
+    layout = _pitch_axes(palette, height=420)
+    layout["showlegend"] = False
+    layout["xaxis"].update(dict(showticklabels=False))
+    layout["yaxis"].update(dict(showticklabels=False))
+    fig.update_layout(layout)
+    fig.add_annotation(
+        x=PITCH_LENGTH / 2, y=PITCH_WIDTH + 1.5, showarrow=False,
+        text=f"<b>{team_label}</b> · {len(edges)} passing connections",
+        font=dict(color=palette["text"], size=12), xanchor="center",
+    )
+    return fig
+
+
+# ─── Pressing timeline ───────────────────────────────────────────────────────
+def build_pressing_timeline(palette: dict, pressing: dict) -> go.Figure:
+    """Two-line chart of nearest-opponent distance to the ball (lower = more press)."""
+    if not pressing or not pressing.get("x"):
+        return _empty_fig(palette, "No pressing data")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=pressing["x"], y=pressing["team1"], mode="lines",
+        name="Team 1", line=dict(color=palette["team1"], width=2),
+        hovertemplate="Frame %{x}<br>Team 1 press: %{y:.1f} m<extra></extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=pressing["x"], y=pressing["team2"], mode="lines",
+        name="Team 2", line=dict(color=palette["team2"], width=2),
+        hovertemplate="Frame %{x}<br>Team 2 press: %{y:.1f} m<extra></extra>",
+    ))
+    layout = _base_layout(palette, height=320)
+    layout.update(dict(
+        xaxis=dict(title="Frame", gridcolor=palette["grid"],
+                   zerolinecolor=palette["grid"]),
+        yaxis=dict(title="Nearest opponent to ball (m)", rangemode="tozero",
+                   gridcolor=palette["grid"], zerolinecolor=palette["grid"]),
+    ))
+    fig.update_layout(layout)
+    return fig
+
+
+# ─── Defensive line height timeline ──────────────────────────────────────────
+def build_defensive_line_timeline(palette: dict, dline: dict) -> go.Figure:
+    """Mean X of each team's deepest outfield player per frame (excludes GK)."""
+    if not dline or not dline.get("x"):
+        return _empty_fig(palette, "No defensive-line data")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=dline["x"], y=dline["team1"], mode="lines",
+        name="Team 1", line=dict(color=palette["team1"], width=2.2),
+        connectgaps=False,
+        hovertemplate="Frame %{x}<br>Team 1 line: %{y:.1f} m<extra></extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=dline["x"], y=dline["team2"], mode="lines",
+        name="Team 2", line=dict(color=palette["team2"], width=2.2),
+        connectgaps=False,
+        hovertemplate="Frame %{x}<br>Team 2 line: %{y:.1f} m<extra></extra>",
+    ))
+    # Reference: midline
+    fig.add_hline(y=CENTER_X, line=dict(color=palette["grid"], width=1, dash="dash"))
+    layout = _base_layout(palette, height=320)
+    layout.update(dict(
+        xaxis=dict(title="Frame", gridcolor=palette["grid"],
+                   zerolinecolor=palette["grid"]),
+        yaxis=dict(title="Defensive line X (m)", range=[-2, PITCH_LENGTH + 2],
+                   gridcolor=palette["grid"], zerolinecolor=palette["grid"]),
+    ))
+    fig.update_layout(layout)
+    return fig
+
+
+# ─── xT pitch-value heatmap ──────────────────────────────────────────────────
+def build_xt_heatmap(palette: dict, xt: dict, team_id: int) -> go.Figure:
+    """Pitch-value heatmap (danger-weighted ball-possession grid)."""
+    if team_id == 0:
+        matrix = xt.get("team1_matrix", np.zeros((1, 1)))
+        total = xt.get("team1_total_value", 0.0)
+        color = palette["team1"]
+        name = "Team 1"
+    else:
+        matrix = xt.get("team2_matrix", np.zeros((1, 1)))
+        total = xt.get("team2_total_value", 0.0)
+        color = palette["team2"]
+        name = "Team 2"
+    matrix = np.asarray(matrix, dtype=np.float32)
+    if matrix.size == 0 or matrix.max() <= 0:
+        return _empty_fig(palette, "No xT data")
+    x_edges = xt.get("x_edges")
+    y_edges = xt.get("y_edges")
+    x_centers = (x_edges[:-1] + x_edges[1:]) / 2.0
+    y_centers = (y_edges[:-1] + y_edges[1:]) / 2.0
+    z = matrix.T
+    max_v = float(z.max())
+    scale = [
+        [0.0, "rgba(0,0,0,0)"],
+        [0.2, _alpha(color, 0.35)],
+        [0.6, _alpha(color, 0.75)],
+        [1.0, color],
+    ]
+    fig = go.Figure(go.Heatmap(
+        z=z.tolist(), x=x_centers.tolist(), y=y_centers.tolist(),
+        zsmooth="best", zmin=0, zmax=max_v,
+        colorscale=scale, showscale=True,
+        hovertemplate=f"<b>{name} xT</b><br>x %{{x:.1f}} m · y %{{y:.1f}} m<br>"
+                      "Value: %{z:.2f}<extra></extra>",
+        colorbar=dict(title=dict(text="xT", font=dict(color=palette["text_dim"])),
+                      tickfont=dict(color=palette["text_dim"])),
+    ))
+    layout = _pitch_axes(palette, height=440)
+    layout["showlegend"] = False
+    fig.update_layout(layout)
+    fig.add_annotation(
+        x=PITCH_LENGTH / 2, y=PITCH_WIDTH + 1.5, showarrow=False,
+        text=f"<b>{name}</b> · total xT {total:.1f}",
+        font=dict(color=palette["text"], size=12), xanchor="center",
+    )
+    return fig
+
+
+# ─── Voronoi pitch control ───────────────────────────────────────────────────
+def build_voronoi_control(palette: dict, voronoi: dict) -> go.Figure:
+    """Per-cell signed control heatmap (-1 = Team 2, +1 = Team 1)."""
+    matrix = np.asarray(voronoi.get("matrix", np.zeros((1, 1))), dtype=np.float32)
+    if matrix.size == 0:
+        return _empty_fig(palette, "No Voronoi data")
+    x_edges = voronoi["x_edges"]; y_edges = voronoi["y_edges"]
+    x_centers = (x_edges[:-1] + x_edges[1:]) / 2.0
+    y_centers = (y_edges[:-1] + y_edges[1:]) / 2.0
+    z = matrix.T
+    scale = [
+        [0.0, palette["team2"]],
+        [0.5, palette["panel_alt"]],
+        [1.0, palette["team1"]],
+    ]
+    fig = go.Figure(go.Heatmap(
+        z=z.tolist(), x=x_centers.tolist(), y=y_centers.tolist(),
+        zmin=-1, zmax=1, zsmooth="best",
+        colorscale=scale, showscale=True,
+        hovertemplate="x %{x:.1f} m · y %{y:.1f} m<br>Control: %{z:.2f}<extra></extra>",
+        colorbar=dict(
+            title=dict(text="Control", font=dict(color=palette["text_dim"])),
+            tickfont=dict(color=palette["text_dim"]),
+            tickvals=[-0.8, 0, 0.8], ticktext=["T2", "—", "T1"],
+        ),
+    ))
+    layout = _pitch_axes(palette, height=440)
+    layout["showlegend"] = False
+    fig.update_layout(layout)
+    fig.add_annotation(
+        x=PITCH_LENGTH / 2, y=PITCH_WIDTH + 1.5, showarrow=False,
+        text=(f"<b>Pitch control</b> · "
+              f"T1 {voronoi.get('team1_pct', 0):.0f}% · "
+              f"T2 {voronoi.get('team2_pct', 0):.0f}% · "
+              f"Contested {voronoi.get('contested_pct', 0):.0f}%"),
+        font=dict(color=palette["text"], size=12), xanchor="center",
+    )
+    return fig
+
+
+# ─── Possession chain length histogram ───────────────────────────────────────
+def build_chain_length_histogram(palette: dict, chains: dict) -> go.Figure:
+    """Histogram of possession chain lengths per team (in frames, ~30-frame buckets)."""
+    t1_hist = (chains.get("team1") or {}).get("histogram", {})
+    t2_hist = (chains.get("team2") or {}).get("histogram", {})
+    if not t1_hist and not t2_hist:
+        return _empty_fig(palette, "No possession chains")
+    # Union of x buckets
+    xs = sorted(set(t1_hist) | set(t2_hist))
+    if not xs:
+        return _empty_fig(palette, "No possession chains")
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=[f"{x}+" for x in xs], y=[t1_hist.get(x, 0) for x in xs],
+        name="Team 1", marker=dict(color=palette["team1"]),
+        hovertemplate="<b>Team 1</b><br>%{x} frames<br>Chains: %{y}<extra></extra>",
+    ))
+    fig.add_trace(go.Bar(
+        x=[f"{x}+" for x in xs], y=[t2_hist.get(x, 0) for x in xs],
+        name="Team 2", marker=dict(color=palette["team2"]),
+        hovertemplate="<b>Team 2</b><br>%{x} frames<br>Chains: %{y}<extra></extra>",
+    ))
+    layout = _base_layout(palette, height=320)
+    layout.update(dict(
+        barmode="group",
+        xaxis=dict(title="Chain length (frames)", gridcolor=palette["grid"]),
+        yaxis=dict(title="Number of chains", gridcolor=palette["grid"],
+                   rangemode="tozero"),
+    ))
+    fig.update_layout(layout)
     return fig

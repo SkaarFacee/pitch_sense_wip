@@ -106,6 +106,56 @@ class PitchArtist():
 
 
 
+    # ------------------------------------------------------------------
+    # Segmentation zone overlay
+    # ------------------------------------------------------------------
+    _SEG_ZONE_COLORS = {
+        # BGR — same palette as _create_seg_overlay in keypoint_pipeline.py
+        "18Yard":              (255,   0,   0),
+        "18Yard Circle":       (  0, 255,   0),
+        "5Yard":               (  0,   0, 255),
+        "Half Central Circle": (255, 255,   0),
+        "Half Field":          (255,   0, 255),
+    }
+
+    def draw_seg_zones(self, img, processed_segments, alpha: float = 0.25):
+        """Draw detected pitch regions (penalty box, 6-yard box, half field, …)
+        as semi-transparent polygons on the top-down canvas.
+
+        Each entry in ``processed_segments`` is expected to carry a
+        ``canvas_bbox`` field (4-corner polygon in pitch-meter coordinates)
+        as produced by ``CanvasMapper.get_canvas_mapping``. Entries with
+        ``canvas_bbox`` is None are silently skipped — this is the documented
+        behaviour for the Half Central Circle / Half Field when ``side_hint``
+        is missing.
+
+        Args:
+            img: Pitch canvas (H, W, 3).
+            processed_segments: list of segment dicts from ``Segmentor.extract``.
+            alpha: 0-1 blending factor for the zone fill (0 = invisible).
+
+        Returns:
+            Canvas with zone shading drawn (does not mutate ``img``).
+        """
+        if not processed_segments:
+            return img
+        alpha = float(max(0.0, min(1.0, alpha)))
+        if alpha <= 0.0:
+            return img
+
+        out = img.copy()
+        overlay = img.copy()
+        for seg in processed_segments:
+            bbox = seg.get("canvas_bbox")
+            if bbox is None:
+                continue
+            class_name = seg.get("class_name", "")
+            color = self._SEG_ZONE_COLORS.get(class_name, (128, 128, 128))
+            pts = self.transform_coordinates_to_pixels(np.asarray(bbox, dtype=np.float32))
+            cv2.fillPoly(overlay, [pts], color)
+        cv2.addWeighted(overlay, alpha, out, 1.0 - alpha, 0, out)
+        return out
+
     def draw_players_on_pitch(
         self,
         img,

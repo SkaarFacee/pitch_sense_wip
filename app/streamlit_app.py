@@ -34,6 +34,10 @@ import numpy as np
 
 from keypoint_pipeline import KeypointPipeline
 from game_analyzer import GameAnalyzer
+from frame_scrubber import (
+    seek_to_frame, frame_to_rgb, regions_for_frame, find_closest_entry,
+    get_video_meta,
+)
 import ui_theme as ui
 import charts as ch
 
@@ -88,6 +92,12 @@ if "last_output_dir" not in st.session_state:
     st.session_state.last_output_dir = None
 if "last_video_name" not in st.session_state:
     st.session_state.last_video_name = None
+if "scrubber_frame_idx" not in st.session_state:
+    st.session_state.scrubber_frame_idx = 1
+if "scrubber_min_total" not in st.session_state:
+    st.session_state.scrubber_min_total = 0
+if "scrubber_fps" not in st.session_state:
+    st.session_state.scrubber_fps = 30.0
 
 # Inject theme CSS (re-injected every rerun)
 st.markdown(ui.inject_css(st.session_state.theme), unsafe_allow_html=True)
@@ -127,6 +137,31 @@ def get_output_videos(output_dir: Path) -> list[tuple[Path, str, str]]:
         if p.exists():
             out.append((p, label, desc))
     return out
+
+
+def get_scrubber_bounds(output_dir: Path) -> tuple[int, float, list[tuple[Path, str, int]]]:
+    """Return (min_total_frames, fps, [(path, label, frames), ...]) for all
+    output videos that exist. ``min_total_frames`` is the smallest frame
+    count across the 5 outputs, which is the safe upper bound for the
+    scrubber slider.
+    """
+    fps = 30.0
+    rows: list[tuple[Path, str, int]] = []
+    for filename, label, _desc in OUTPUT_VIDEOS:
+        p = output_dir / filename
+        if not p.exists():
+            continue
+        meta = get_video_meta(str(p))
+        if meta is None:
+            continue
+        f, total, _w, _h = meta
+        if f > 0.0:
+            fps = f  # they should all be the same; last one wins
+        rows.append((p, label, int(total)))
+    if not rows:
+        return (0, fps, [])
+    min_total = min(r[2] for r in rows)
+    return (int(min_total), float(fps), rows)
 
 
 def check_models() -> dict[str, bool]:
@@ -248,8 +283,8 @@ st.markdown(
 
 
 # ─── Tabs ─────────────────────────────────────────────────────────────────────
-tab_processing, tab_match, tab_pitch, tab_videos = st.tabs(
-    ["Processing", "Match Centre", "Pitch Analysis", "Outputs"]
+tab_processing, tab_match, tab_pitch, tab_players, tab_videos = st.tabs(
+    ["Processing", "Match Centre", "Pitch Analysis", "Player Analytics", "Outputs"]
 )
 
 
@@ -407,6 +442,16 @@ with tab_processing:
         total_frames = total_in_video
         if max_frames > 0:
             total_frames = min(total_frames, max_frames)
+
+        # Stash the source FPS so the zone analytics / scrubber can use it
+        # even though session_state doesn't keep the file handle.
+        try:
+            from frame_scrubber import get_video_meta as _gvm
+            _meta = _gvm(selected_path)
+            if _meta is not None:
+                st.session_state.scrubber_fps = float(_meta[0])
+        except Exception:
+            pass
 
         # Ring progress placeholder (re-rendered every frame)
         ring_slot = st.empty()
@@ -640,6 +685,49 @@ with tab_match:
             st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
             st.markdown(ui.card_close(), unsafe_allow_html=True)
 
+        # Attacking direction -------------------------------------------------
+        direction_info = GameAnalyzer.infer_attacking_direction(game_data) or {}
+        if direction_info.get("team1_attacks"):
+            t1_dir = direction_info["team1_attacks"]
+            t2_dir = direction_info["team2_attacks"]
+            source = direction_info["source"]
+            conf_pct = int(round(direction_info.get("confidence", 0.0) * 100))
+            if source == "gk":
+                t1_box = direction_info.get("team1_gk_box")
+                t2_box = direction_info.get("team2_gk_box")
+                t1_frac = direction_info.get("team1_gk_box_frac")
+                t2_frac = direction_info.get("team2_gk_box_frac")
+                caption = (f"Inferred from goalkeeper position · "
+                           f"GK X = T1 {direction_info.get('team1_gk_x', 'n/a')} m, "
+                           f"T2 {direction_info.get('team2_gk_x', 'n/a')} m · "
+                           f"box side = T1 {t1_box or 'n/a'} ({int(round((t1_frac or 0) * 100))}%), "
+                           f"T2 {t2_box or 'n/a'} ({int(round((t2_frac or 0) * 100))}%) · "
+                           f"confidence {conf_pct}%")
+            elif source == "mean_x":
+                caption = (f"Inferred from team centroid (no GK detected) · "
+                           f"mean X = T1 {direction_info.get('team1_mean_x', 'n/a')} m, "
+                           f"T2 {direction_info.get('team2_mean_x', 'n/a')} m · "
+                           f"confidence {conf_pct}%")
+            else:
+                caption = "Direction could not be inferred"
+            st.markdown(ui.card_open("Attacking Direction",
+                                     "Each team's attacking axis inferred from player positions",
+                                     chip=caption),
+                        unsafe_allow_html=True)
+            fig = ch.build_attacking_direction_diagram(
+                detected_palette, direction_info,
+                detected_palette["team1"], detected_palette["team2"],
+            )
+            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+            st.markdown(
+                f"<div class='ps-card__sub'>"
+                f"Team 1 attacks <b>{'right →' if t1_dir == 'right' else '← left'}</b> · "
+                f"Team 2 attacks <b>{'right →' if t2_dir == 'right' else '← left'}</b>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(ui.card_close(), unsafe_allow_html=True)
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # TAB 3 — PITCH ANALYSIS
@@ -741,12 +829,249 @@ with tab_pitch:
                 st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
                 st.markdown(ui.card_close(), unsafe_allow_html=True)
 
+            # --- Deeper pitch-zones analytics ------------------------------
+            zone_summary = GameAnalyzer.compute_zone_summary(
+                st.session_state.analytics_data,
+                fps=float(st.session_state.get("scrubber_fps", 30.0)),
+            )
+            zone_timeline = GameAnalyzer.compute_zone_timeline(
+                st.session_state.analytics_data, window=100,
+            )
+
+            most_label = SEG_CLASS_LABELS.get(
+                zone_summary.get("most_detected") or "",
+                zone_summary.get("most_detected") or "—",
+            )
+            zone_kpi = ui.kpi_grid([
+                ("Most-Detected Region", most_label,
+                 f"{zone_summary.get('most_detected_count', 0):,} detections"),
+                ("Half Field — Left",
+                 f"{zone_summary.get('half_field_left_pct', 0.0):.1f}%",
+                 "of half-field frames"),
+                ("Half Field — Right",
+                 f"{zone_summary.get('half_field_right_pct', 0.0):.1f}%",
+                 "of half-field frames"),
+                ("Zone Coverage",
+                 f"{analytics['coverage_pct']:.1f}%",
+                 "frames with any region"),
+            ])
+            st.markdown(zone_kpi, unsafe_allow_html=True)
+
+            zone_cols = st.columns(2)
+            with zone_cols[0]:
+                st.markdown(ui.card_open("Time in Zone",
+                                         "Estimated seconds per pitch region"),
+                            unsafe_allow_html=True)
+                fig = ch.build_zone_time_bar(palette, zone_summary)
+                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+                st.markdown(ui.card_close(), unsafe_allow_html=True)
+            with zone_cols[1]:
+                st.markdown(ui.card_open("Region Detection Timeline",
+                                         "Rolling 100-frame window — detections per region"),
+                            unsafe_allow_html=True)
+                fig = ch.build_zone_timeline(palette, zone_timeline)
+                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+                st.markdown(ui.card_close(), unsafe_allow_html=True)
+
 
 # ═════════════════════════════════════════════════════════════════════════════
-# TAB 4 — OUTPUTS
+# TAB 4 — PLAYER ANALYTICS
+# ═════════════════════════════════════════════════════════════════════════════
+with tab_players:
+    if not st.session_state.game_data:
+        st.markdown(
+            """
+            <div class='ps-card' style='text-align:center;padding:40px 24px;'>
+              <h3>No player data yet</h3>
+              <p style='color:var(--ps-text-dim);'>Process a video to view per-player and tactical analytics.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        gd = st.session_state.game_data
+        fps_val = float(st.session_state.get("scrubber_fps", 30.0))
+
+        # Same detected-colour override as the other tabs so the new charts
+        # use the live team colours.
+        detected_palette = dict(palette)
+        t1_bgr = GameAnalyzer.dominant_team_bgr(gd, team=0)
+        t2_bgr = GameAnalyzer.dominant_team_bgr(gd, team=1)
+        if t1_bgr is not None:
+            detected_palette["team1"] = GameAnalyzer.bgr_to_hex(t1_bgr)
+        if t2_bgr is not None:
+            detected_palette["team2"] = GameAnalyzer.bgr_to_hex(t2_bgr)
+        st.markdown(
+            f"<style>:root {{"
+            f"  --ps-team1: {detected_palette['team1']};"
+            f"  --ps-team2: {detected_palette['team2']};"
+            f"}}</style>",
+            unsafe_allow_html=True,
+        )
+
+        profiles = GameAnalyzer.compute_player_profiles(gd, fps=fps_val)
+        network = GameAnalyzer.compute_passing_network(gd)
+        pressing = GameAnalyzer.compute_pressing_timeline(gd, window=30)
+        dline = GameAnalyzer.compute_defensive_line_height(gd)
+        setpieces = GameAnalyzer.compute_set_pieces(gd, fps=fps_val)
+        xt = GameAnalyzer.compute_xt_heatmap(gd)
+        voronoi = GameAnalyzer.compute_voronoi_control(gd)
+        chains = GameAnalyzer.compute_possession_chains(gd)
+        halves = GameAnalyzer.compute_half_comparison(gd)
+
+        # --- KPI strip -------------------------------------------------------
+        total_passes = (network.get("total_passes_team1", 0)
+                        + network.get("total_passes_team2", 0))
+        total_dist = sum(p["distance_m"] for p in profiles["profiles"])
+        top_speed = max((p["top_speed_m_s"] for p in profiles["profiles"]),
+                        default=0.0)
+        total_setpieces = setpieces.get("total", 0)
+        kpi = ui.kpi_grid([
+            ("Tracked Players", f"{len(profiles['profiles'])}",
+             "with team assignment"),
+            ("Top Speed",       f"{top_speed:.1f} m/s",
+             f"{total_dist / 1000:.1f} km covered total"),
+            ("Passes Detected", f"{total_passes:,}",
+             f"T1 {network.get('total_passes_team1', 0)} · "
+             f"T2 {network.get('total_passes_team2', 0)}"),
+            ("Set Pieces",      f"{total_setpieces}",
+             f"corners {setpieces['counts'].get('corner', 0)} · "
+             f"goal kicks {setpieces['counts'].get('goal_kick', 0)} · "
+             f"FK-danger {setpieces['counts'].get('free_kick_dangerous', 0)}"),
+            ("Longest Chain",
+             f"{max(chains['team1'].get('longest', 0), chains['team2'].get('longest', 0))}f",
+             f"T1 {chains['team1'].get('longest', 0)} · T2 {chains['team2'].get('longest', 0)}"),
+            ("Pitch Control",
+             f"T1 {voronoi['team1_pct']:.0f}% · T2 {voronoi['team2_pct']:.0f}%",
+             f"contested {voronoi['contested_pct']:.0f}%"),
+        ])
+        st.markdown(kpi, unsafe_allow_html=True)
+
+        # --- Passing networks ------------------------------------------------
+        net_cols = st.columns(2)
+        with net_cols[0]:
+            st.markdown(ui.card_open("Team 1 Passing Network",
+                                     "Directed player→player passes overlaid on the pitch"),
+                        unsafe_allow_html=True)
+            fig = ch.build_passing_network(detected_palette, network.get("team1", {}),
+                                           "Team 1", detected_palette["team1"])
+            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+            st.markdown(ui.card_close(), unsafe_allow_html=True)
+        with net_cols[1]:
+            st.markdown(ui.card_open("Team 2 Passing Network",
+                                     "Directed player→player passes overlaid on the pitch"),
+                        unsafe_allow_html=True)
+            fig = ch.build_passing_network(detected_palette, network.get("team2", {}),
+                                           "Team 2", detected_palette["team2"])
+            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+            st.markdown(ui.card_close(), unsafe_allow_html=True)
+
+        # --- Pressing + defensive line --------------------------------------
+        tactical_cols = st.columns(2)
+        with tactical_cols[0]:
+            st.markdown(ui.card_open("Pressing Intensity",
+                                     "Rolling 30-frame mean of nearest opponent distance to the ball — lower = more press"),
+                        unsafe_allow_html=True)
+            fig = ch.build_pressing_timeline(detected_palette, pressing)
+            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+            st.markdown(ui.card_close(), unsafe_allow_html=True)
+        with tactical_cols[1]:
+            st.markdown(ui.card_open("Defensive Line Height",
+                                     "Mean X of each team's deepest outfield player (excludes GK)"),
+                        unsafe_allow_html=True)
+            fig = ch.build_defensive_line_timeline(detected_palette, dline)
+            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+            st.markdown(ui.card_close(), unsafe_allow_html=True)
+
+        # --- xT + Voronoi ---------------------------------------------------
+        space_cols = st.columns(2)
+        with space_cols[0]:
+            st.markdown(ui.card_open("Pitch Value (xT)",
+                                     "Danger-weighted ball-possession heatmap"),
+                        unsafe_allow_html=True)
+            xt_cols = st.columns(2)
+            with xt_cols[0]:
+                fig = ch.build_xt_heatmap(detected_palette, xt, team_id=0)
+                st.plotly_chart(fig, use_container_width=True,
+                                config={"displayModeBar": False})
+            with xt_cols[1]:
+                fig = ch.build_xt_heatmap(detected_palette, xt, team_id=1)
+                st.plotly_chart(fig, use_container_width=True,
+                                config={"displayModeBar": False})
+            st.markdown(ui.card_close(), unsafe_allow_html=True)
+        with space_cols[1]:
+            st.markdown(ui.card_open("Pitch Control (Voronoi)",
+                                     "Per-cell ownership by nearest player, signed T1/T2"),
+                        unsafe_allow_html=True)
+            fig = ch.build_voronoi_control(detected_palette, voronoi)
+            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+            st.markdown(ui.card_close(), unsafe_allow_html=True)
+
+        # --- Possession chains + halves comparison --------------------------
+        bottom_cols = st.columns(2)
+        with bottom_cols[0]:
+            st.markdown(ui.card_open("Possession Chains",
+                                     "Length distribution of unbroken possession sequences (frames)"),
+                        unsafe_allow_html=True)
+            fig = ch.build_chain_length_histogram(detected_palette, chains)
+            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+            t1c = chains["team1"]; t2c = chains["team2"]
+            st.markdown(
+                f"<div class='ps-card__sub'>"
+                f"T1 longest: <b>{t1c.get('longest', 0)}</b>f · mean "
+                f"<b>{t1c.get('mean', 0):.1f}</b>f · "
+                f"T2 longest: <b>{t2c.get('longest', 0)}</b>f · mean "
+                f"<b>{t2c.get('mean', 0):.1f}</b>f"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(ui.card_close(), unsafe_allow_html=True)
+        with bottom_cols[1]:
+            st.markdown(ui.card_open("First Half vs Second Half",
+                                     f"Split at frame {halves.get('split_frame', 0):,}"),
+                        unsafe_allow_html=True)
+            fp = halves.get("first", {}).get("possession", {})
+            sp = halves.get("second", {}).get("possession", {})
+            st.markdown(ui.kpi_grid([
+                ("1H Possession",
+                 f"{fp.get('team1_possession_pct', 0):.0f}% / "
+                 f"{fp.get('team2_possession_pct', 0):.0f}%",
+                 f"{halves.get('first_frames', 0):,} frames"),
+                ("2H Possession",
+                 f"{sp.get('team1_possession_pct', 0):.0f}% / "
+                 f"{sp.get('team2_possession_pct', 0):.0f}%",
+                 f"{halves.get('second_frames', 0):,} frames"),
+                ("1H Ball Rate",
+                 f"{halves.get('first', {}).get('ball_rate', 0):.1f}%",
+                 "frames with ball detected"),
+                ("2H Ball Rate",
+                 f"{halves.get('second', {}).get('ball_rate', 0):.1f}%",
+                 "frames with ball detected"),
+            ]), unsafe_allow_html=True)
+            st.markdown(ui.card_close(), unsafe_allow_html=True)
+
+        # --- Set-piece summary ----------------------------------------------
+        sp_cols = st.columns(4)
+        sp_kpis = [
+            ("Corners",            setpieces["counts"].get("corner", 0),
+             "ball-stationary near flag"),
+            ("Goal Kicks",         setpieces["counts"].get("goal_kick", 0),
+             "ball-stationary in 6-yard box"),
+            ("Dangerous Free Kicks", setpieces["counts"].get("free_kick_dangerous", 0),
+             "ball-stationary in opp box"),
+            ("Other Stoppages",    setpieces["counts"].get("other", 0),
+             "ball-stationary elsewhere"),
+        ]
+        for c, (label, val, hint) in zip(sp_cols, sp_kpis):
+            with c:
+                st.markdown(ui.kpi_card(label, f"{val}", hint),
+                            unsafe_allow_html=True)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TAB 5 — OUTPUTS
 # ═════════════════════════════════════════════════════════════════════════════
 with tab_videos:
-
 
 
 
@@ -783,6 +1108,142 @@ with tab_videos:
                         st.markdown(ui.card_open(label, desc), unsafe_allow_html=True)
                         st.video(str(path))
                         st.markdown(ui.card_close(), unsafe_allow_html=True)
+
+            # ─── Frame Inspector ────────────────────────────────────────────
+            min_total, fps, frame_rows = get_scrubber_bounds(out_dir)
+            if min_total > 0 and frame_rows:
+                # Clamp the slider into the valid range whenever the source
+                # match changes (or first load).
+                if st.session_state.scrubber_frame_idx > min_total:
+                    st.session_state.scrubber_frame_idx = min_total
+                if st.session_state.scrubber_frame_idx < 1:
+                    st.session_state.scrubber_frame_idx = 1
+
+                st.markdown(
+                    ui.card_open("Frame Inspector",
+                                 "Pick a frame — preview all 5 output videos at that "
+                                 "timestamp, with match context.",
+                                 chip=f"{min_total:,} frames · {fps:.1f} fps"),
+                    unsafe_allow_html=True,
+                )
+
+                nav_cols = st.columns([1, 1, 1, 1, 4])
+                with nav_cols[0]:
+                    if st.button("⟪ -10", use_container_width=True,
+                                 key="scrub_back10"):
+                        st.session_state.scrubber_frame_idx = max(
+                            1, st.session_state.scrubber_frame_idx - 10)
+                        st.rerun()
+                with nav_cols[1]:
+                    if st.button("◀ -1", use_container_width=True,
+                                 key="scrub_back1"):
+                        st.session_state.scrubber_frame_idx = max(
+                            1, st.session_state.scrubber_frame_idx - 1)
+                        st.rerun()
+                with nav_cols[2]:
+                    if st.button("+1 ▶", use_container_width=True,
+                                 key="scrub_fwd1"):
+                        st.session_state.scrubber_frame_idx = min(
+                            min_total, st.session_state.scrubber_frame_idx + 1)
+                        st.rerun()
+                with nav_cols[3]:
+                    if st.button("+10 ⟫", use_container_width=True,
+                                 key="scrub_fwd10"):
+                        st.session_state.scrubber_frame_idx = min(
+                            min_total, st.session_state.scrubber_frame_idx + 10)
+                        st.rerun()
+                with nav_cols[4]:
+                    slider_val = st.slider(
+                        "Frame",
+                        min_value=1, max_value=int(min_total),
+                        value=int(st.session_state.scrubber_frame_idx),
+                        step=1, key="scrubber_frame_idx_slider",
+                        label_visibility="collapsed",
+                    )
+                    if slider_val != st.session_state.scrubber_frame_idx:
+                        st.session_state.scrubber_frame_idx = int(slider_val)
+
+                # Context line: frame # / total, timecode, ball position, possession
+                idx_now = int(st.session_state.scrubber_frame_idx)
+                seconds = (idx_now - 1) / max(fps, 1e-6)
+                m, s = int(seconds // 60), seconds - int(seconds // 60) * 60
+                tc = f"{m:02d}:{s:05.2f}"
+                ball_txt = "no ball"
+                poss_txt = ""
+                entry = find_closest_entry(st.session_state.game_data, idx_now)
+                if entry is not None:
+                    bp = entry.get("ball_position")
+                    if bp is not None:
+                        bp = np.asarray(bp, dtype=float).reshape(-1)
+                        if bp.shape[0] >= 2:
+                            ball_txt = f"ball pitch ({bp[0]:.1f}, {bp[1]:.1f})"
+                    tids = entry.get("team_ids")
+                    positions = entry.get("player_positions")
+                    if bp is not None and tids is not None and positions is not None and len(positions) > 0:
+                        ball_arr = np.asarray(bp, dtype=np.float32).reshape(1, 2)
+                        positions = np.asarray(positions)
+                        tids = np.asarray(tids)
+                        valid = tids >= 0
+                        if np.any(valid):
+                            d = np.linalg.norm(positions[valid] - ball_arr, axis=1)
+                            team_lab = tids[valid]
+                            nearest_idx = int(np.argmin(d))
+                            owner = int(team_lab[nearest_idx])
+                            poss_txt = f" · possession: Team {owner + 1}"
+                st.markdown(
+                    f"<div class='ps-card__sub' style='margin:4px 0 10px;'>"
+                    f"Frame <b>{idx_now:,}</b> / {min_total:,} · "
+                    f"<b>{tc}</b> @ {fps:.1f}fps · {ball_txt}{poss_txt}"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+
+                # Regions in view (segmentation chips)
+                segs = regions_for_frame(st.session_state.analytics_data, idx_now)
+                if segs:
+                    chips = " ".join(
+                        f'<span class="ps-chip">'
+                        f'{SEG_CLASS_LABELS.get(s.get("class_name", ""), s.get("class_name", ""))}'
+                        f' · {float(s.get("confidence", 0)):.2f}</span>'
+                        for s in segs[:5]
+                    )
+                    st.markdown(
+                        f"<div style='display:flex;flex-wrap:wrap;gap:6px;"
+                        f"margin-bottom:10px;'>"
+                        f"<span class='ps-card__sub' style='margin-right:4px;'>Regions in view:</span>"
+                        f"{chips}</div>",
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.markdown(
+                        "<div class='ps-card__sub' style='margin-bottom:10px;'>"
+                        "Regions in view: <i>No pitch regions detected at this timestamp.</i></div>",
+                        unsafe_allow_html=True,
+                    )
+
+                # 5-up preview grid
+                preview_cols = st.columns(len(frame_rows))
+                for col, (path, label, _total) in zip(preview_cols, frame_rows):
+                    with col:
+                        bgr = seek_to_frame(str(path), idx_now)
+                        if bgr is None:
+                            st.warning(f"Could not open {path.name}")
+                            continue
+                        st.image(
+                            frame_to_rgb(bgr),
+                            caption=label, use_container_width=True,
+                        )
+
+                # Frame-length sanity check
+                distinct_totals = {t for (_p, _l, t) in frame_rows}
+                if len(distinct_totals) > 1:
+                    st.warning(
+                        "Output videos have mismatched frame counts: "
+                        + ", ".join(f"{Path(p).name}={t}" for p, _l, t in frame_rows)
+                        + ". Scrubber is clamped to the shortest."
+                    )
+
+                st.markdown(ui.card_close(), unsafe_allow_html=True)
 
 
 # ─── Footer ───────────────────────────────────────────────────────────────────
