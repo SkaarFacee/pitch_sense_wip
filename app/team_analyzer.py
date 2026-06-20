@@ -87,6 +87,12 @@ TEAM_HARD_LOCK_FRAMES = 5
 # early `team_locked = True` even before TEAM_HARD_LOCK_FRAMES elapses.
 TEAM_CONSEC_STREAK_LOCK = 3
 
+# Spatial-continuity team lock: minimum IoU between a current detection
+# and a confident prev-frame TEAM0/TEAM1 box for the current (possibly
+# new) track to inherit the prev box's team identity. Symmetric (mutual
+# 1-to-1 best match) so converging/ambiguous boxes are rejected.
+SPATIAL_CONTINUITY_IOU = 0.5
+
 # How many position samples are required before the pitch-position
 # fallback engages for similar-colored teams.
 POSITION_MIN_SAMPLES = 5
@@ -126,6 +132,12 @@ class TeamColorAnalyzer:
         self._last_centroids_hsv = None  # for drift-trigger re-cluster
         self._last_H = None  # latest homography (for Tier 1.6 touchline check)
 
+        # Spatial-continuity team lock (anti-jitter for ByteTrack ID
+        # switches). Each entry: {'bbox': np.ndarray(4,), 'team_id': int}.
+        # Only confident/locked TEAM0/TEAM1 detections are recorded, and
+        # only TEAM0/TEAM1 prev entries are eligible for inheritance.
+        self._prev_frame_detections: list[dict] = []
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -146,6 +158,9 @@ class TeamColorAnalyzer:
         position-based logic still works off `_record_pitch_positions`.
         """
         if len(player_xyxy) == 0:
+            # Clear the prev-frame buffer so a one-frame gap (e.g. pitch
+            # mask dropping everyone) doesn't match a stale box next frame.
+            self._prev_frame_detections = []
             self._cleanup_stale_tracks()
             return self._empty_result()
 
@@ -209,7 +224,29 @@ class TeamColorAnalyzer:
         if not self.initialized or team_ids is None or len(team_ids) == 0:
             return self._empty_result()
 
-        return self._build_result(team_ids)
+        result = self._build_result(team_ids)
+
+        # Record confident/locked TEAM0/TEAM1 detections as the prev-frame
+        # source for next frame's spatial-continuity check. Only TEAM0/TEAM1
+        # labels are inheritable, and only confident/locked tracks are
+        # recorded so warm-up votes never seed a wrong inheritance.
+        prev_dets: list[dict] = []
+        for i in range(len(player_xyxy)):
+            label = int(team_ids[i])
+            if label not in (self.TEAM0, self.TEAM1):
+                continue
+            t = self.tracks.get(int(track_ids[i]))
+            if t is None:
+                continue
+            if not (t.get('team_locked', False) or t['frames_seen'] >= TEAM_LOCK_MIN_FRAMES):
+                continue
+            prev_dets.append({
+                'bbox': player_xyxy[i].copy(),
+                'team_id': label,
+            })
+        self._prev_frame_detections = prev_dets
+
+        return result
 
     # ------------------------------------------------------------------
     # Per-track bookkeeping
@@ -657,6 +694,102 @@ class TeamColorAnalyzer:
     # ------------------------------------------------------------------
     # Per-frame team-id decision
     # ------------------------------------------------------------------
+    @staticmethod
+    def _compute_iou_matrix(cur_xyxy: np.ndarray, prev_boxes: np.ndarray) -> np.ndarray:
+        """Vectorized IoU between every current box and every prev box.
+
+        ``cur_xyxy``: (N, 4) float in xyxy. ``prev_boxes``: (M, 4) float.
+        Returns an (N, M) float32 IoU matrix; zero where boxes do not
+        overlap. Handles N==0 or M==0 by returning an empty matrix.
+        """
+        N = len(cur_xyxy)
+        M = len(prev_boxes)
+        if N == 0 or M == 0:
+            return np.zeros((N, M), dtype=np.float32)
+        cur = cur_xyxy.astype(np.float32)
+        prev = prev_boxes.astype(np.float32)
+        lt = np.maximum(cur[:, None, :2], prev[None, :, :2])  # (N, M, 2)
+        rb = np.minimum(cur[:, None, 2:], prev[None, :, 2:])  # (N, M, 2)
+        wh = np.clip(rb - lt, 0.0, None)
+        inter = wh[..., 0] * wh[..., 1]                          # (N, M)
+        cur_area = (cur[:, 2] - cur[:, 0]) * (cur[:, 3] - cur[:, 1])   # (N,)
+        prev_area = (prev[:, 2] - prev[:, 0]) * (prev[:, 3] - prev[:, 1])  # (M,)
+        union = cur_area[:, None] + prev_area[None, :] - inter
+        iou = np.where(union > 0, inter / np.maximum(union, 1e-6), 0.0)
+        return iou.astype(np.float32)
+
+    def _spatial_continuity_overrides(self, track_ids, player_xyxy, team_ids):
+        """Inherit a confident prev-frame TEAM0/TEAM1 label onto fresh /
+        ID-switched tracks whose boxes uniquely overlap a prev box.
+
+        Runs *before* any per-frame reassignment in
+        ``_decide_per_frame_team_ids``. Only prev entries whose resolved
+        team_id is TEAM0/TEAM1 are considered inheritable (never GK or
+        REF — those are positional/situational). Only tracks that are
+        NOT already ``team_locked`` are eligible (fresh / ID-switched
+        tracks); a locked track is never overwritten.
+
+        Matching uses a symmetric mutual 1-to-1 best match with IoU
+        >= ``SPATIAL_CONTINUITY_IOU``: the current detection's best
+        prev box AND that prev box's best current detection must be
+        each other.
+
+        For each accepted pair ``(i, prev)`` the inherited team is
+        written onto ``team_ids[i]`` and the new track's ``team_id``,
+        a strong vote is cast via ``_cast_team_vote`` (so the existing
+        hard-lock path engages quickly), and ``i`` is added to the
+        returned ``skip`` set so the rest of
+        ``_decide_per_frame_team_ids`` does not reassign it this frame.
+
+        Returns ``(team_ids, skip_set)``.
+        """
+        skip: set[int] = set()
+        if len(self._prev_frame_detections) == 0 or len(player_xyxy) == 0:
+            return team_ids, skip
+
+        prev_boxes = np.array(
+            [d['bbox'] for d in self._prev_frame_detections],
+            dtype=np.float32,
+        ).reshape(-1, 4)
+        prev_team_ids = np.array(
+            [d['team_id'] for d in self._prev_frame_detections],
+            dtype=np.int32,
+        )
+        inheritable = (prev_team_ids == self.TEAM0) | (prev_team_ids == self.TEAM1)
+        if not inheritable.any():
+            return team_ids, skip
+
+        prev_boxes_inh = prev_boxes[inheritable]
+        prev_team_inh = prev_team_ids[inheritable]
+        iou = self._compute_iou_matrix(player_xyxy, prev_boxes_inh)  # (N_cur, M_inh)
+        best_prev_for_cur = iou.argmax(axis=1)                       # (N_cur,)
+        best_cur_for_prev = iou.argmax(axis=0)                       # (M_inh,)
+        best_iou_cur = iou.max(axis=1)                               # (N_cur,)
+
+        thresh = SPATIAL_CONTINUITY_IOU
+        for i in range(len(player_xyxy)):
+            if best_iou_cur[i] < thresh:
+                continue
+            tid = int(track_ids[i])
+            t = self.tracks.get(tid)
+            if t is None:
+                continue
+            # Only fire for NOT-locked tracks (fresh / ID-switched).
+            if t.get('team_locked', False):
+                continue
+            j = int(best_prev_for_cur[i])
+            if int(best_cur_for_prev[j]) != i:
+                continue  # not a mutual 1-to-1 best match
+            if iou[i, j] < thresh:
+                continue
+            inherited = int(prev_team_inh[j])
+            team_ids[i] = inherited
+            t['team_id'] = inherited
+            self._cast_team_vote(t, inherited)
+            t['quality'] = self._compute_track_quality(t)
+            skip.add(i)
+        return team_ids, skip
+
     def _decide_per_frame_team_ids(self, track_ids, per_det_feature, frame, player_xyxy, H,
                                    player_pitch_pts=None):
         """Decide team_id per detection with strong stickiness (plan (a))
@@ -692,6 +825,15 @@ class TeamColorAnalyzer:
         team_ids = np.full(len(track_ids), self.GK, dtype=np.int32)
         centroids_close = self._centroids_too_close()
 
+        # Spatial-continuity team lock: before any per-frame reassignment,
+        # inherit a confident prev-frame TEAM0/TEAM1 label onto fresh /
+        # ID-switched tracks whose boxes uniquely overlap. Returns a
+        # `skip` set of detection indices whose label has been fixed this
+        # frame and must NOT be reassigned below.
+        team_ids, skip_set = self._spatial_continuity_overrides(
+            track_ids, player_xyxy, team_ids,
+        )
+
         # Build the all-track pitch list once per frame so the leftmost /
         # rightmost safety net has a stable set of comparisons. Each
         # entry is (track_id_int, pitch_x, pitch_y) for tracks with at
@@ -704,6 +846,12 @@ class TeamColorAnalyzer:
                 all_track_pitches.append((int(tid), float(np.median(xs)), float(np.median(ys))))
 
         for i, tid in enumerate(track_ids):
+            # Spatial-continuity-matched detections: team_id already set
+            # and votes already cast by `_spatial_continuity_overrides`.
+            # Skip all per-frame reassignment for them this frame.
+            if i in skip_set:
+                continue
+
             t = self.tracks.get(int(tid))
             if t is None or t['track_feature'] is None:
                 continue
@@ -1764,3 +1912,4 @@ class TeamColorAnalyzer:
         self.tracks.clear()
         self.frame_count = 0
         self._last_centroids_hsv = None
+        self._prev_frame_detections = []
