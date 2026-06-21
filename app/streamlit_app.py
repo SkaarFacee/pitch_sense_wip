@@ -72,6 +72,64 @@ SEG_CLASS_LABELS = {
 }
 
 
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def ensure_contrasting_bgr(t1_bgr, t2_bgr, min_dist: float = 100.0,
+                           scale: float = 2.0):
+    """Push two team colours apart when they are perceptually too close.
+
+    Returns ``(t1_bgr, t2_bgr)`` (unchanged if either is None or they are
+    already far enough apart). When the BGR euclidean distance is below
+    ``min_dist`` the existing difference direction is amplified by
+    ``scale``; if the two colours are nearly identical the second team is
+    pushed to a complementary hue so the two teams stay distinguishable in
+    the dashboard (hero bar, donut, radar, heatmaps, etc.).
+    """
+    if t1_bgr is None or t2_bgr is None:
+        return t1_bgr, t2_bgr
+    a = np.array(t1_bgr, dtype=float)
+    b = np.array(t2_bgr, dtype=float)
+    diff = b - a
+    dist = float(np.linalg.norm(diff))
+    if dist >= min_dist:
+        return t1_bgr, t2_bgr
+    if dist < 1e-3:
+        # Nearly identical jerseys — rotate team1's hue by 180° and make
+        # sure the result is reasonably saturated/bright.
+        import colorsys
+        b1, g1, r1 = t1_bgr
+        h, s, v = colorsys.rgb_to_hsv(r1 / 255.0, g1 / 255.0, b1 / 255.0)
+        r2, g2, b2 = colorsys.hsv_to_rgb((h + 0.5) % 1.0,
+                                         max(s, 0.65), max(v, 0.55))
+        return t1_bgr, (int(b2 * 255), int(g2 * 255), int(r2 * 255))
+    new_b = np.clip(a + diff * scale, 0, 255)
+    return t1_bgr, (int(new_b[0]), int(new_b[1]), int(new_b[2]))
+
+
+def _ball_owner_by_frame(game_data) -> dict:
+    """Cache and return a ``{frame_idx: owner_team}`` map built from
+    ``GameAnalyzer.compute_ball_owner_per_frame``.
+
+    Uses the SAME canonical-team + bbox-overlap + sticky carry logic as the
+    Overview tab so the scrubber's per-frame "possession: Team X" line
+    never disagrees with it. Recomputed only when ``game_data`` changes
+    length (i.e. a new run / more frames appended).
+    """
+    n = len(game_data) if game_data is not None else 0
+    cache = st.session_state.get("ball_owner_map")
+    if cache is not None and cache.get("_n") == n:
+        return cache["map"]
+    owner_map: dict = {}
+    if game_data:
+        owners = GameAnalyzer.compute_ball_owner_per_frame(game_data)
+        for entry, owner in zip(game_data, owners):
+            fi = int(entry.get("frame_idx", -1))
+            if fi >= 0 and owner is not None:
+                owner_map[fi] = int(owner)
+    st.session_state["ball_owner_map"] = {"_n": n, "map": owner_map}
+    return owner_map
+
+
 # ─── Page setup ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="PitchSense — Match Intelligence",
@@ -513,13 +571,16 @@ with tab_processing:
                 st.session_state.game_data.append({
                     "frame_idx": processed,
                     "player_positions": result.get("player_pitch_pts", np.empty((0, 2))),
+                    "player_xyxy": result.get("player_xyxy", np.empty((0, 4))),
                     "team_ids": team_ids,
                     "track_ids": track_ids,
                     "track_quality": track_quality,
                     "team1_bgr": team1_bgr,
                     "team2_bgr": team2_bgr,
                     "ball_position": result.get("ball_pitch_pt"),
+                    "ball_xyxy": result.get("ball_xyxy", np.empty((0, 4))),
                     "player_conf": result.get("player_conf", np.empty((0,))),
+                    "pass_event": result.get("pass_event"),
                 })
 
                 pct = (processed / max(total_frames, 1)) * 100
@@ -610,6 +671,9 @@ with tab_match:
         detected_palette = dict(palette)
         t1_bgr = GameAnalyzer.dominant_team_bgr(game_data, team=0)
         t2_bgr = GameAnalyzer.dominant_team_bgr(game_data, team=1)
+        # Boost separation when the detected jerseys are too similar so the
+        # hero bar / donut / radar stay readable.
+        t1_bgr, t2_bgr = ensure_contrasting_bgr(t1_bgr, t2_bgr)
         if t1_bgr is not None:
             detected_palette["team1"] = GameAnalyzer.bgr_to_hex(t1_bgr)
         if t2_bgr is not None:
@@ -751,6 +815,7 @@ with tab_pitch:
         detected_palette = dict(palette)
         t1_bgr = GameAnalyzer.dominant_team_bgr(st.session_state.game_data, team=0)
         t2_bgr = GameAnalyzer.dominant_team_bgr(st.session_state.game_data, team=1)
+        t1_bgr, t2_bgr = ensure_contrasting_bgr(t1_bgr, t2_bgr)
         if t1_bgr is not None:
             detected_palette["team1"] = GameAnalyzer.bgr_to_hex(t1_bgr)
         if t2_bgr is not None:
@@ -897,6 +962,7 @@ with tab_players:
         detected_palette = dict(palette)
         t1_bgr = GameAnalyzer.dominant_team_bgr(gd, team=0)
         t2_bgr = GameAnalyzer.dominant_team_bgr(gd, team=1)
+        t1_bgr, t2_bgr = ensure_contrasting_bgr(t1_bgr, t2_bgr)
         if t1_bgr is not None:
             detected_palette["team1"] = GameAnalyzer.bgr_to_hex(t1_bgr)
         if t2_bgr is not None:
@@ -1177,19 +1243,14 @@ with tab_videos:
                         bp = np.asarray(bp, dtype=float).reshape(-1)
                         if bp.shape[0] >= 2:
                             ball_txt = f"ball pitch ({bp[0]:.1f}, {bp[1]:.1f})"
-                    tids = entry.get("team_ids")
-                    positions = entry.get("player_positions")
-                    if bp is not None and tids is not None and positions is not None and len(positions) > 0:
-                        ball_arr = np.asarray(bp, dtype=np.float32).reshape(1, 2)
-                        positions = np.asarray(positions)
-                        tids = np.asarray(tids)
-                        valid = tids >= 0
-                        if np.any(valid):
-                            d = np.linalg.norm(positions[valid] - ball_arr, axis=1)
-                            team_lab = tids[valid]
-                            nearest_idx = int(np.argmin(d))
-                            owner = int(team_lab[nearest_idx])
-                            poss_txt = f" · possession: Team {owner + 1}"
+                    # Per-frame possession comes from the SAME canonical-team
+                    # + bbox-overlap + sticky-carry logic the Overview tab
+                    # uses (cached in session_state), so the two never
+                    # disagree. Falls back to "" (loose ball / no data).
+                    owner_map = _ball_owner_by_frame(st.session_state.game_data)
+                    owner = owner_map.get(idx_now)
+                    if owner is not None:
+                        poss_txt = f" · possession: Team {owner + 1}"
                 st.markdown(
                     f"<div class='ps-card__sub' style='margin:4px 0 10px;'>"
                     f"Frame <b>{idx_now:,}</b> / {min_total:,} · "

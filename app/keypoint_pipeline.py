@@ -23,6 +23,13 @@ MIN_PASS_DISTANCE_M = 12.0
 # Combined with the player-distance gate, this catches only events where
 # the ball genuinely travelled from one player to another.
 MIN_BALL_DISPLACEMENT_M = 3.0
+
+# Defensive-line drawing: smoothing factor for the running estimate of
+# each team's mean pitch-X. A small alpha makes the "which goal does this
+# team defend" decision stable across frame-to-frame jitter so the two
+# defensive lines don't flip sides when players momentarily cross the
+# halfway line.
+TEAM_X_EMA_ALPHA = 0.04
 from keypoint_service import KeypointHomographyComputer
 from player_service import PlayerDetector
 from ball_service import BallDetector
@@ -58,6 +65,11 @@ class KeypointPipeline:
         self._prev_ball_pitch: Optional[np.ndarray] = None
         self._pass_flash_counter: int = 0
         self._last_pass_info: dict = {}
+        # Running EMA of each team's mean pitch-X. Used ONLY to decide
+        # which goal each team defends for the defensive-line overlay —
+        # far more stable than a per-frame mean, which flickers as players
+        # cross the halfway line.
+        self._team_x_ema: dict[int, Optional[float]] = {0: None, 1: None}
 
     def process_frame(self, frame: np.ndarray, frame_idx: int = 0):
         frame_h, frame_w = frame.shape[:2]
@@ -608,29 +620,38 @@ class KeypointPipeline:
 
     def _draw_defensive_lines(self, frame, H, tids_arr, team_ids_arr,
                               player_pitch_pts, team1_color, team2_color):
-        """Project each team's deepest outfield player back into image space
-        and draw a VERTICAL line at that image-X position so the viewer
-        can see the defensive line shift up and down the pitch over the
-        match.
+        """Draw each team's defensive line as a perspective-correct line
+        running ACROSS the pitch width at the depth of that team's deepest
+        outfield defender.
 
         Args:
             frame: Deep-analysis frame to annotate.
             H: 3x3 homography mapping pitch (meters) → image (pixels).
             tids_arr: per-detection track_ids (parallel to player_pitch_pts).
-            team_ids_arr: per-detection team labels (0, 1, -1, -2).
-            player_pitch_pts: (N, 2) pitch coordinates.
+            team_ids_arr: per-detection team labels (0, 1, -1 GK, -2 REF).
+            player_pitch_pts: (N, 2) pitch coordinates (already flip-adjusted
+                by ``process_frame`` to match the top-down canvas).
             team1_color, team2_color: BGR team colours.
 
-        The "deepest" outfield player for a team is the one with the
-        SMALLEST pitch-X (closest to their own goal). The goalkeeper
-        (team_id == -1) is excluded — the defensive line should reflect
-        the back four / five, not the keeper.
-
-        Convention: in the deep-analysis video the pitch's DEPTH axis
-        (pitch-X, the long axis) is rendered HORIZONTALLY across the
-        screen. A defensive line therefore appears as a VERTICAL line on
-        the camera image — running top-to-bottom at the depth where the
-        defense is sitting.
+        Method:
+          * The goalkeeper (team_id == -1) and referee (-2) are excluded —
+            the line reflects the back four / five, not the keeper.
+          * Each team's defending goal is decided from a SMOOTHED running
+            estimate of its mean pitch-X (``self._team_x_ema``) so the two
+            lines stay on opposite halves instead of flipping when a player
+            briefly crosses the halfway line.
+          * The "deepest defender" is the outfield player nearest the goal
+            the team defends: SMALLEST pitch-X when defending the left goal,
+            LARGEST pitch-X when defending the right.
+          * The line is drawn as a purely VERTICAL bar in image space at
+            the depth of the deepest defender. The depth is measured in
+            pitch metres, projected to a single pixel-x via the pitch
+            midline (``line_x, PITCH_WIDTH/2``) → H⁻¹, then a vertical
+            segment is drawn at that pixel-x spanning the frame height.
+            This keeps the line upright instead of perspective-slanted.
+            Because ``player_pitch_pts`` were flipped for display, the
+            projection first UN-FLIPS so H⁻¹ receives the raw pitch
+            coordinates it maps.
         """
         out = frame.copy()
         h, w = out.shape[:2]
@@ -640,110 +661,141 @@ class KeypointPipeline:
             return out
 
         n = min(len(tids_arr), len(team_ids_arr), len(player_pitch_pts))
-        # Stash the tids array on self so the inner helper (which closes
-        # over self) can look up a track_id for the picked defender.
-        self._tids_for_draw = tids_arr
+        if n == 0:
+            return out
 
-        def _team_line(team_id: int, defending_left: bool):
-            """Return (image_x, pitch_x, track_id) for the team's deepest
-            outfield player, or None.
+        def _pitch_to_image(px: float, py: float):
+            """Map a (possibly flipped) pitch point to image pixels.
 
-            ``defending_left`` is decided per-frame by comparing the two
-            teams' mean pitch-X: whichever team sits further LEFT (smaller
-            mean X) defends the left goal, the other defends the right.
-            This guarantees the two defensive lines are ALWAYS on opposite
-            sides of the pitch — the real-world constraint that each team
-            defends a different goal.
+            ``player_pitch_pts`` are flipped to match the top-down canvas,
+            but H⁻¹ expects the raw projection space, so un-flip first.
+            Returns ``(x, y)`` floats or ``None`` if the point projects to
+            (or behind) the camera horizon.
             """
+            rx, ry = px, py
+            if self.flip_projection_x:
+                rx = PITCH_LENGTH - rx
+            if self.flip_projection_y:
+                ry = PITCH_WIDTH - ry
+            homog = np.array([[rx, ry, 1.0]], dtype=np.float32)
+            proj = homog @ H_inv.T
+            wz = float(proj[0, 2])
+            if abs(wz) < 1e-6:
+                return None
+            return (float(proj[0, 0] / wz), float(proj[0, 1] / wz))
+
+        def _deepest_defender(team_id: int, defending_left: bool):
+            """Return (pitch_x, track_id) for the team's deepest on-pitch
+            outfield player, or None."""
             best_x = None
-            best_y = None
             best_track = None
             for i in range(n):
                 if int(team_ids_arr[i]) != team_id:
-                    continue
+                    continue  # skips GK (-1) and REF (-2) too
                 pt = player_pitch_pts[i]
                 if not (-2 <= pt[0] <= PITCH_LENGTH + 2
                         and -2 <= pt[1] <= PITCH_WIDTH + 2):
                     continue
+                px = float(pt[0])
                 if best_x is None:
-                    best_x = float(pt[0])
-                    best_y = float(pt[1])
-                    best_track = int(self._tids_for_draw[i])
-                    continue
-                # defending_left → deepest = SMALLEST pitch-X (closest to
-                # the left goal); !defending_left → deepest = LARGEST.
-                if defending_left and pt[0] < best_x:
-                    best_x = float(pt[0])
-                    best_y = float(pt[1])
-                    best_track = int(self._tids_for_draw[i])
-                elif (not defending_left) and pt[0] > best_x:
-                    best_x = float(pt[0])
-                    best_y = float(pt[1])
-                    best_track = int(self._tids_for_draw[i])
+                    best_x, best_track = px, int(tids_arr[i])
+                elif defending_left and px < best_x:
+                    best_x, best_track = px, int(tids_arr[i])
+                elif (not defending_left) and px > best_x:
+                    best_x, best_track = px, int(tids_arr[i])
             if best_x is None:
                 return None
-            # Project the defender's actual pitch position to image space.
-            homog = np.array([[best_x, best_y, 1.0]], dtype=np.float32)
-            proj = homog @ H_inv.T
-            proj = proj[0, :2] / proj[0, 2]
-            ix = float(proj[0])
-            # Clamp to frame so the line stays inside the video.
-            x_px = int(max(0, min(w - 1, ix)))
-            return (x_px, best_x, best_track)
+            return (best_x, best_track)
 
-        # Decide per-frame which team defends the LEFT goal: the team
-        # whose outfield mean pitch-X is smaller. If only one team has
-        # outfield players on the pitch this frame, that team defaults
-        # to defending the LEFT (legacy "min X" behaviour) and the other
-        # team draws nothing this frame.
-        def _team_mean_x(tid: int) -> Optional[float]:
-            xs: list[float] = []
-            for i in range(n):
-                if int(team_ids_arr[i]) != tid:
-                    continue
-                pt = player_pitch_pts[i]
-                if -2 <= pt[0] <= PITCH_LENGTH + 2 and -2 <= pt[1] <= PITCH_WIDTH + 2:
-                    xs.append(float(pt[0]))
-            if not xs:
-                return None
-            return float(np.mean(xs))
-
-        t1_mean = _team_mean_x(0)
-        t2_mean = _team_mean_x(1)
-        if t1_mean is not None and t2_mean is not None:
-            t1_defends_left = bool(t1_mean <= t2_mean)
-        else:
-            t1_defends_left = True
+        # Update the smoothed mean-X estimate for each team, then decide
+        # which goal each team defends. The smaller smoothed mean-X defends
+        # the left goal.
+        for team_id in (0, 1):
+            self._update_team_x_ema(team_id, team_ids_arr, player_pitch_pts, n)
+        t1_defends_left = self._team_defends_left(0)
 
         for team_id, color, tag, defends_left in (
             (0, team1_color, "T1", t1_defends_left),
             (1, team2_color, "T2", not t1_defends_left),
         ):
-            line = _team_line(team_id, defends_left)
-            if line is None:
+            picked = _deepest_defender(team_id, defends_left)
+            if picked is None:
                 continue
-            x_px, line_x, line_track = line
+            line_x, line_track = picked
+
+            # Project the depth at the pitch midline and draw a purely
+            # VERTICAL line in image space (constant pixel-x) at that depth.
+            # Using a single projection point (mid-width) avoids the
+            # perspective slant produced by connecting the two goal-line
+            # endpoints, which is what the viewer asked to remove.
+            p_mid = _pitch_to_image(line_x, PITCH_WIDTH * 0.5)
+            if p_mid is None:
+                continue
+            vx = int(round(p_mid[0]))
+            if not (0 <= vx < w):
+                continue
+
+            pt1 = (vx, 0)
+            pt2 = (vx, h - 1)
+
+            # Clip the (possibly off-screen) segment to the frame rectangle.
+            inside, cp1, cp2 = cv2.clipLine((0, 0, w, h), pt1, pt2)
+            if not inside:
+                continue
+
             color_t = tuple(int(c) for c in color)
-            # Thick VERTICAL line spanning most of the frame height.
-            cv2.line(out, (x_px, int(h * 0.08)), (x_px, int(h * 0.92)),
-                     color_t, 3, cv2.LINE_AA)
-            # Filled black backing for the label so it stays readable.
+            cv2.line(out, cp1, cp2, color_t, 3, cv2.LINE_AA)
+
+            # Label anchored at the top of the vertical line, nudged
+            # inside the frame so it never clips off-screen.
             label = f"{tag} Def Line · {line_x:.0f}m · #{line_track}"
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
-            # Place the label to the LEFT of the line by default; flip to
-            # the RIGHT side when the line sits near the left edge of the
-            # frame so the label never clips off-screen.
-            if x_px >= tw + 16:
-                tx = x_px - tw - 12
-                ty = int(h * 0.08) + th + 4
-            else:
-                tx = x_px + 12
-                ty = int(h * 0.08) + th + 4
+            anchor = cp1 if cp1[1] <= cp2[1] else cp2
+            tx = int(min(max(anchor[0] + 8, 4), max(4, w - tw - 4)))
+            ty = int(min(max(anchor[1] + th + 4, th + 4), h - 4))
             cv2.rectangle(out, (tx - 4, ty - th - 4),
                           (tx + tw + 4, ty + 4), (0, 0, 0), -1)
             cv2.putText(out, label, (tx, ty),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_t, 2, cv2.LINE_AA)
         return out
+
+    def _update_team_x_ema(self, team_id, team_ids_arr, player_pitch_pts, n):
+        """Fold this frame's mean pitch-X for ``team_id`` (outfield, on-pitch
+        only) into the running EMA used for the defending-side decision."""
+        xs = []
+        for i in range(n):
+            if int(team_ids_arr[i]) != team_id:
+                continue
+            pt = player_pitch_pts[i]
+            if -2 <= pt[0] <= PITCH_LENGTH + 2 and -2 <= pt[1] <= PITCH_WIDTH + 2:
+                xs.append(float(pt[0]))
+        if not xs:
+            return
+        mean_x = float(np.mean(xs))
+        prev = self._team_x_ema.get(team_id)
+        if prev is None:
+            self._team_x_ema[team_id] = mean_x
+        else:
+            self._team_x_ema[team_id] = (
+                (1.0 - TEAM_X_EMA_ALPHA) * prev + TEAM_X_EMA_ALPHA * mean_x
+            )
+
+    def _team_defends_left(self, team_id: int) -> bool:
+        """True if ``team_id`` defends the LEFT goal, decided from the
+        smoothed mean-X estimates. The team sitting further left (smaller
+        mean-X) defends the left goal. Falls back to a stable default when
+        one or both estimates are missing."""
+        other = 1 - team_id
+        a = self._team_x_ema.get(team_id)
+        b = self._team_x_ema.get(other)
+        if a is None and b is None:
+            return team_id == 0  # deterministic default
+        if a is None:
+            return True
+        if b is None:
+            return False
+        return a <= b
+
 
     # ------------------------------------------------------------------
     # Video processing
@@ -779,6 +831,8 @@ class KeypointPipeline:
         self._prev_ball_pitch = None
         self._pass_flash_counter = 0
         self._last_pass_info = {}
+        # Reset the smoothed defending-side estimate so a re-run starts fresh.
+        self._team_x_ema = {0: None, 1: None}
         try:
             while True:
                 ret, frame = cap.read()

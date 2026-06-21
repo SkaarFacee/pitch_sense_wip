@@ -803,7 +803,7 @@ def build_pressing_timeline(palette: dict, pressing: dict) -> go.Figure:
 
 # ─── Defensive line height timeline ──────────────────────────────────────────
 def build_defensive_line_timeline(palette: dict, dline: dict) -> go.Figure:
-    """Mean X of each team's deepest outfield player per frame (excludes GK)."""
+    """Deepest outfield defender's X for each team per frame (excludes GK)."""
     if not dline or not dline.get("x"):
         return _empty_fig(palette, "No defensive-line data")
     fig = go.Figure()

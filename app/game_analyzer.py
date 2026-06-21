@@ -50,6 +50,17 @@ TRACK_QUALITY_REGISTRY_EMA = 0.3
 # it's an opposition turnover.
 SAME_TEAM_PASS_MAX_DIST = 30.0  # meters; bail on giant jumps
 
+# Possession: fraction of a player's bbox size to pad the containment test
+# when resolving the ball owner. Catches a ball at the player's feet whose
+# center sits just outside (typically just below) the detected box.
+BBOX_OWNER_PAD_FRAC = 0.15
+
+# Possession: maximum number of CONSECUTIVE frames the ball can be missing
+# before possession is released (set to None). Without this, a single
+# detection followed by a long ball-loss stretch would carry one team's
+# possession forward indefinitely and inflate its percentage.
+MAX_BALL_LOST_CARRY_FRAMES = 30
+
 
 @dataclass
 class TrackRecord:
@@ -276,10 +287,15 @@ class GameAnalyzer:
         valid_pos, valid_tid, t1, t2 = GameAnalyzer._split_teams(entry)
         if valid_pos is None or (len(t1) == 0 and len(t2) == 0):
             return None
+        # Use the NEAREST (minimum-distance) player per team, not the mean.
+        # A team spread across the pitch should not "lose" the ball just
+        # because its average distance is large when one of its players is
+        # right on the ball. This matches the track-aware branch above,
+        # which also uses the single closest player.
         dists = np.linalg.norm(valid_pos - ball_arr, axis=1)
-        avg1 = float(np.mean(dists[valid_tid == 0])) if len(t1) > 0 else float("inf")
-        avg2 = float(np.mean(dists[valid_tid == 1])) if len(t2) > 0 else float("inf")
-        if avg1 <= avg2:
+        min1 = float(np.min(dists[valid_tid == 0])) if len(t1) > 0 else float("inf")
+        min2 = float(np.min(dists[valid_tid == 1])) if len(t2) > 0 else float("inf")
+        if min1 <= min2:
             return TEAM0
         return TEAM1
 
@@ -320,8 +336,15 @@ class GameAnalyzer:
                 continue
             px1 = float(player_xyxy[i, 0]); py1 = float(player_xyxy[i, 1])
             px2 = float(player_xyxy[i, 2]); py2 = float(player_xyxy[i, 3])
-            # Containment → strongest signal, return immediately.
-            if px1 <= cx <= px2 and py1 <= cy <= py2:
+            # Containment → strongest signal, return immediately. Pad the
+            # player box by a small fraction of its size so a ball at the
+            # player's feet (its center sitting just outside the detected
+            # box, typically just below it) still counts as possession
+            # instead of falling through to the area tiebreak — which can
+            # otherwise hand the ball to a barely-overlapping opponent.
+            pad_x = (px2 - px1) * BBOX_OWNER_PAD_FRAC
+            pad_y = (py2 - py1) * BBOX_OWNER_PAD_FRAC
+            if (px1 - pad_x) <= cx <= (px2 + pad_x) and (py1 - pad_y) <= cy <= (py2 + pad_y):
                 return t
             ix1 = max(bx1, px1); iy1 = max(by1, py1)
             ix2 = min(bx2, px2); iy2 = min(by2, py2)
@@ -351,16 +374,29 @@ class GameAnalyzer:
             data without ``player_xyxy``/``ball_xyxy``), the change
             gate is effectively bypassed and possession follows
             nearest-pitch exactly as before — no 0/0 frames.
+          * Possession is carried forward across frames where the ball is
+            not detected, but only for up to ``MAX_BALL_LOST_CARRY_FRAMES``
+            consecutive frames; after that it is released (None) so a long
+            ball-loss stretch doesn't inflate one team's possession.
         """
         registry = GameAnalyzer.build_registry(game_data)
         owners: List[Optional[int]] = []
         current: Optional[int] = None
+        frames_since_ball = 0
 
         for entry in game_data:
             ball = entry.get("ball_position")
             if ball is None:
+                # Carry possession forward across short ball-loss gaps, but
+                # release it once the ball has been missing for too long so
+                # one team's possession isn't inflated during a long stretch
+                # with no ball detection.
+                frames_since_ball += 1
+                if frames_since_ball > MAX_BALL_LOST_CARRY_FRAMES:
+                    current = None
                 owners.append(current)
                 continue
+            frames_since_ball = 0
             ball_arr = np.asarray(ball, dtype=np.float32).reshape(1, 2)
 
             nearest = GameAnalyzer._nearest_team_to_ball(
@@ -1517,11 +1553,28 @@ class GameAnalyzer:
                 prev_owner_tid = best_tid
                 prev_owner_team = new_team
 
-        # Node layouts: per-track average position.
+        # Node layouts: only players who actually participated in a pass
+        # (as ``from`` or ``to`` in some recorded edge), positioned at their
+        # LAST on-pitch position rather than their average. This keeps the
+        # graph focused on the players who moved the ball.
         def _nodes_for(team: int) -> list[dict]:
+            # Track ids that touched a pass edge belonging to this team.
+            participants: set[int] = set()
+            for (a, b), c in edge_counts.items():
+                if c <= 0:
+                    continue
+                ta = registry.canonical_team(a)
+                tb = registry.canonical_team(b)
+                if ta == team:
+                    participants.add(a)
+                if tb == team:
+                    participants.add(b)
+
             nodes = []
             for tid, rec in registry.tracks.items():
                 if rec.canonical_team != team or not rec.positions:
+                    continue
+                if tid not in participants:
                     continue
                 xs = np.array([p[0] for p in rec.positions], dtype=np.float32)
                 ys = np.array([p[1] for p in rec.positions], dtype=np.float32)
@@ -1529,10 +1582,20 @@ class GameAnalyzer:
                         & (ys >= -2) & (ys <= PITCH_WIDTH + 2))
                 if not np.any(mask):
                     continue
+                # Last on-pitch position: walk the recorded positions
+                # backwards and take the first that is on-pitch.
+                last_x = last_y = None
+                for px, py in reversed(rec.positions):
+                    if -2 <= px <= PITCH_LENGTH + 2 and -2 <= py <= PITCH_WIDTH + 2:
+                        last_x, last_y = float(px), float(py)
+                        break
+                if last_x is None:
+                    last_x = float(xs[mask][-1])
+                    last_y = float(ys[mask][-1])
                 nodes.append({
                     "track_id": int(tid),
-                    "x": float(xs[mask].mean()),
-                    "y": float(ys[mask].mean()),
+                    "x": last_x,
+                    "y": last_y,
                     "frames": int(rec.frames_seen),
                 })
             return nodes
@@ -1633,24 +1696,37 @@ class GameAnalyzer:
 
     @staticmethod
     def compute_defensive_line_height(game_data: List[dict]) -> dict:
-        """Average X of each team's deepest OUTFIELD player per frame.
+        """X of each team's deepest OUTFIELD player per frame.
+
+        The "deepest" player is the outfielder nearest the goal that team
+        DEFENDS — the smallest pitch-X when the team defends the left goal,
+        the largest when it defends the right. The defending side is taken
+        from ``infer_attacking_direction`` (robust GK-box inference with a
+        mean-X fallback) so the series reflects the true back line rather
+        than the squad average.
 
         Excludes the goalkeeper so the line reflects the back four / five.
         Uses the canonical team so a brief relabel doesn't shift the line.
 
         Returns::
 
-            {x: [frame_idx,...], team1: [mean_defender_x, ...],
-             team2: [...], "window": int}
+            {x: [frame_idx,...], team1: [deepest_defender_x, ...],
+             team2: [...]}
         """
         if not game_data:
             return {"x": [], "team1": [], "team2": []}
         registry = GameAnalyzer.build_registry(game_data)
 
+        # Decide which goal each team defends (stable, whole-match estimate).
+        direction = GameAnalyzer.infer_attacking_direction(game_data)
+        # A team that ATTACKS right DEFENDS the left goal → deepest = min X.
+        t1_attacks = direction.get("team1_attacks")
+        t2_attacks = direction.get("team2_attacks")
+        t1_defends_left = (t1_attacks == "right") if t1_attacks else True
+        t2_defends_left = (t2_attacks == "right") if t2_attacks else (not t1_defends_left)
+
         # Pre-compute which tracks belong to each team and exclude their GK.
-        gk_for_team: dict[int, Optional[int]] = {}
-        for tid, rec in registry.tracks.items():
-            gk_for_team[tid] = None
+        gk_for_team: dict = {}
         for tid, rec in registry.tracks.items():
             if rec.canonical_team in (TEAM0, TEAM1) and rec.team_votes.get(GK, 0) > 0:
                 # Pick the track with most GK votes per team
@@ -1660,6 +1736,11 @@ class GameAnalyzer:
 
         def _gk_track_id(team: int) -> Optional[int]:
             return gk_for_team.get(("gk", team))
+
+        def _deepest(xs: list[float], defends_left: bool) -> Optional[float]:
+            if not xs:
+                return None
+            return float(min(xs)) if defends_left else float(max(xs))
 
         x_axis: list[int] = []
         t1_series: list[Optional[float]] = []
@@ -1684,8 +1765,8 @@ class GameAnalyzer:
                     t1_xs.append(float(positions[i][0]))
                 elif rec.canonical_team == TEAM1 and int(tid) != t2_gk:
                     t2_xs.append(float(positions[i][0]))
-            t1_series.append(float(np.mean(t1_xs)) if t1_xs else None)
-            t2_series.append(float(np.mean(t2_xs)) if t2_xs else None)
+            t1_series.append(_deepest(t1_xs, t1_defends_left))
+            t2_series.append(_deepest(t2_xs, t2_defends_left))
 
         return {"x": x_axis, "team1": t1_series, "team2": t2_series}
 
