@@ -31,6 +31,7 @@ import numpy as np
 import cv2
 from sklearn.cluster import KMeans
 from constants import (
+    NO_TEAM, ROLE_UNKNOWN, ROLE_OUTFIELD, ROLE_GK, ROLE_REF,
     TEAM_N_CLUSTERS, TEAM_JERSEY_Y_START, TEAM_JERSEY_Y_END, TEAM_JERSEY_X_START, TEAM_JERSEY_X_END,
     GREEN_HSV_LOWER, GREEN_HSV_UPPER, REF_SATURATION_THRESHOLD,
     COLOR_CACHE_REFRESH_N, TRACK_HISTORY_LEN, TRACK_MIN_FRAMES_TO_CLUSTER,
@@ -164,27 +165,11 @@ class TeamColorAnalyzer:
             self._cleanup_stale_tracks()
             return self._empty_result()
 
-        # Tier 1.1: apply gray-world illumination normalization to the whole
-        # frame ONCE before per-crop extraction. Per-crop gray-world is wrong
-        # because each crop is dominated by jersey color — it normalizes the
-        # very signal we want to read.
-        if ILLUMINATION_NORMALIZE:
-            frame = self._illumination_normalize(frame)
-
-        # 1) Per-detection color extraction (Tier 1.2 adaptive band) — 4D feature
-        per_det_feature = []
-        per_det_bgr = []
-        per_det_weight = []
-        for i, bbox in enumerate(player_xyxy):
-            feature, bgr_c = self._extract_dominant_color(frame, bbox)
-            per_det_feature.append(feature)
-            per_det_bgr.append(bgr_c)
-            area = max(1.0, (bbox[2] - bbox[0]) * (bbox[3] - bbox[1]))
-            conf = float(player_conf[i]) if player_conf is not None and i < len(player_conf) else 1.0
-            per_det_weight.append(conf * min(1.0, area / self.REF_BBOX_AREA))
-        per_det_feature = np.array(per_det_feature, dtype=np.float32)
-        per_det_bgr = np.array(per_det_bgr, dtype=np.float32)
-        per_det_weight = np.array(per_det_weight, dtype=np.float32)
+        feature_info = self.extract_detection_features(frame, player_xyxy, player_conf)
+        frame = feature_info.get('normalized_frame', frame)
+        per_det_feature = feature_info['features']
+        per_det_bgr = feature_info['jersey_bgr']
+        per_det_weight = feature_info['weights']
 
         # 2) Update per-track state (Tier 1.3 EMA layered on top of median)
         track_ids = self._normalize_track_ids(track_ids, len(player_xyxy))
@@ -247,6 +232,46 @@ class TeamColorAnalyzer:
         self._prev_frame_detections = prev_dets
 
         return result
+
+    def extract_detection_features(self, frame: np.ndarray, player_xyxy: np.ndarray,
+                                   player_conf: np.ndarray = None) -> dict:
+        """Stateless per-detection kit feature extraction.
+
+        Returns 6D BGR features ``[jersey_bgr, shorts_bgr]`` plus the visible
+        jersey BGR color and a crop quality weight. This is used by the
+        full-sequence stabilizer so final labels do not depend on the mutable
+        online vote/lock state in ``assign_team_colors``.
+        """
+        n = len(player_xyxy) if player_xyxy is not None else 0
+        if n == 0:
+            return {
+                'features': np.empty((0, 6), dtype=np.float32),
+                'jersey_bgr': np.empty((0, 3), dtype=np.float32),
+                'weights': np.empty((0,), dtype=np.float32),
+                'normalized_frame': frame,
+            }
+
+        work_frame = frame
+        if ILLUMINATION_NORMALIZE:
+            work_frame = self._illumination_normalize(frame)
+
+        per_det_feature = []
+        per_det_bgr = []
+        per_det_weight = []
+        for i, bbox in enumerate(player_xyxy):
+            feature, bgr_c = self._extract_dominant_color(work_frame, bbox)
+            per_det_feature.append(feature)
+            per_det_bgr.append(bgr_c)
+            area = max(1.0, (bbox[2] - bbox[0]) * (bbox[3] - bbox[1]))
+            conf = float(player_conf[i]) if player_conf is not None and i < len(player_conf) else 1.0
+            per_det_weight.append(conf * min(1.0, area / self.REF_BBOX_AREA))
+
+        return {
+            'features': np.array(per_det_feature, dtype=np.float32),
+            'jersey_bgr': np.array(per_det_bgr, dtype=np.float32),
+            'weights': np.array(per_det_weight, dtype=np.float32),
+            'normalized_frame': work_frame,
+        }
 
     # ------------------------------------------------------------------
     # Per-track bookkeeping
@@ -1870,6 +1895,9 @@ class TeamColorAnalyzer:
     def _build_result(self, team_ids, track_ids) -> dict:
         centroids = self.team_centroids_bgr
         team_colors = []
+        team_membership = np.full(len(team_ids), NO_TEAM, dtype=np.int32)
+        role_ids = np.full(len(team_ids), ROLE_UNKNOWN, dtype=np.int32)
+        identity_ids = np.asarray(track_ids, dtype=np.int32).copy()
         track_quality = np.empty(len(team_ids), dtype=np.float32)
         soft_team_probs = np.zeros((len(team_ids), 2), dtype=np.float32)
         for i, label in enumerate(team_ids):
@@ -1892,23 +1920,65 @@ class TeamColorAnalyzer:
                     pass
 
             if label == self.REF:
+                team_membership[i] = NO_TEAM
+                role_ids[i] = ROLE_REF
                 team_colors.append(self.REF_COLOR)
             elif label == self.GK:
-                team_colors.append(self.GK_COLOR)
+                gk_team = self._team_membership_for_gk(t)
+                team_membership[i] = gk_team
+                role_ids[i] = ROLE_GK
+                if gk_team == self.TEAM0:
+                    team_colors.append(tuple(map(int, centroids[0])) if centroids is not None else self.DEFAULT_TEAM_COLORS[0])
+                    soft_team_probs[i, self.TEAM0] = max(float(soft_team_probs[i, self.TEAM0]), 1.0)
+                elif gk_team == self.TEAM1:
+                    team_colors.append(tuple(map(int, centroids[1])) if centroids is not None and len(centroids) > 1 else self.DEFAULT_TEAM_COLORS[1])
+                    soft_team_probs[i, self.TEAM1] = max(float(soft_team_probs[i, self.TEAM1]), 1.0)
+                else:
+                    team_colors.append(self.GK_COLOR)
             elif label == self.TEAM0:
+                team_membership[i] = self.TEAM0
+                role_ids[i] = ROLE_OUTFIELD
                 team_colors.append(tuple(map(int, centroids[0])) if centroids is not None else self.DEFAULT_TEAM_COLORS[0])
             else:
+                team_membership[i] = self.TEAM1
+                role_ids[i] = ROLE_OUTFIELD
                 team_colors.append(tuple(map(int, centroids[1])) if centroids is not None and len(centroids) > 1 else self.DEFAULT_TEAM_COLORS[1])
 
         t1 = tuple(map(int, centroids[0])) if centroids is not None else self.DEFAULT_TEAM_COLORS[0]
         t2 = tuple(map(int, centroids[1])) if centroids is not None and len(centroids) > 1 else self.DEFAULT_TEAM_COLORS[1]
-        return {'team_ids': np.array(team_ids, dtype=np.int32), 'team_colors': team_colors,
+        return {'team_ids': team_membership, 'role_ids': role_ids, 'identity_ids': identity_ids,
+                'team_colors': team_colors,
                 'team1_bgr': t1, 'team2_bgr': t2,
                 'track_quality': track_quality,
                 'soft_team_probs': soft_team_probs}
 
+    def _team_membership_for_gk(self, t) -> int:
+        """Best-effort online GK team membership.
+
+        The full-sequence stabilizer resolves this globally. For the online
+        fallback, prefer accumulated team votes and then nearest stable team
+        feature so ``team_ids`` still means membership instead of role.
+        """
+        if t is None:
+            return NO_TEAM
+        votes = t.get('team_votes', {})
+        t0_votes = int(votes.get(self.TEAM0, 0))
+        t1_votes = int(votes.get(self.TEAM1, 0))
+        if t0_votes > 0 or t1_votes > 0:
+            return self.TEAM0 if t0_votes >= t1_votes else self.TEAM1
+        if (t.get('track_feature') is not None
+                and self.team_centroids_bgr_feat is not None
+                and len(self.team_centroids_bgr_feat) >= 2):
+            dists = [self._feature_distance(t['track_feature'], c)
+                     for c in self.team_centroids_bgr_feat]
+            return int(np.argmin(dists))
+        return NO_TEAM
+
     def _empty_result(self) -> dict:
-        return {'team_ids': np.empty((0,), dtype=np.int32), 'team_colors': [],
+        return {'team_ids': np.empty((0,), dtype=np.int32),
+                'role_ids': np.empty((0,), dtype=np.int32),
+                'identity_ids': np.empty((0,), dtype=np.int32),
+                'team_colors': [],
                 'team1_bgr': self.DEFAULT_TEAM_COLORS[0], 'team2_bgr': self.DEFAULT_TEAM_COLORS[1],
                 'track_quality': np.empty((0,), dtype=np.float32),
                 'soft_team_probs': np.empty((0, 2), dtype=np.float32)}

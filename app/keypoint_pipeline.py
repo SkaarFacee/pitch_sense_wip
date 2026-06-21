@@ -7,6 +7,7 @@ from constants import (
     PLAYER_CONF, SEG_CONF, CANVAS_W, CANVAS_H, PITCH_LENGTH, PITCH_WIDTH,
     CENTER_X, CENTER_Y,
     BALL_CONF, BALL_TRAIL_LENGTH, BALL_BBOX_COLOR, BALL_DOT_COLOR,
+    TEAM0, TEAM1, NO_TEAM, ROLE_UNKNOWN, ROLE_OUTFIELD, ROLE_GK, ROLE_REF,
 )
 
 # How many frames the "PASS DETECTED" banner stays on screen after a pass.
@@ -37,6 +38,7 @@ from segmentation import Segmentor
 from pitch import PitchArtist
 from director import Director
 from team_analyzer import TeamColorAnalyzer
+from team_stabilizer import TeamCalibration, TeamSequenceStabilizer, validate_frame_team_infos
 
 
 class KeypointPipeline:
@@ -60,6 +62,7 @@ class KeypointPipeline:
         # (a) player-to-player distance and (b) ball displacement between
         # the two frames — both must clear their thresholds to count.
         self._prev_ball_owner_tid: Optional[int] = None
+        self._prev_ball_owner_display_tid: Optional[int] = None
         self._prev_ball_owner_team: Optional[int] = None
         self._prev_ball_owner_pitch: Optional[np.ndarray] = None
         self._prev_ball_pitch: Optional[np.ndarray] = None
@@ -114,12 +117,13 @@ class KeypointPipeline:
                 player_xyxy, pitch_mask, anchor="lower_torso",
             )
             if len(keep) < len(player_xyxy):
+                orig_n = len(player_xyxy)
                 player_xyxy = player_xyxy[keep]
-                if len(player_conf) == len(keep):
+                if len(player_conf) == orig_n:
                     player_conf = player_conf[keep]
                 else:
                     player_conf = player_conf[:0]
-                if len(track_ids) == len(keep):
+                if len(track_ids) == orig_n:
                     track_ids = track_ids[keep]
                 else:
                     track_ids = track_ids[:0]
@@ -203,6 +207,10 @@ class KeypointPipeline:
                             and 'team_ids' in team_info
                             and len(team_info['team_ids']) > 0)
                         else np.empty((0,), dtype=np.int32))
+        role_ids_arr = (np.asarray(team_info.get('role_ids', []), dtype=np.int32)
+                        if (team_info is not None
+                            and len(team_info.get('role_ids', [])) > 0)
+                        else np.full(len(team_ids_arr), ROLE_UNKNOWN, dtype=np.int32))
 
         # Resolve the new ball-owner by checking which player bbox the
         # ball bbox overlaps. Requires BOTH the ball detector AND the
@@ -297,7 +305,8 @@ class KeypointPipeline:
             annotated_frame = self._draw_team_bboxes(annotated_frame, player_xyxy,
                                                     team_info['team_colors'],
                                                     player_conf=player_conf,
-                                                    team_ids=team_info['team_ids'])
+                                                    team_ids=team_info['team_ids'],
+                                                    role_ids=team_info.get('role_ids'))
         if len(ball_xyxy) > 0:
             annotated_frame = self._draw_ball_bbox(annotated_frame, ball_xyxy, ball_conf, color=BALL_BBOX_COLOR)
         deep_analysis_frame = self._draw_keypoints_on_frame(seg_overlay_frame, used_kpts) if used_kpts else seg_overlay_frame
@@ -306,6 +315,7 @@ class KeypointPipeline:
                                                        team_info['team_colors'],
                                                        player_conf=player_conf,
                                                        team_ids=team_info['team_ids'],
+                                                       role_ids=team_info.get('role_ids'),
                                                        track_ids=track_ids)
         if len(ball_xyxy) > 0:
             deep_analysis_frame = self._draw_ball_bbox(deep_analysis_frame, ball_xyxy, ball_conf, color=BALL_BBOX_COLOR)
@@ -318,6 +328,7 @@ class KeypointPipeline:
                 deep_analysis_frame, H, tids_arr, team_ids_arr, player_pitch_pts,
                 team_info.get("team1_bgr", (255, 0, 0)),
                 team_info.get("team2_bgr", (0, 0, 255)),
+                role_ids_arr=role_ids_arr,
             )
         # Pass flash overlay — drawn LAST so it sits on top of every other
         # annotation. Only on the Deep Analysis video (per the request).
@@ -521,17 +532,11 @@ class KeypointPipeline:
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         return out
 
-    # Mapping of team_ids values (from team_analyzer.TeamColorAnalyzer) to
-    # the user-facing label drawn on each player bbox.
-    _TEAM_ID_LABELS = {
-        0:  "T1",
-        1:  "T2",
-        -1: "GK",   # GK constant from team_analyzer
-        -2: "REF",  # REF constant from team_analyzer
-    }
+    _TEAM_ID_LABELS = {TEAM0: "T1", TEAM1: "T2", NO_TEAM: ""}
 
     def _draw_team_bboxes(self, frame, player_xyxy, team_colors,
-                          player_conf=None, team_ids=None, track_ids=None):
+                          player_conf=None, team_ids=None, role_ids=None,
+                          track_ids=None):
         out = frame.copy()
         h, w = frame.shape[:2]
         for i in range(min(len(player_xyxy), len(team_colors))):
@@ -542,10 +547,22 @@ class KeypointPipeline:
             cv2.addWeighted(ov, 0.25, out, 0.75, 0, out)
             cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
 
-            # Build the label: "T1" / "T2" / "GK" / "REF" (+ tid + conf).
+            # Build the label from membership + role: "T1", "T2",
+            # "T1 GK", "T2 GK", "REF" (+ tid + conf).
             team_label = ""
+            role = ROLE_UNKNOWN
+            if role_ids is not None and i < len(role_ids):
+                role = int(role_ids[i])
             if team_ids is not None and i < len(team_ids):
-                team_label = self._TEAM_ID_LABELS.get(int(team_ids[i]), "")
+                team_id = int(team_ids[i])
+                if role == ROLE_REF:
+                    team_label = "REF"
+                elif team_id == TEAM0:
+                    team_label = "T1 GK" if role == ROLE_GK else "T1"
+                elif team_id == TEAM1:
+                    team_label = "T2 GK" if role == ROLE_GK else "T2"
+                elif role == ROLE_GK:
+                    team_label = "GK"
             tid_txt = ""
             if track_ids is not None and i < len(track_ids):
                 tid_txt = f"#{int(track_ids[i])}"
@@ -624,7 +641,8 @@ class KeypointPipeline:
         return out
 
     def _draw_defensive_lines(self, frame, H, tids_arr, team_ids_arr,
-                              player_pitch_pts, team1_color, team2_color):
+                              player_pitch_pts, team1_color, team2_color,
+                              role_ids_arr=None):
         """Draw each team's defensive line as a perspective-correct line
         running ACROSS the pitch width at the depth of that team's deepest
         outfield defender.
@@ -633,14 +651,15 @@ class KeypointPipeline:
             frame: Deep-analysis frame to annotate.
             H: 3x3 homography mapping pitch (meters) → image (pixels).
             tids_arr: per-detection track_ids (parallel to player_pitch_pts).
-            team_ids_arr: per-detection team labels (0, 1, -1 GK, -2 REF).
+            team_ids_arr: per-detection team membership labels (0, 1, NO_TEAM).
+            role_ids_arr: per-detection role labels; GK/ref are excluded.
             player_pitch_pts: (N, 2) pitch coordinates (already flip-adjusted
                 by ``process_frame`` to match the top-down canvas).
             team1_color, team2_color: BGR team colours.
 
         Method:
-          * The goalkeeper (team_id == -1) and referee (-2) are excluded —
-            the line reflects the back four / five, not the keeper.
+          * Goalkeepers and referees are excluded by ``role_ids_arr`` so the
+            line reflects the back four / five, not the keeper.
           * Each team's defending goal is decided from a SMOOTHED running
             estimate of its mean pitch-X (``self._team_x_ema``) so the two
             lines stay on opposite halves instead of flipping when a player
@@ -665,7 +684,10 @@ class KeypointPipeline:
         except np.linalg.LinAlgError:
             return out
 
-        n = min(len(tids_arr), len(team_ids_arr), len(player_pitch_pts))
+        if role_ids_arr is None or len(role_ids_arr) == 0:
+            role_ids_arr = np.full(len(team_ids_arr), ROLE_OUTFIELD, dtype=np.int32)
+        role_ids_arr = np.asarray(role_ids_arr, dtype=np.int32)
+        n = min(len(tids_arr), len(team_ids_arr), len(role_ids_arr), len(player_pitch_pts))
         if n == 0:
             return out
 
@@ -696,7 +718,9 @@ class KeypointPipeline:
             best_track = None
             for i in range(n):
                 if int(team_ids_arr[i]) != team_id:
-                    continue  # skips GK (-1) and REF (-2) too
+                    continue
+                if int(role_ids_arr[i]) in (ROLE_GK, ROLE_REF):
+                    continue
                 pt = player_pitch_pts[i]
                 if not (-2 <= pt[0] <= PITCH_LENGTH + 2
                         and -2 <= pt[1] <= PITCH_WIDTH + 2):
@@ -716,7 +740,8 @@ class KeypointPipeline:
         # which goal each team defends. The smaller smoothed mean-X defends
         # the left goal.
         for team_id in (0, 1):
-            self._update_team_x_ema(team_id, team_ids_arr, player_pitch_pts, n)
+            self._update_team_x_ema(team_id, team_ids_arr, player_pitch_pts, n,
+                                    role_ids_arr=role_ids_arr)
         t1_defends_left = self._team_defends_left(0)
 
         for team_id, color, tag, defends_left in (
@@ -764,12 +789,17 @@ class KeypointPipeline:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_t, 2, cv2.LINE_AA)
         return out
 
-    def _update_team_x_ema(self, team_id, team_ids_arr, player_pitch_pts, n):
+    def _update_team_x_ema(self, team_id, team_ids_arr, player_pitch_pts, n,
+                           role_ids_arr=None):
         """Fold this frame's mean pitch-X for ``team_id`` (outfield, on-pitch
         only) into the running EMA used for the defending-side decision."""
         xs = []
+        if role_ids_arr is None or len(role_ids_arr) == 0:
+            role_ids_arr = np.full(n, ROLE_OUTFIELD, dtype=np.int32)
         for i in range(n):
             if int(team_ids_arr[i]) != team_id:
+                continue
+            if int(role_ids_arr[i]) in (ROLE_GK, ROLE_REF):
                 continue
             pt = player_pitch_pts[i]
             if -2 <= pt[0] <= PITCH_LENGTH + 2 and -2 <= pt[1] <= PITCH_WIDTH + 2:
@@ -805,8 +835,322 @@ class KeypointPipeline:
     # ------------------------------------------------------------------
     # Video processing
     # ------------------------------------------------------------------
+    def _reset_video_state(self, reset_team_analyzer: bool = True,
+                           reset_homography: bool = True):
+        if reset_team_analyzer and self.team_analyzer is not None:
+            self.team_analyzer.reset()
+        if reset_homography:
+            self.last_H = None
+        self.ball_trajectory = []
+        self._prev_ball_owner_tid = None
+        self._prev_ball_owner_display_tid = None
+        self._prev_ball_owner_team = None
+        self._prev_ball_owner_pitch = None
+        self._prev_ball_pitch = None
+        self._pass_flash_counter = 0
+        self._last_pass_info = {}
+        self._team_x_ema = {TEAM0: None, TEAM1: None}
+
+    def _analyze_frame_for_sequence(self, frame: np.ndarray, frame_idx: int):
+        """First-pass inference only; stores compact metadata, no rendering."""
+        frame_h, frame_w = frame.shape[:2]
+        processed_segments = []
+
+        seg_op = self.segmentor.model.predict(frame, conf=SEG_CONF, verbose=False)[0]
+        if seg_op is not None and getattr(seg_op, 'masks', None) is not None:
+            processed_segments = self.segmentor.extract(seg_op, frame_w, last_side=None)
+        pitch_mask = self._build_pitch_mask(processed_segments, frame_h, frame_w)
+
+        H, H_info = self.keypoint_computer.compute_homography(frame, last_H=self.last_H)
+        if H is not None:
+            self.last_H = H
+
+        formatted = self.player_detector.track_players(frame, conf=PLAYER_CONF)
+        if formatted is not None:
+            player_xyxy, player_conf, _, track_ids = formatted
+        else:
+            player_xyxy = np.empty((0, 4), dtype=np.float32)
+            player_conf = np.empty((0,), dtype=np.float32)
+            track_ids = np.empty((0,), dtype=np.int32)
+
+        if pitch_mask is not None and len(player_xyxy) > 0:
+            keep = self._filter_bboxes_by_mask(player_xyxy, pitch_mask, anchor="lower_torso")
+            if len(keep) < len(player_xyxy):
+                orig_n = len(player_xyxy)
+                player_xyxy = player_xyxy[keep]
+                player_conf = player_conf[keep] if len(player_conf) == orig_n else player_conf[:0]
+                track_ids = track_ids[keep] if len(track_ids) == orig_n else track_ids[:0]
+
+        player_pitch_pts = np.empty((0, 2), dtype=np.float32)
+        if H is not None and len(player_xyxy) > 0:
+            player_pitch_pts = self.player_detector.project_points(player_xyxy, H)
+            if self.flip_projection_x and len(player_pitch_pts) > 0:
+                player_pitch_pts[:, 0] = PITCH_LENGTH - player_pitch_pts[:, 0]
+            if self.flip_projection_y and len(player_pitch_pts) > 0:
+                player_pitch_pts[:, 1] = PITCH_WIDTH - player_pitch_pts[:, 1]
+
+        team_features = None
+        if self.team_analyzer is not None and len(player_xyxy) > 0:
+            team_features = self.team_analyzer.extract_detection_features(
+                frame, player_xyxy, player_conf,
+            )
+
+        ball_xyxy = np.empty((0, 4), dtype=np.float32)
+        ball_conf = np.empty((0,), dtype=np.float32)
+        ball_pitch_pt = None
+        if self.ball_detector is not None:
+            ball_xyxy, ball_conf = self.ball_detector.detect_ball(frame)
+            if pitch_mask is not None and len(ball_xyxy) > 0:
+                if not self._bbox_center_in_mask(ball_xyxy[0], pitch_mask):
+                    ball_xyxy = np.empty((0, 4), dtype=np.float32)
+                    ball_conf = np.empty((0,), dtype=np.float32)
+            if len(ball_xyxy) > 0 and H is not None:
+                ball_pitch_pt = self.ball_detector.project_ball_to_pitch(
+                    ball_xyxy, H,
+                    flip_x=self.flip_projection_x,
+                    flip_y=self.flip_projection_y,
+                    pitch_length=PITCH_LENGTH,
+                    pitch_width=PITCH_WIDTH,
+                )
+
+        return {
+            'phase': 'analysis',
+            'frame_idx': int(frame_idx),
+            'H': H,
+            'H_info': H_info,
+            'player_xyxy': player_xyxy,
+            'player_conf': player_conf,
+            'track_ids': track_ids,
+            'player_pitch_pts': player_pitch_pts,
+            'keypoints_used': H_info.get('used_keypoints', []) if H_info else [],
+            'processed_segments': processed_segments,
+            'team_features': team_features,
+            'ball_xyxy': ball_xyxy,
+            'ball_conf': ball_conf,
+            'ball_pitch_pt': ball_pitch_pt,
+        }
+
+    def _render_frame_from_record(self, frame: np.ndarray, record: dict,
+                                  team_info: Optional[dict]):
+        """Second-pass rendering from first-pass metadata and stable labels."""
+        H = record.get('H')
+        H_info = record.get('H_info') or {}
+        player_xyxy = record.get('player_xyxy', np.empty((0, 4), dtype=np.float32))
+        player_conf = record.get('player_conf', np.empty((0,), dtype=np.float32))
+        track_ids = record.get('track_ids', np.empty((0,), dtype=np.int32))
+        player_pitch_pts = record.get('player_pitch_pts', np.empty((0, 2), dtype=np.float32))
+        processed_segments = record.get('processed_segments', [])
+        ball_xyxy = record.get('ball_xyxy', np.empty((0, 4), dtype=np.float32))
+        ball_conf = record.get('ball_conf', np.empty((0,), dtype=np.float32))
+        ball_pitch_pt = record.get('ball_pitch_pt')
+        used_kpts = record.get('keypoints_used', [])
+
+        seg_overlay_frame = self._create_seg_overlay(frame, None, processed_segments) if processed_segments else frame.copy()
+
+        if ball_pitch_pt is not None:
+            self.ball_trajectory.append(np.asarray(ball_pitch_pt, dtype=np.float32).copy())
+            if len(self.ball_trajectory) > BALL_TRAIL_LENGTH:
+                self.ball_trajectory.pop(0)
+
+        pitch_canvas = self.pitch_artist.draw_pitch_base()
+        if processed_segments:
+            pitch_canvas = self.pitch_artist.draw_seg_zones(pitch_canvas, processed_segments, alpha=0.25)
+        if len(self.ball_trajectory) > 1:
+            pitch_canvas = self.pitch_artist.draw_ball_trajectory(
+                pitch_canvas, self.ball_trajectory, max_trail=BALL_TRAIL_LENGTH,
+            )
+        if len(player_pitch_pts) > 0:
+            mask = ((player_pitch_pts[:, 0] >= -5) & (player_pitch_pts[:, 0] <= PITCH_LENGTH + 5)
+                    & (player_pitch_pts[:, 1] >= -5) & (player_pitch_pts[:, 1] <= PITCH_WIDTH + 5))
+            valid_pts = player_pitch_pts[mask]
+            if len(valid_pts) > 0:
+                colors = None
+                if team_info is not None:
+                    c = team_info.get('team_colors', [])
+                    colors = [c[i] for i in range(len(c)) if mask[i]] if len(c) == len(mask) else None
+                pitch_canvas = self.pitch_artist.draw_players_on_pitch(
+                    pitch_canvas, valid_pts, colors=colors, default_color=(0, 0, 255),
+                )
+            if team_info is not None:
+                pitch_canvas = self.pitch_artist.draw_team_legend(
+                    pitch_canvas, team_info.get('team1_bgr', (255, 0, 0)),
+                    team_info.get('team2_bgr', (0, 0, 255)),
+                )
+        if ball_pitch_pt is not None:
+            pitch_canvas = self.pitch_artist.draw_ball_on_pitch(
+                pitch_canvas, ball_pitch_pt, ball_color=BALL_DOT_COLOR,
+            )
+
+        tids_arr = np.asarray(track_ids) if len(track_ids) > 0 else np.empty((0,), dtype=np.int32)
+        team_ids_arr = (np.asarray(team_info.get('team_ids', []), dtype=np.int32)
+                        if team_info is not None else np.empty((0,), dtype=np.int32))
+        role_ids_arr = (np.asarray(team_info.get('role_ids', []), dtype=np.int32)
+                        if team_info is not None else np.empty((0,), dtype=np.int32))
+        identity_ids_arr = (np.asarray(team_info.get('identity_ids', []), dtype=np.int32)
+                            if team_info is not None else np.empty((0,), dtype=np.int32))
+
+        pass_event = self._update_pass_state(
+            ball_xyxy=ball_xyxy,
+            player_xyxy=player_xyxy,
+            tids_arr=tids_arr,
+            owner_ids_arr=identity_ids_arr,
+            team_ids_arr=team_ids_arr,
+            player_pitch_pts=player_pitch_pts,
+            ball_pitch_pt=ball_pitch_pt,
+        )
+
+        annotated_frame = self._draw_keypoints_on_frame(frame, used_kpts)
+        if team_info is not None and len(player_xyxy) > 0:
+            annotated_frame = self._draw_team_bboxes(
+                annotated_frame, player_xyxy, team_info.get('team_colors', []),
+                player_conf=player_conf,
+                team_ids=team_info.get('team_ids'),
+                role_ids=team_info.get('role_ids'),
+            )
+        if len(ball_xyxy) > 0:
+            annotated_frame = self._draw_ball_bbox(annotated_frame, ball_xyxy, ball_conf, color=BALL_BBOX_COLOR)
+
+        deep_analysis_frame = self._draw_keypoints_on_frame(seg_overlay_frame, used_kpts) if used_kpts else seg_overlay_frame
+        if team_info is not None and len(player_xyxy) > 0:
+            deep_analysis_frame = self._draw_team_bboxes(
+                deep_analysis_frame, player_xyxy, team_info.get('team_colors', []),
+                player_conf=player_conf,
+                team_ids=team_info.get('team_ids'),
+                role_ids=team_info.get('role_ids'),
+                track_ids=track_ids,
+            )
+        if len(ball_xyxy) > 0:
+            deep_analysis_frame = self._draw_ball_bbox(deep_analysis_frame, ball_xyxy, ball_conf, color=BALL_BBOX_COLOR)
+        if team_info is not None and H is not None and len(player_pitch_pts) > 0:
+            deep_analysis_frame = self._draw_defensive_lines(
+                deep_analysis_frame, H, tids_arr, team_ids_arr, player_pitch_pts,
+                team_info.get("team1_bgr", (255, 0, 0)),
+                team_info.get("team2_bgr", (0, 0, 255)),
+                role_ids_arr=role_ids_arr,
+            )
+        if self._pass_flash_counter > 0:
+            deep_analysis_frame = self._draw_pass_flash(
+                deep_analysis_frame, self._last_pass_info, self._pass_flash_counter,
+                PASS_FLASH_FRAMES,
+            )
+
+        return {
+            'phase': 'render',
+            'H': H, 'H_info': H_info, 'player_xyxy': player_xyxy, 'player_conf': player_conf,
+            'track_ids': track_ids, 'player_pitch_pts': player_pitch_pts, 'keypoints_used': used_kpts,
+            'seg_result': None, 'processed_segments': processed_segments, 'pitch_canvas': pitch_canvas,
+            'annotated_frame': annotated_frame, 'deep_analysis_frame': deep_analysis_frame,
+            'team_info': team_info,
+            'ball_xyxy': ball_xyxy, 'ball_conf': ball_conf, 'ball_pitch_pt': ball_pitch_pt,
+            'ball_trajectory': list(self.ball_trajectory), 'pass_event': pass_event,
+            'pitch_mask': None,
+        }
+
+    def _update_pass_state(self, ball_xyxy, player_xyxy, tids_arr, owner_ids_arr,
+                           team_ids_arr, player_pitch_pts, ball_pitch_pt) -> Optional[dict]:
+        pass_info: dict = {}
+        pass_event: Optional[dict] = None
+        ball_owner_idx: Optional[int] = None
+        if len(ball_xyxy) > 0 and len(player_xyxy) > 0:
+            ball_owner_idx, _owner_score = self._find_ball_owner_by_bbox_overlap(
+                ball_xyxy, player_xyxy,
+            )
+
+        if owner_ids_arr is None or len(owner_ids_arr) == 0:
+            owner_ids_arr = tids_arr
+        owner_ids_arr = np.asarray(owner_ids_arr, dtype=np.int32)
+
+        best_key: Optional[int] = None
+        best_display_tid: Optional[int] = None
+        best_team: Optional[int] = None
+        best_pitch: Optional[np.ndarray] = None
+        if ball_owner_idx is not None:
+            n = min(len(tids_arr), len(owner_ids_arr), len(team_ids_arr), len(player_xyxy), len(player_pitch_pts))
+            if ball_owner_idx < n:
+                owner_team = int(team_ids_arr[ball_owner_idx])
+                if owner_team in (TEAM0, TEAM1):
+                    proj_pt = player_pitch_pts[ball_owner_idx]
+                    if (-2 <= proj_pt[0] <= PITCH_LENGTH + 2
+                            and -2 <= proj_pt[1] <= PITCH_WIDTH + 2):
+                        key = int(owner_ids_arr[ball_owner_idx])
+                        if key < 0:
+                            key = int(tids_arr[ball_owner_idx])
+                        best_key = key
+                        best_display_tid = int(tids_arr[ball_owner_idx])
+                        best_team = owner_team
+                        best_pitch = np.asarray(proj_pt, dtype=np.float32).copy()
+
+        if (best_key is not None
+                and self._prev_ball_owner_tid is not None
+                and best_key != self._prev_ball_owner_tid
+                and self._prev_ball_owner_team is not None
+                and best_team == self._prev_ball_owner_team):
+            pass_dist_m = 0.0
+            if self._prev_ball_owner_pitch is not None and best_pitch is not None:
+                pass_dist_m = float(np.linalg.norm(self._prev_ball_owner_pitch - best_pitch))
+            ball_disp_m = 0.0
+            if self._prev_ball_pitch is not None and ball_pitch_pt is not None:
+                ball_disp_m = float(np.linalg.norm(
+                    np.asarray(self._prev_ball_pitch, dtype=np.float32)
+                    - np.asarray(ball_pitch_pt, dtype=np.float32)))
+            if (pass_dist_m >= MIN_PASS_DISTANCE_M
+                    and ball_disp_m >= MIN_BALL_DISPLACEMENT_M):
+                from_tid = (self._prev_ball_owner_display_tid
+                            if self._prev_ball_owner_display_tid is not None
+                            else self._prev_ball_owner_tid)
+                pass_info = {
+                    "from_tid": int(from_tid),
+                    "to_tid": int(best_display_tid if best_display_tid is not None else best_key),
+                    "from_identity_id": int(self._prev_ball_owner_tid),
+                    "to_identity_id": int(best_key),
+                    "team": int(best_team),
+                    "distance_m": round(pass_dist_m, 1),
+                }
+                pass_event = dict(pass_info)
+                self._pass_flash_counter = PASS_FLASH_FRAMES
+                self._last_pass_info = pass_info
+
+        if best_key is not None:
+            self._prev_ball_owner_tid = best_key
+            self._prev_ball_owner_display_tid = best_display_tid
+            self._prev_ball_owner_team = best_team
+            self._prev_ball_owner_pitch = best_pitch
+        elif ball_owner_idx is None:
+            self._prev_ball_owner_tid = None
+            self._prev_ball_owner_display_tid = None
+            self._prev_ball_owner_team = None
+            self._prev_ball_owner_pitch = None
+
+        if ball_pitch_pt is not None:
+            self._prev_ball_pitch = np.asarray(ball_pitch_pt, dtype=np.float32).copy()
+        else:
+            self._prev_ball_owner_tid = None
+            self._prev_ball_owner_display_tid = None
+            self._prev_ball_owner_team = None
+            self._prev_ball_owner_pitch = None
+            self._prev_ball_pitch = None
+        if self._pass_flash_counter > 0:
+            self._pass_flash_counter = max(0, self._pass_flash_counter - 1)
+        return pass_event
+
+    def _write_draft_frame(self, writer, frame, pitch_canvas, frame_w: int, frame_h: int):
+        if pitch_canvas is None:
+            return
+        pip_w, pip_h = frame_w // 4, int((frame_w // 4) * CANVAS_H / CANVAS_W)
+        pip = cv2.resize(pitch_canvas, (pip_w, pip_h))
+        ox, oy = frame_w - pip_w - 15, frame_h - pip_h - 15
+        draft = frame.copy()
+        ov = draft.copy()
+        cv2.rectangle(ov, (ox - 5, oy - 5), (ox + pip_w + 5, oy + pip_h + 5), (0, 0, 0), -1)
+        cv2.addWeighted(ov, 0.4, draft, 0.6, 0, draft)
+        draft[oy:oy + pip_h, ox:ox + pip_w] = pip
+        cv2.rectangle(draft, (ox - 2, oy - 2), (ox + pip_w + 2, oy + pip_h + 2), (255, 255, 255), 2)
+        writer.write(draft)
+
     def process_video(self, source_video_path: str, output_dir: str = "output", fps: float = 30.0,
-                      start_frame: int = 0, max_frames: Optional[int] = None, process_every_n: int = 1):
+                      start_frame: int = 0, max_frames: Optional[int] = None,
+                      process_every_n: int = 1, team_calibration=None):
+        process_every_n = max(1, int(process_every_n))
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
         paths = {k: output_path / v for k, v in [("pitch", "full_pitch_debug_map.mp4"), ("annotated", "annotated_video.mp4"),
@@ -819,25 +1163,22 @@ class KeypointPipeline:
             cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
         actual_fps = cap.get(cv2.CAP_PROP_FPS) or fps
         frame_w, frame_h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        pw = Director.make_video_writer(paths["pitch"], actual_fps, (CANVAS_W, CANVAS_H))
-        aw = Director.make_video_writer(paths["annotated"], actual_fps, (frame_w, frame_h))
-        dw = Director.make_video_writer(paths["deep"], actual_fps, (frame_w, frame_h))
-        fw = Director.make_video_writer(paths["draft"], actual_fps, (frame_w, frame_h))
-        kw = Director.make_video_writer(paths["keypoint"], actual_fps, (frame_w, frame_h))
-        if self.team_analyzer is not None:
-            self.team_analyzer.reset()
+
+        total_source = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        remaining_source = max(0, total_source - int(start_frame)) if total_source > 0 else 0
+        expected_count = (remaining_source + max(process_every_n, 1) - 1) // max(process_every_n, 1) if remaining_source else 0
+        if max_frames is not None:
+            expected_count = min(expected_count if expected_count else int(max_frames), int(max_frames))
+        expected_for_progress = max(expected_count, 1)
+
+        self._reset_video_state(reset_team_analyzer=True, reset_homography=True)
+        stabilizer = TeamSequenceStabilizer(
+            calibration=TeamCalibration.from_any(team_calibration),
+            feature_distance_fn=(self.team_analyzer._feature_distance if self.team_analyzer is not None else None),
+        ) if self.team_analyzer is not None else None
+
+        frame_records: list[dict] = []
         frame_idx = processed_count = 0
-        self.ball_trajectory = []
-        # Reset pass detection state so a re-run doesn't inherit stale
-        # owners from a previous video.
-        self._prev_ball_owner_tid = None
-        self._prev_ball_owner_team = None
-        self._prev_ball_owner_pitch = None
-        self._prev_ball_pitch = None
-        self._pass_flash_counter = 0
-        self._last_pass_info = {}
-        # Reset the smoothed defending-side estimate so a re-run starts fresh.
-        self._team_x_ema = {0: None, 1: None}
         try:
             while True:
                 ret, frame = cap.read()
@@ -848,8 +1189,82 @@ class KeypointPipeline:
                 if frame_idx % process_every_n != 0:
                     frame_idx += 1
                     continue
-                result = self.process_frame(frame, frame_idx)
+                record = self._analyze_frame_for_sequence(frame, frame_idx)
+                frame_records.append(record)
+                if stabilizer is not None:
+                    features = record.get('team_features') or {}
+                    stabilizer.add_frame_observations(
+                        frame_idx=frame_idx,
+                        track_ids=record.get('track_ids', np.empty((0,), dtype=np.int32)),
+                        player_xyxy=record.get('player_xyxy', np.empty((0, 4), dtype=np.float32)),
+                        player_conf=record.get('player_conf', np.empty((0,), dtype=np.float32)),
+                        features=features.get('features'),
+                        jersey_bgr=features.get('jersey_bgr'),
+                        weights=features.get('weights'),
+                        player_pitch_pts=record.get('player_pitch_pts'),
+                    )
                 processed_count += 1
+                yield {
+                    'phase': 'analysis',
+                    'frame_idx': frame_idx,
+                    'processed_count': processed_count,
+                    'total_frames': expected_count or processed_count,
+                    'progress_pct': min(50.0, 50.0 * processed_count / expected_for_progress),
+                }
+                frame_idx += 1
+        finally:
+            cap.release()
+
+        if stabilizer is not None:
+            assignments = stabilizer.fit()
+            frame_team_infos = []
+            for record in frame_records:
+                team_info = assignments.team_info_for_frame(record.get('track_ids', np.empty((0,), dtype=np.int32)))
+                frame_team_infos.append(team_info)
+                record['team_info'] = team_info
+            assignments.diagnostics['validation'] = validate_frame_team_infos(frame_team_infos)
+            for team_info in frame_team_infos:
+                team_info['stabilizer_diagnostics'] = assignments.diagnostics
+            stabilizer_report = assignments.diagnostics
+        else:
+            for record in frame_records:
+                record['team_info'] = None
+            stabilizer_report = None
+
+        yield {
+            'phase': 'stabilizing',
+            'processed_count': processed_count,
+            'total_frames': expected_count or processed_count,
+            'progress_pct': 50.0,
+            'stabilizer_report': stabilizer_report,
+        }
+
+        cap_render = cv2.VideoCapture(source_video_path)
+        if not cap_render.isOpened():
+            raise RuntimeError(f"Could not reopen video for rendering: {source_video_path}")
+        if start_frame > 0:
+            cap_render.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+        pw = Director.make_video_writer(paths["pitch"], actual_fps, (CANVAS_W, CANVAS_H))
+        aw = Director.make_video_writer(paths["annotated"], actual_fps, (frame_w, frame_h))
+        dw = Director.make_video_writer(paths["deep"], actual_fps, (frame_w, frame_h))
+        fw = Director.make_video_writer(paths["draft"], actual_fps, (frame_w, frame_h))
+        kw = Director.make_video_writer(paths["keypoint"], actual_fps, (frame_w, frame_h))
+
+        self._reset_video_state(reset_team_analyzer=False, reset_homography=False)
+        frame_idx = rendered_count = record_idx = 0
+        try:
+            while record_idx < len(frame_records):
+                ret, frame = cap_render.read()
+                if not ret or frame is None:
+                    break
+                if frame_idx % process_every_n != 0:
+                    frame_idx += 1
+                    continue
+                record = frame_records[record_idx]
+                result = self._render_frame_from_record(frame, record, record.get('team_info'))
+                result['stabilizer_report'] = stabilizer_report
+                result['progress_pct'] = min(100.0, 50.0 + 50.0 * (rendered_count + 1) / max(len(frame_records), 1))
                 if result['pitch_canvas'] is not None:
                     pw.write(result['pitch_canvas'])
                 if result['annotated_frame'] is not None:
@@ -858,20 +1273,12 @@ class KeypointPipeline:
                     dw.write(result['deep_analysis_frame'])
                 kpts = result.get('keypoints_used', [])
                 kw.write(self._draw_keypoints_on_frame(frame.copy(), kpts))
-                if result['pitch_canvas'] is not None:
-                    pip_w, pip_h = frame_w // 4, int((frame_w // 4) * CANVAS_H / CANVAS_W)
-                    pip = cv2.resize(result['pitch_canvas'], (pip_w, pip_h))
-                    ox, oy = frame_w - pip_w - 15, frame_h - pip_h - 15
-                    draft = frame.copy()
-                    ov = draft.copy()
-                    cv2.rectangle(ov, (ox - 5, oy - 5), (ox + pip_w + 5, oy + pip_h + 5), (0, 0, 0), -1)
-                    cv2.addWeighted(ov, 0.4, draft, 0.6, 0, draft)
-                    draft[oy:oy + pip_h, ox:ox + pip_w] = pip
-                    cv2.rectangle(draft, (ox - 2, oy - 2), (ox + pip_w + 2, oy + pip_h + 2), (255, 255, 255), 2)
-                    fw.write(draft)
+                self._write_draft_frame(fw, frame, result.get('pitch_canvas'), frame_w, frame_h)
+                rendered_count += 1
+                record_idx += 1
                 yield result
                 frame_idx += 1
         finally:
-            cap.release()
+            cap_render.release()
             for w in [pw, aw, dw, fw, kw]:
                 w.release()

@@ -12,6 +12,15 @@ SMOOTHING_ALPHA = 0.4       # EMA factor (0=no update, 1=instant). Lower = smoot
 H_STABILITY_THRESHOLD = 0.15  # Max relative change (Frobenius norm) to accept new H
 
 # Team color analysis
+TEAM0 = 0
+TEAM1 = 1
+NO_TEAM = -1
+
+ROLE_UNKNOWN = -1
+ROLE_OUTFIELD = 0
+ROLE_GK = 1
+ROLE_REF = 2
+
 TEAM_N_CLUSTERS = 2           # Number of teams to cluster (usually 2)
 TEAM_JERSEY_Y_START = 0.12   # Top of jersey crop as fraction of bbox height (12% from top, avoids head)
 TEAM_JERSEY_Y_END = 0.50     # Bottom of jersey crop as fraction of bbox height (50% from top, avoids shorts)

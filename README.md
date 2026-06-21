@@ -3,7 +3,7 @@
 **PitchSense** is a football (soccer) video analysis pipeline that processes tactical/broadcast footage to produce:
 
 - **Keypoint detection** → pitch registration via homography
-- **Player detection & tracking** → ByteTrack + team color clustering
+- **Player detection & tracking** → ByteTrack + full-sequence team stabilization
 - **Ball detection** → dedicated YOLO model + trajectory trail
 - **Pitch segmentation** → region overlay (penalty areas, center circle, etc.)
 - **Top-down pitch map** → projected player + ball positions with trail
@@ -76,7 +76,8 @@ All source files are in [`app/`](app/). The pipeline flows through these modules
     │
     ├── player_service.PlayerDetector
     │       └── YOLO detection + ByteTrack → bboxes → bottom-center → project via H
-    │       └── team_analyzer.TeamColorAnalyzer → K-means on HSV jersey colors
+    │       └── team_analyzer.TeamColorAnalyzer → robust kit feature extraction
+    │       └── team_stabilizer.TeamSequenceStabilizer → stable identity/team/role labels
     │
     ├── ball_service.BallDetector
     │       └── YOLO ball model → bbox → bottom-center → project via H → trajectory
@@ -84,8 +85,9 @@ All source files are in [`app/`](app/). The pipeline flows through these modules
     ├── pitch.PitchArtist
     │       └── Draw top-down pitch canvas with players, ball, trail, legend
     │
-    └── keypoint_pipeline.KeypointPipeline.process_frame()
-            └── Orchestrates all of the above → returns dict with 5 output frames
+    └── keypoint_pipeline.KeypointPipeline.process_video()
+            └── Pass 1: inference + compact metadata
+            └── Pass 2: stabilized rendering + 5 output videos
 ```
 
 ### Output Videos
@@ -102,20 +104,21 @@ All source files are in [`app/`](app/). The pipeline flows through these modules
 
 ## File Overview
 
-| File | Lines | Purpose |
-|------|-------|---------|
-| [`streamlit_app.py`](app/streamlit_app.py) | 744 | Streamlit UI (Processing, Analytics, Game Analysis tabs) |
-| [`keypoint_pipeline.py`](app/keypoint_pipeline.py) | 261 | Core pipeline orchestrator per-frame + video writer |
-| [`game_analyzer.py`](app/game_analyzer.py) | 290 | Possession, heatmaps, formation, territory, match stats |
-| [`team_analyzer.py`](app/team_analyzer.py) | 613 | K-means HSV color clustering for team assignment |
-| [`keypoint_service.py`](app/keypoint_service.py) | 149 | YOLO-Pose → homography (DLT + EMA smoothing) |
-| [`pitch.py`](app/pitch.py) | 306 | Top-down pitch canvas drawing (lines, players, ball, trail) |
-| [`ball_service.py`](app/ball_service.py) | 126 | Ball detection + pitch projection |
-| [`segmentation.py`](app/segmentation.py) | 100 | YOLO-seg → quad extraction for pitch regions |
-| [`seg_helpers.py`](app/seg_helpers.py) | 125 | Canvas coordinate mapping for segmentation regions |
-| [`player_service.py`](app/player_service.py) | 89 | YOLO player detection + ByteTrack + projection |
-| [`constants.py`](app/constants.py) | 80 | All configurable constants (thresholds, geometry, colors) |
-| [`director.py`](app/director.py) | 11 | H.264 video writer factory |
+| File | Purpose |
+|------|---------|
+| [`streamlit_app.py`](app/streamlit_app.py) | Streamlit UI (Processing, Match Centre, Pitch Analysis, Outputs) |
+| [`keypoint_pipeline.py`](app/keypoint_pipeline.py) | Core pipeline orchestrator, two-pass video processing, rendering, video writers |
+| [`team_stabilizer.py`](app/team_stabilizer.py) | Sequence-level identity linking, stable team membership, role assignment, diagnostics |
+| [`game_analyzer.py`](app/game_analyzer.py) | Possession, heatmaps, formation, territory, match stats, player profiles |
+| [`team_analyzer.py`](app/team_analyzer.py) | Robust jersey/shorts feature extraction and best-effort online fallback |
+| [`keypoint_service.py`](app/keypoint_service.py) | YOLO-Pose → homography (DLT + EMA smoothing) |
+| [`pitch.py`](app/pitch.py) | Top-down pitch canvas drawing (lines, players, ball, trail) |
+| [`ball_service.py`](app/ball_service.py) | Ball detection + pitch projection |
+| [`segmentation.py`](app/segmentation.py) | YOLO-seg → quad extraction for pitch regions |
+| [`seg_helpers.py`](app/seg_helpers.py) | Canvas coordinate mapping for segmentation regions |
+| [`player_service.py`](app/player_service.py) | YOLO player detection + ByteTrack + projection |
+| [`constants.py`](app/constants.py) | Configurable thresholds, geometry, colors, team/role schema constants |
+| [`director.py`](app/director.py) | H.264 video writer factory |
 
 ---
 
@@ -150,11 +153,18 @@ Collected during processing for the Game Analysis tab:
 {
     "frame_idx": int,
     "player_positions": np.ndarray  # (N, 2) pitch-coordinates in meters
-    "team_ids": np.ndarray          # (N,) int: 0=Team1, 1=Team2, -1=GK, -2=Ref
+    "track_ids": np.ndarray         # (N,) raw ByteTrack IDs
+    "identity_ids": np.ndarray      # (N,) canonical full-sequence identity IDs
+    "team_ids": np.ndarray          # (N,) int: 0=Team1, 1=Team2, -1=NO_TEAM
+    "role_ids": np.ndarray          # (N,) int: 0=Outfield, 1=GK, 2=Ref, -1=Unknown
     "ball_position": np.ndarray    # (2,) or None — ball pitch-coordinate
     "player_conf": np.ndarray      # (N,) detection confidences
 }
 ```
+
+`team_ids` now represents actual team membership only. Goalkeepers keep their team membership (`0` or `1`) and are identified by `role_ids == 1`. Referees/unknowns use `team_ids == -1` and `role_ids == 2` or `-1`.
+
+Full-video processing uses a two-pass stabilizer. The zero-switch guarantee applies to `KeypointPipeline.process_video()`, where each canonical `identity_id` receives one stable team assignment for the whole sequence. `process_frame()` remains available as best-effort online behavior.
 
 ---
 
@@ -166,7 +176,7 @@ Collected during processing for the Game Analysis tab:
 - Raw frame-by-frame JSON export
 
 **Game Analysis tab:**
-- Ball possession % (proximity-based, GKs excluded)
+- Ball possession % (bbox/proximity-based; GKs are team members, refs are excluded)
 - Player density heatmaps (per team on pitch outline)
 - Formation scatter + defensive depth metrics
 - 9-zone territory control grid

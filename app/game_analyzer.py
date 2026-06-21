@@ -19,6 +19,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from typing import List, Tuple, Optional, Dict, Any
 from constants import (
+    TEAM0, TEAM1, NO_TEAM,
+    ROLE_UNKNOWN, ROLE_OUTFIELD, ROLE_GK, ROLE_REF,
     PITCH_LENGTH, PITCH_WIDTH, CENTER_X, CENTER_Y, CENTER_CIRCLE_RADIUS,
     PENALTY_AREA_DEPTH, PENALTY_AREA_WIDTH, GOAL_AREA_DEPTH, GOAL_AREA_WIDTH,
     PENALTY_SPOT_DISTANCE, PENALTY_ARC_RADIUS,
@@ -35,12 +37,6 @@ ZONE_NAMES = [
     ["Def Cent",  "Mid Cent",  "Att Cent"],
     ["Def Right", "Mid Right", "Att Right"],
 ]
-
-# Class labels (kept in sync with team_analyzer.TeamColorAnalyzer)
-TEAM0 = 0
-TEAM1 = 1
-GK = -1
-REF = -2
 
 # Smoothing factor for the registry's own EMA of per-track quality
 TRACK_QUALITY_REGISTRY_EMA = 0.3
@@ -66,13 +62,16 @@ MAX_BALL_LOST_CARRY_FRAMES = 30
 class TrackRecord:
     """Canonical per-track summary built once from a full game_data list."""
     track_id: int
-    team_votes: Dict[int, int] = field(default_factory=lambda: {TEAM0: 0, TEAM1: 0, GK: 0, REF: 0})
+    team_votes: Dict[int, int] = field(default_factory=lambda: {TEAM0: 0, TEAM1: 0, NO_TEAM: 0})
+    role_votes: Dict[int, int] = field(default_factory=lambda: {ROLE_OUTFIELD: 0, ROLE_GK: 0, ROLE_REF: 0, ROLE_UNKNOWN: 0})
     positions: List[Tuple[float, float]] = field(default_factory=list)
     frame_indices: List[int] = field(default_factory=list)
     team_ids_seen: List[int] = field(default_factory=list)
+    role_ids_seen: List[int] = field(default_factory=list)
     qualities: List[float] = field(default_factory=list)
     frames_seen: int = 0
-    canonical_team: int = GK  # resolved after build
+    canonical_team: int = NO_TEAM  # resolved after build
+    canonical_role: int = ROLE_UNKNOWN  # resolved after build
     canonical_quality: float = 0.0  # registry-aggregated quality in [0, 1]
 
 
@@ -85,7 +84,11 @@ class GameRegistry:
 
     def canonical_team(self, track_id: int) -> int:
         rec = self.tracks.get(track_id)
-        return rec.canonical_team if rec is not None else GK
+        return rec.canonical_team if rec is not None else NO_TEAM
+
+    def canonical_role(self, track_id: int) -> int:
+        rec = self.tracks.get(track_id)
+        return rec.canonical_role if rec is not None else ROLE_UNKNOWN
 
     def canonical_quality(self, track_id: int) -> float:
         rec = self.tracks.get(track_id)
@@ -102,6 +105,40 @@ class GameAnalyzer:
     # Tier 0: canonical track registry
     # ------------------------------------------------------------------
     @staticmethod
+    def _ids_for_entry(entry: dict):
+        ids = entry.get("identity_ids")
+        if ids is not None and len(ids) > 0:
+            return ids
+        return entry.get("track_ids")
+
+    @staticmethod
+    def _normalise_team_role_arrays(entry: dict, n: int) -> Tuple[np.ndarray, np.ndarray]:
+        team_ids_raw = entry.get("team_ids")
+        role_ids_raw = entry.get("role_ids")
+        if team_ids_raw is None or len(team_ids_raw) != n:
+            team_ids = np.full(n, NO_TEAM, dtype=np.int32)
+        else:
+            raw = np.asarray(team_ids_raw, dtype=np.int32)
+            team_ids = np.full(n, NO_TEAM, dtype=np.int32)
+            team_ids[(raw == TEAM0) | (raw == TEAM1)] = raw[(raw == TEAM0) | (raw == TEAM1)]
+
+        if role_ids_raw is not None and len(role_ids_raw) == n:
+            role_ids = np.asarray(role_ids_raw, dtype=np.int32)
+            valid_roles = ((role_ids == ROLE_OUTFIELD) | (role_ids == ROLE_GK)
+                           | (role_ids == ROLE_REF) | (role_ids == ROLE_UNKNOWN))
+            role_ids = np.where(valid_roles, role_ids, ROLE_UNKNOWN).astype(np.int32)
+        elif team_ids_raw is not None and len(team_ids_raw) == n:
+            # Legacy schema: -1 meant GK and -2 meant REF in team_ids.
+            raw = np.asarray(team_ids_raw, dtype=np.int32)
+            role_ids = np.full(n, ROLE_UNKNOWN, dtype=np.int32)
+            role_ids[(raw == TEAM0) | (raw == TEAM1)] = ROLE_OUTFIELD
+            role_ids[raw == -1] = ROLE_GK
+            role_ids[raw == -2] = ROLE_REF
+        else:
+            role_ids = np.full(n, ROLE_UNKNOWN, dtype=np.int32)
+        return team_ids, role_ids
+
+    @staticmethod
     def build_registry(game_data: List[dict]) -> GameRegistry:
         """Scan every per-frame entry and assemble one TrackRecord per ByteTrack id.
 
@@ -115,7 +152,7 @@ class GameAnalyzer:
         has_track_quality = False
 
         for entry in game_data:
-            tids = entry.get("track_ids")
+            tids = GameAnalyzer._ids_for_entry(entry)
             if tids is None:
                 continue
             tids = np.asarray(tids)
@@ -123,13 +160,7 @@ class GameAnalyzer:
                 continue
             has_track_ids = True
 
-            team_ids_raw = entry.get("team_ids")
-            if team_ids_raw is None:
-                team_ids_raw = np.full(len(tids), GK, dtype=np.int32)
-            else:
-                team_ids_raw = np.asarray(team_ids_raw)
-                if len(team_ids_raw) != len(tids):
-                    team_ids_raw = np.full(len(tids), GK, dtype=np.int32)
+            team_ids_raw, role_ids_raw = GameAnalyzer._normalise_team_role_arrays(entry, len(tids))
 
             positions = entry.get("player_positions")
             if positions is None or len(positions) != len(tids):
@@ -153,7 +184,7 @@ class GameAnalyzer:
                         has_track_quality = True
 
             frame_idx = int(entry.get("frame_idx", 0))
-            for tid, team_label, pos, q in zip(tids, team_ids_raw, pos_iter, qual_iter):
+            for tid, team_label, role_label, pos, q in zip(tids, team_ids_raw, role_ids_raw, pos_iter, qual_iter):
                 rec = tracks.get(int(tid))
                 if rec is None:
                     rec = TrackRecord(track_id=int(tid))
@@ -162,12 +193,15 @@ class GameAnalyzer:
                 rec.frame_indices.append(frame_idx)
                 rec.positions.append(pos)
                 rec.team_ids_seen.append(int(team_label))
+                rec.role_ids_seen.append(int(role_label))
                 rec.qualities.append(q)
                 rec.team_votes[int(team_label)] = rec.team_votes.get(int(team_label), 0) + 1
+                rec.role_votes[int(role_label)] = rec.role_votes.get(int(role_label), 0) + 1
 
         # Resolve canonical team + quality for each record
         for rec in tracks.values():
             rec.canonical_team = GameAnalyzer._resolve_majority_team(rec.team_votes, rec.frames_seen)
+            rec.canonical_role = GameAnalyzer._resolve_majority_role(rec.role_votes, rec.frames_seen)
             rec.canonical_quality = GameAnalyzer._aggregate_quality(rec.qualities)
 
         return GameRegistry(tracks=tracks, has_track_ids=has_track_ids, has_track_quality=has_track_quality)
@@ -176,15 +210,24 @@ class GameAnalyzer:
     def _resolve_majority_team(votes: Dict[int, int], frames_seen: int) -> int:
         """Pick the team that a track was on for the majority of its lifetime.
 
-        Falls back to GK if no team ever won a vote (degenerate / empty).
+        Falls back to NO_TEAM if no actual team ever won a vote.
         """
         if frames_seen <= 0 or not votes:
-            return GK
-        # Filter to positive votes
+            return NO_TEAM
+        positive = {k: v for k, v in votes.items() if k in (TEAM0, TEAM1) and v > 0}
+        if not positive:
+            return NO_TEAM
+        return int(max(positive.items(), key=lambda kv: kv[1])[0])
+
+    @staticmethod
+    def _resolve_majority_role(votes: Dict[int, int], frames_seen: int) -> int:
+        if frames_seen <= 0 or not votes:
+            return ROLE_UNKNOWN
         positive = {k: v for k, v in votes.items() if v > 0}
         if not positive:
-            return GK
-        return int(max(positive.items(), key=lambda kv: kv[1])[0])
+            return ROLE_UNKNOWN
+        priority = {ROLE_REF: 3, ROLE_GK: 2, ROLE_OUTFIELD: 1, ROLE_UNKNOWN: 0}
+        return int(max(positive.items(), key=lambda kv: (kv[1], priority.get(kv[0], 0)))[0])
 
     @staticmethod
     def _aggregate_quality(qualities: List[float]) -> float:
@@ -205,9 +248,9 @@ class GameAnalyzer:
         team_ids = entry.get("team_ids")
         if positions is None or team_ids is None:
             return None, None, None, None
-        team_ids = np.asarray(team_ids)
         positions = np.asarray(positions)
-        valid = team_ids >= 0
+        team_ids, role_ids = GameAnalyzer._normalise_team_role_arrays(entry, len(positions))
+        valid = ((team_ids == TEAM0) | (team_ids == TEAM1)) & (role_ids != ROLE_REF)
         if not np.any(valid):
             return None, None, None, None
         valid_pos = positions[valid]
@@ -263,7 +306,7 @@ class GameAnalyzer:
             return bbox_owner
 
         # Legacy fallback: pitch-distance nearest
-        tids = entry.get("track_ids")
+        tids = GameAnalyzer._ids_for_entry(entry)
         positions = entry.get("player_positions")
         team_ids_raw = entry.get("team_ids")
 
@@ -322,8 +365,8 @@ class GameAnalyzer:
             return None
         if team_ids is None or len(team_ids) == 0:
             return None
-        team_ids = np.asarray(team_ids)
         n = min(len(player_xyxy), len(team_ids))
+        team_ids, role_ids = GameAnalyzer._normalise_team_role_arrays(entry, n)
         bx1 = float(ball_xyxy[0, 0]); by1 = float(ball_xyxy[0, 1])
         bx2 = float(ball_xyxy[0, 2]); by2 = float(ball_xyxy[0, 3])
         cx = (bx1 + bx2) / 2.0
@@ -332,7 +375,7 @@ class GameAnalyzer:
         best_score = 0.0
         for i in range(n):
             t = int(team_ids[i])
-            if t not in (TEAM0, TEAM1):
+            if t not in (TEAM0, TEAM1) or int(role_ids[i]) == ROLE_REF:
                 continue
             px1 = float(player_xyxy[i, 0]); py1 = float(player_xyxy[i, 1])
             px2 = float(player_xyxy[i, 2]); py2 = float(player_xyxy[i, 3])
@@ -445,7 +488,7 @@ class GameAnalyzer:
         if registry.has_track_ids:
             # One sample per track per frame, weighted by canonical_quality
             for entry in game_data:
-                tids = entry.get("track_ids")
+                tids = GameAnalyzer._ids_for_entry(entry)
                 positions = entry.get("player_positions")
                 if tids is None or positions is None:
                     continue
@@ -600,7 +643,7 @@ class GameAnalyzer:
         t1_axis = GameAnalyzer._depth_axis_for(t1_dir)
         t2_axis = GameAnalyzer._depth_axis_for(t2_dir)
         for entry in game_data:
-            tids = entry.get("track_ids")
+            tids = GameAnalyzer._ids_for_entry(entry)
             positions = entry.get("player_positions")
             if tids is None or positions is None or len(tids) == 0:
                 continue
@@ -656,7 +699,7 @@ class GameAnalyzer:
         step = max(1, len(game_data) // max_frames)
         for entry in game_data[::step]:
             if registry.has_track_ids:
-                tids = entry.get("track_ids")
+                tids = GameAnalyzer._ids_for_entry(entry)
                 positions = entry.get("player_positions")
                 if tids is None or positions is None:
                     continue
@@ -698,7 +741,7 @@ class GameAnalyzer:
 
         if registry.has_track_ids:
             for entry in game_data:
-                tids = entry.get("track_ids")
+                tids = GameAnalyzer._ids_for_entry(entry)
                 positions = entry.get("player_positions")
                 if tids is None or positions is None:
                     continue
@@ -721,10 +764,9 @@ class GameAnalyzer:
                         counts[row][col]["t2"] += 1
         else:
             for entry in game_data:
-                _, valid_tid, t1, t2 = GameAnalyzer._split_teams(entry)
+                positions, valid_tid, t1, t2 = GameAnalyzer._split_teams(entry)
                 if valid_tid is None:
                     continue
-                positions = np.asarray(entry["player_positions"])[np.asarray(entry["team_ids"]) >= 0]
                 for i in range(len(positions)):
                     x, y = positions[i]
                     col = min(np.searchsorted(ZONE_X_EDGES[1:], x, side="right"), 2)
@@ -807,7 +849,7 @@ class GameAnalyzer:
         per_track_frames: Dict[int, int] = {}
 
         for entry in game_data:
-            tids = entry.get("track_ids")
+            tids = GameAnalyzer._ids_for_entry(entry)
             positions = entry.get("player_positions")
             if tids is None or positions is None or len(tids) == 0:
                 t1_counts.append(0)
@@ -836,6 +878,8 @@ class GameAnalyzer:
                     tid_i = int(tid)
                     rec = registry.tracks.get(tid_i)
                     if rec is None:
+                        continue
+                    if rec.canonical_team not in (TEAM0, TEAM1):
                         continue
                     prev = getattr(rec, "_last_pos", None)
                     pt = np.asarray(positions[i], dtype=np.float32)
@@ -905,7 +949,7 @@ class GameAnalyzer:
             ball = entry.get("ball_position")
             if ball is None:
                 continue
-            tids = entry.get("track_ids")
+            tids = GameAnalyzer._ids_for_entry(entry)
             positions = entry.get("player_positions")
             if tids is None or positions is None or len(tids) == 0:
                 continue
@@ -1266,7 +1310,9 @@ class GameAnalyzer:
             for rec in registry.tracks.values():
                 if rec.canonical_team != team:
                     continue
-                gk_votes = rec.team_votes.get(GK, 0)
+                gk_votes = rec.role_votes.get(ROLE_GK, 0)
+                if rec.canonical_role == ROLE_GK:
+                    gk_votes = max(gk_votes, rec.frames_seen)
                 if gk_votes <= 0:
                     continue
                 box = GameAnalyzer._gk_box_stats(rec)
@@ -1432,6 +1478,7 @@ class GameAnalyzer:
             profiles.append({
                 "track_id": int(tid),
                 "team": int(rec.canonical_team),
+                "role": int(rec.canonical_role),
                 "frames": int(rec.frames_seen),
                 "seconds_seen": round(seconds_seen, 1),
                 "distance_m": round(distance, 1),
@@ -1513,8 +1560,8 @@ class GameAnalyzer:
             if ev is None:
                 continue
             used_bbox_events = True
-            a = int(ev.get("from_tid"))
-            b = int(ev.get("to_tid"))
+            a = int(ev.get("from_identity_id", ev.get("from_tid")))
+            b = int(ev.get("to_identity_id", ev.get("to_tid")))
             if a == b:
                 continue
             edge_counts[(a, b)] = edge_counts.get((a, b), 0) + 1
@@ -1526,7 +1573,7 @@ class GameAnalyzer:
                 ball = entry.get("ball_position")
                 if ball is None:
                     continue
-                tids = entry.get("track_ids")
+                tids = GameAnalyzer._ids_for_entry(entry)
                 positions = entry.get("player_positions")
                 if tids is None or positions is None or len(tids) == 0:
                     continue
@@ -1643,7 +1690,7 @@ class GameAnalyzer:
 
         for entry in game_data:
             ball = entry.get("ball_position")
-            tids = entry.get("track_ids")
+            tids = GameAnalyzer._ids_for_entry(entry)
             positions = entry.get("player_positions")
             fi = int(entry.get("frame_idx", len(x_axis) + 1))
             x_axis.append(fi)
@@ -1728,10 +1775,10 @@ class GameAnalyzer:
         # Pre-compute which tracks belong to each team and exclude their GK.
         gk_for_team: dict = {}
         for tid, rec in registry.tracks.items():
-            if rec.canonical_team in (TEAM0, TEAM1) and rec.team_votes.get(GK, 0) > 0:
+            if rec.canonical_team in (TEAM0, TEAM1) and rec.role_votes.get(ROLE_GK, 0) > 0:
                 # Pick the track with most GK votes per team
                 cur = gk_for_team.get(("gk", rec.canonical_team))
-                if cur is None or rec.team_votes[GK] > registry.tracks[cur].team_votes.get(GK, 0):
+                if cur is None or rec.role_votes.get(ROLE_GK, 0) > registry.tracks[cur].role_votes.get(ROLE_GK, 0):
                     gk_for_team[("gk", rec.canonical_team)] = tid
 
         def _gk_track_id(team: int) -> Optional[int]:
@@ -1747,7 +1794,7 @@ class GameAnalyzer:
         t2_series: list[Optional[float]] = []
 
         for entry in game_data:
-            tids = entry.get("track_ids")
+            tids = GameAnalyzer._ids_for_entry(entry)
             positions = entry.get("player_positions")
             fi = int(entry.get("frame_idx", len(x_axis) + 1))
             x_axis.append(fi)
@@ -1760,6 +1807,8 @@ class GameAnalyzer:
             for i, tid in enumerate(tids):
                 rec = registry.tracks.get(int(tid))
                 if rec is None:
+                    continue
+                if rec.canonical_role in (ROLE_GK, ROLE_REF):
                     continue
                 if rec.canonical_team == TEAM0 and int(tid) != t1_gk:
                     t1_xs.append(float(positions[i][0]))
@@ -2004,7 +2053,7 @@ class GameAnalyzer:
         n_frames = 0
 
         for entry in game_data:
-            tids = entry.get("track_ids")
+            tids = GameAnalyzer._ids_for_entry(entry)
             positions = entry.get("player_positions")
             if tids is None or positions is None or len(tids) == 0:
                 continue
@@ -2020,10 +2069,11 @@ class GameAnalyzer:
                 if not (-5 <= px <= PITCH_LENGTH + 5 and -5 <= py <= PITCH_WIDTH + 5):
                     continue
                 d = np.sqrt((Xc - px) ** 2 + (Yc - py) ** 2)
-                any_player = True
                 if rec.canonical_team == TEAM0:
+                    any_player = True
                     t1_best = np.minimum(t1_best, d)
                 elif rec.canonical_team == TEAM1:
+                    any_player = True
                     t2_best = np.minimum(t2_best, d)
             if not any_player:
                 continue
@@ -2148,4 +2198,3 @@ def _emit_set_piece(events: list, xs: list, ys: list, frame_idx: int) -> None:
         "frame_idx": int(frame_idx), "type": "other",
         "x": round(cx, 2), "y": round(cy, 2),
     })
-

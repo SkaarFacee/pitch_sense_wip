@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import sys
 import re
+import json
 from pathlib import Path
 from collections import Counter
 
@@ -156,6 +157,8 @@ if "scrubber_min_total" not in st.session_state:
     st.session_state.scrubber_min_total = 0
 if "scrubber_fps" not in st.session_state:
     st.session_state.scrubber_fps = 30.0
+if "stabilizer_report" not in st.session_state:
+    st.session_state.stabilizer_report = None
 
 # Inject theme CSS (re-injected every rerun)
 st.markdown(ui.inject_css(st.session_state.theme), unsafe_allow_html=True)
@@ -315,6 +318,14 @@ with st.sidebar:
                                     help="Mirror the long axis of the pitch if the camera is behind the opposite goal.")
     flip_projection_y = st.checkbox("Flip projection (Y — short axis)", value=True,
                                     help="Mirror the short axis if the ball/players appear on the wrong side of the top-down pitch canvas.")
+    with st.expander("Advanced team calibration", expanded=False):
+        team_calibration_text = st.text_area(
+            "Calibration / overrides JSON",
+            value="",
+            height=120,
+            placeholder='{"team1_bgr": [255, 0, 0], "team2_bgr": [0, 0, 255], "track_role_overrides": {"12": "gk"}}',
+            help="Optional BGR seed colours and track/identity team or role overrides. Leave blank for automatic stabilization.",
+        )
 
 
 palette = ui.palette(st.session_state.theme)
@@ -489,7 +500,17 @@ with tab_processing:
     if process_btn:
         st.session_state.analytics_data = []
         st.session_state.game_data = []
+        st.session_state.stabilizer_report = None
+        st.session_state.ball_owner_map = None
         st.session_state.processing_done = False
+
+        team_calibration = None
+        if team_calibration_text.strip():
+            try:
+                team_calibration = json.loads(team_calibration_text)
+            except Exception as exc:
+                st.error(f"Invalid calibration JSON: {exc}")
+                st.stop()
 
         safe_stem = "".join(c if c.isalnum() or c in " _-" else "_" for c in Path(selected_path).stem)
         output_dir = OUTPUT_BASE / f"processed_{safe_stem}"
@@ -540,16 +561,43 @@ with tab_processing:
 
             processed = 0
             ball_count = 0
+            stabilizer_report = None
             for result in pipeline.process_video(
                 source_video_path=selected_path,
                 output_dir=str(output_dir),
                 start_frame=0,
                 max_frames=max_frames if max_frames > 0 else None,
+                team_calibration=team_calibration,
             ):
+                phase = result.get("phase", "render")
+                if phase != "render":
+                    phase_label = "Analysing" if phase == "analysis" else "Stabilising Teams"
+                    phase_sub = "First pass: model inference and feature extraction" if phase == "analysis" else "Resolving stable identities, teams, and roles"
+                    pct = float(result.get("progress_pct", 0.0))
+                    phase_count = int(result.get("processed_count", processed))
+                    stabilizer_report = result.get("stabilizer_report") or stabilizer_report
+                    if phase_count % 2 == 0 or phase != "analysis":
+                        ring_slot.markdown(
+                            ui.ring_html(
+                                pct=pct,
+                                label=phase_label,
+                                sublabel=phase_sub,
+                                stat_pairs=[
+                                    ("Frames", f"{phase_count:,} / {total_frames:,}"),
+                                    ("Ball Detections", f"{ball_count:,}"),
+                                    ("Players/Frame", "—"),
+                                    ("Phase", phase_label),
+                                ],
+                            ),
+                            unsafe_allow_html=True,
+                        )
+                    continue
+
                 processed += 1
                 has_ball = len(result.get("ball_xyxy", [])) > 0
                 if has_ball:
                     ball_count += 1
+                stabilizer_report = result.get("stabilizer_report") or stabilizer_report
 
                 segs = result.get("processed_segments", [])
                 if segs:
@@ -564,6 +612,8 @@ with tab_processing:
 
                 team_info = result.get("team_info")
                 team_ids = team_info.get("team_ids") if team_info else None
+                role_ids = team_info.get("role_ids") if team_info else None
+                identity_ids = team_info.get("identity_ids") if team_info else None
                 track_ids = result.get("track_ids", np.empty((0,), dtype=np.int32))
                 track_quality = team_info.get("track_quality") if team_info else None
                 team1_bgr = team_info.get("team1_bgr") if team_info else None
@@ -573,6 +623,8 @@ with tab_processing:
                     "player_positions": result.get("player_pitch_pts", np.empty((0, 2))),
                     "player_xyxy": result.get("player_xyxy", np.empty((0, 4))),
                     "team_ids": team_ids,
+                    "role_ids": role_ids,
+                    "identity_ids": identity_ids,
                     "track_ids": track_ids,
                     "track_quality": track_quality,
                     "team1_bgr": team1_bgr,
@@ -583,7 +635,7 @@ with tab_processing:
                     "pass_event": result.get("pass_event"),
                 })
 
-                pct = (processed / max(total_frames, 1)) * 100
+                pct = float(result.get("progress_pct", (processed / max(total_frames, 1)) * 100))
                 h_mode = result.get("H_info", {}).get("mode", "N/A")
                 n_players = int(len(result.get("player_pitch_pts", [])))
 
@@ -592,8 +644,8 @@ with tab_processing:
                     ring_slot.markdown(
                         ui.ring_html(
                             pct=pct,
-                            label="Processing",
-                            sublabel=f"Frame <b>{processed:,}</b> of <b>{total_frames:,}</b> · "
+                            label="Rendering",
+                            sublabel=f"Final labels · frame <b>{processed:,}</b> of <b>{total_frames:,}</b> · "
                                      f"{'⚽ ball in view' if has_ball else 'no ball this frame'}",
                             stat_pairs=[
                                 ("Frames", f"{processed:,} / {total_frames:,}"),
@@ -621,7 +673,18 @@ with tab_processing:
                 unsafe_allow_html=True,
             )
             st.session_state.processing_done = True
+            st.session_state.stabilizer_report = stabilizer_report
             st.success("Processing finished — open **Match Centre**, **Pitch Analysis**, or **Outputs**.")
+            if stabilizer_report:
+                validation = stabilizer_report.get("validation", {})
+                status = "passed" if validation.get("ok", False) else "failed"
+                st.info(
+                    f"Team stabilizer {status}: "
+                    f"{stabilizer_report.get('identity_count', 0)} identities, "
+                    f"{len(stabilizer_report.get('linked_fragments', []))} linked fragments, "
+                    f"{len(stabilizer_report.get('goalkeeper_identities', []))} GKs, "
+                    f"{len(stabilizer_report.get('referee_identities', []))} referees."
+                )
             st.balloons()
         except Exception as e:
             st.error(f"Processing failed: {e}")
