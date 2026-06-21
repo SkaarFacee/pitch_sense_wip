@@ -305,7 +305,8 @@ class KeypointPipeline:
             deep_analysis_frame = self._draw_team_bboxes(deep_analysis_frame, player_xyxy,
                                                        team_info['team_colors'],
                                                        player_conf=player_conf,
-                                                       team_ids=team_info['team_ids'])
+                                                       team_ids=team_info['team_ids'],
+                                                       track_ids=track_ids)
         if len(ball_xyxy) > 0:
             deep_analysis_frame = self._draw_ball_bbox(deep_analysis_frame, ball_xyxy, ball_conf, color=BALL_BBOX_COLOR)
         # Defensive-line overlay: project each team's deepest outfield
@@ -530,7 +531,7 @@ class KeypointPipeline:
     }
 
     def _draw_team_bboxes(self, frame, player_xyxy, team_colors,
-                          player_conf=None, team_ids=None):
+                          player_conf=None, team_ids=None, track_ids=None):
         out = frame.copy()
         h, w = frame.shape[:2]
         for i in range(min(len(player_xyxy), len(team_colors))):
@@ -541,14 +542,18 @@ class KeypointPipeline:
             cv2.addWeighted(ov, 0.25, out, 0.75, 0, out)
             cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
 
-            # Build the label: "T1" / "T2" / "GK" / "REF" (+ optional conf).
+            # Build the label: "T1" / "T2" / "GK" / "REF" (+ tid + conf).
             team_label = ""
             if team_ids is not None and i < len(team_ids):
                 team_label = self._TEAM_ID_LABELS.get(int(team_ids[i]), "")
+            tid_txt = ""
+            if track_ids is not None and i < len(track_ids):
+                tid_txt = f"#{int(track_ids[i])}"
             conf_txt = ""
             if player_conf is not None and i < len(player_conf):
-                conf_txt = f" {float(player_conf[i]):.2f}"
-            tag = f"{team_label}{conf_txt}".strip()
+                conf_txt = f"{float(player_conf[i]):.2f}"
+            parts = [p for p in (team_label, tid_txt, conf_txt) if p]
+            tag = " ".join(parts)
             if tag:
                 # Filled black backing for legibility on any background.
                 (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)

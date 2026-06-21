@@ -224,7 +224,7 @@ class TeamColorAnalyzer:
         if not self.initialized or team_ids is None or len(team_ids) == 0:
             return self._empty_result()
 
-        result = self._build_result(team_ids)
+        result = self._build_result(team_ids, track_ids)
 
         # Record confident/locked TEAM0/TEAM1 detections as the prev-frame
         # source for next frame's spatial-continuity check. Only TEAM0/TEAM1
@@ -666,23 +666,31 @@ class TeamColorAnalyzer:
     # Cluster fitting (KMeans or GMM, gated on USE_GMM)
     # ------------------------------------------------------------------
     def _fit_cluster(self, feat: np.ndarray, k: int):
-        """Returns (centroids (k, 2) sorted by hue, gmm_or_None)."""
+        """Returns (centroids (k, 6) sorted by hue, gmm_or_None)."""
+        # Cluster on jersey only (first 3 dims)
+        feat_j = feat[:, :3]
         if USE_GMM and k >= 1:
             GMM = _safe_import_gmm()
             if GMM is not None:
                 try:
                     gmm = GMM(n_components=k, covariance_type=GMM_COVARIANCE_TYPE,
                               random_state=0, n_init=1, reg_covar=1e-3)
-                    gmm.fit(feat)
-                    centroids = gmm.means_.astype(np.float32)
-                    return centroids, gmm
+                    gmm.fit(feat_j)
+                    c3 = gmm.means_.astype(np.float32)
+                    c6 = np.zeros((k, 6), dtype=np.float32)
+                    c6[:, :3] = c3
+                    return c6, gmm
                 except Exception:
                     pass
         try:
-            km = KMeans(n_clusters=k, random_state=0, n_init='auto').fit(feat)
+            km = KMeans(n_clusters=k, random_state=0, n_init='auto').fit(feat_j)
         except Exception:
             return None, None
-        return km.cluster_centers_.astype(np.float32), None
+        
+        c3 = km.cluster_centers_.astype(np.float32)
+        c6 = np.zeros((k, 6), dtype=np.float32)
+        c6[:, :3] = c3
+        return c6, None
 
     @staticmethod
     def _centroids_to_bgr(centroids: np.ndarray) -> np.ndarray:
@@ -1859,20 +1867,20 @@ class TeamColorAnalyzer:
     # ------------------------------------------------------------------
     # Output
     # ------------------------------------------------------------------
-    def _build_result(self, team_ids) -> dict:
+    def _build_result(self, team_ids, track_ids) -> dict:
         centroids = self.team_centroids_bgr
         team_colors = []
         track_quality = np.empty(len(team_ids), dtype=np.float32)
         soft_team_probs = np.zeros((len(team_ids), 2), dtype=np.float32)
-        for i, tid in enumerate(team_ids):
-            t = self.tracks.get(int(tid))
+        for i, label in enumerate(team_ids):
+            t = self.tracks.get(int(track_ids[i]))
             q = float(t['quality']) if t is not None else 1.0
             track_quality[i] = q
 
-            # Tier 2.1: GMM soft probabilities (use 4D feature for predictions)
+            # Tier 2.1: GMM soft probabilities
             if USE_GMM and self.gmm_model is not None and t is not None and t['track_feature'] is not None:
                 try:
-                    probs = self.gmm_model.predict_proba(t['track_feature'].reshape(1, -1))[0]
+                    probs = self.gmm_model.predict_proba(t['track_feature'][:3].reshape(1, -1))[0]
                     # Reorder so [0] = team0 (lowest hue), [1] = team1
                     order = np.argsort(self.gmm_model.means_[:, 0])
                     inv = np.argsort(order)
@@ -1883,11 +1891,11 @@ class TeamColorAnalyzer:
                 except Exception:
                     pass
 
-            if tid == self.REF:
+            if label == self.REF:
                 team_colors.append(self.REF_COLOR)
-            elif tid == self.GK:
+            elif label == self.GK:
                 team_colors.append(self.GK_COLOR)
-            elif tid == self.TEAM0:
+            elif label == self.TEAM0:
                 team_colors.append(tuple(map(int, centroids[0])) if centroids is not None else self.DEFAULT_TEAM_COLORS[0])
             else:
                 team_colors.append(tuple(map(int, centroids[1])) if centroids is not None and len(centroids) > 1 else self.DEFAULT_TEAM_COLORS[1])
