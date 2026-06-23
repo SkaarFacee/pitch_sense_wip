@@ -13,17 +13,27 @@ from constants import (
 # How many frames the "PASS DETECTED" banner stays on screen after a pass.
 PASS_FLASH_FRAMES = 30
 
-# Minimum pitch-distance between the previous and the new ball-owner for
-# a transition to count as a pass. Filters out (a) detection jitter
-# between two same-team players within a few meters of the ball, and
-# (b) the ball rolling slowly past a row of teammates — each "new
-# closest" handoff would otherwise be counted as a pass.
-MIN_PASS_DISTANCE_M = 12.0
+# Minimum pitch-distance between confirmed stable owners. This is kept low
+# enough for short kickoff/build-up passes; flicker is handled by the owner
+# stability gates below rather than by discarding all short passes.
+MIN_PASS_DISTANCE_M = 1.5
 
-# Minimum ball displacement between the two frames that bracket a pass.
-# Combined with the player-distance gate, this catches only events where
-# the ball genuinely travelled from one player to another.
-MIN_BALL_DISPLACEMENT_M = 3.0
+# Minimum ball travel accumulated while ownership is being transferred.
+# The older single-frame displacement gate was too sensitive to bbox and
+# homography jitter; pass validation now measures travel across the whole
+# release/receiver window instead.
+MIN_PASS_BALL_TRAVEL_M = 1.5
+
+# Ownership must be stable before it can start or receive a pass. These gates
+# suppress one-frame bbox-overlap flicker in crowded frames.
+MIN_PASSER_STABLE_FRAMES = 3
+MIN_RECEIVER_STABLE_FRAMES = 2
+
+# Bounds for retaining an in-flight candidate through short no-overlap or
+# missing-ball gaps without comparing against stale ownership later.
+MAX_PASS_TRANSIT_FRAMES = 45
+MAX_PASS_BALL_MISSING_FRAMES = 15
+PASS_COOLDOWN_FRAMES = 12
 
 # Defensive-line drawing: smoothing factor for the running estimate of
 # each team's mean pitch-X. A small alpha makes the "which goal does this
@@ -55,19 +65,7 @@ class KeypointPipeline:
         self.flip_projection_x = flip_projection_x
         self.flip_projection_y = flip_projection_y
         self.ball_trajectory = []
-        # Pass-detection state: rolling previous-owner track id / team
-        # and a frame counter for the on-screen "PASS DETECTED" flash.
-        # We also keep the previous owner's last-known PITCH position and
-        # the previous frame's ball position so the pass gate can compare
-        # (a) player-to-player distance and (b) ball displacement between
-        # the two frames — both must clear their thresholds to count.
-        self._prev_ball_owner_tid: Optional[int] = None
-        self._prev_ball_owner_display_tid: Optional[int] = None
-        self._prev_ball_owner_team: Optional[int] = None
-        self._prev_ball_owner_pitch: Optional[np.ndarray] = None
-        self._prev_ball_pitch: Optional[np.ndarray] = None
-        self._pass_flash_counter: int = 0
-        self._last_pass_info: dict = {}
+        self._reset_pass_state()
         # Running EMA of each team's mean pitch-X. Used ONLY to decide
         # which goal each team defends for the defensive-line overlay —
         # far more stable than a per-frame mean, which flickers as players
@@ -191,16 +189,8 @@ class KeypointPipeline:
         if ball_pitch_pt is not None:
             pitch_canvas = self.pitch_artist.draw_ball_on_pitch(pitch_canvas, ball_pitch_pt, ball_color=BALL_DOT_COLOR)
 
-        # 4b. Pass detection.
-        # Per spec: a pass is a possession transition where the ball bbox
-        # (from the ball model) overlaps with a player bbox (from the
-        # player model). Ball-owner is therefore resolved by BBOX OVERLAP
-        # rather than nearest-pitch-distance. The previous owner is
-        # remembered across frames; if a DIFFERENT track on the SAME
-        # team is now overlapping the ball, and the player-distance and
-        # ball-displacement gates clear, the transition counts as a pass.
-        pass_info: dict = {}
-        pass_event: Optional[dict] = None
+        # 4b. Pass detection. Keep online processing on the same stable
+        # ownership state machine used by the two-pass video renderer.
         tids_arr = np.asarray(track_ids) if len(track_ids) > 0 else np.empty((0,), dtype=np.int32)
         team_ids_arr = (np.asarray(team_info['team_ids'])
                         if (team_info is not None
@@ -211,92 +201,15 @@ class KeypointPipeline:
                         if (team_info is not None
                             and len(team_info.get('role_ids', [])) > 0)
                         else np.full(len(team_ids_arr), ROLE_UNKNOWN, dtype=np.int32))
-
-        # Resolve the new ball-owner by checking which player bbox the
-        # ball bbox overlaps. Requires BOTH the ball detector AND the
-        # player detector to have produced boxes this frame.
-        ball_owner_idx: Optional[int] = None
-        if len(ball_xyxy) > 0 and len(player_xyxy) > 0:
-            ball_owner_idx, _owner_score = self._find_ball_owner_by_bbox_overlap(
-                ball_xyxy, player_xyxy
-            )
-
-        best_tid: Optional[int] = None
-        best_team: Optional[int] = None
-        best_pitch: Optional[np.ndarray] = None
-        if ball_owner_idx is not None:
-            n = min(len(tids_arr), len(team_ids_arr), len(player_xyxy), len(player_pitch_pts))
-            if ball_owner_idx < n:
-                owner_team = int(team_ids_arr[ball_owner_idx])
-                if owner_team in (0, 1):
-                    proj_pt = player_pitch_pts[ball_owner_idx]
-                    if (-2 <= proj_pt[0] <= PITCH_LENGTH + 2
-                            and -2 <= proj_pt[1] <= PITCH_WIDTH + 2):
-                        best_tid = int(tids_arr[ball_owner_idx])
-                        best_team = owner_team
-                        best_pitch = np.asarray(proj_pt, dtype=np.float32).copy()
-
-        if (best_tid is not None
-                and self._prev_ball_owner_tid is not None
-                and best_tid != self._prev_ball_owner_tid
-                and self._prev_ball_owner_team is not None
-                and best_team == self._prev_ball_owner_team):
-            # Two gates must both pass for a real pass:
-            #   1) The two players are far enough apart in pitch space.
-            #   2) The ball has actually moved between frames — without
-            #      this, a stationary ball whose "nearest player"
-            #      assignment jitters still counts as a pass.
-            pass_dist_m = 0.0
-            if self._prev_ball_owner_pitch is not None and best_pitch is not None:
-                pass_dist_m = float(np.linalg.norm(
-                    self._prev_ball_owner_pitch - best_pitch))
-            ball_disp_m = 0.0
-            if self._prev_ball_pitch is not None and ball_pitch_pt is not None:
-                ball_disp_m = float(np.linalg.norm(
-                    np.asarray(self._prev_ball_pitch, dtype=np.float32)
-                    - np.asarray(ball_pitch_pt, dtype=np.float32)))
-            if (pass_dist_m >= MIN_PASS_DISTANCE_M
-                    and ball_disp_m >= MIN_BALL_DISPLACEMENT_M):
-                pass_info = {
-                    "from_tid": int(self._prev_ball_owner_tid),
-                    "to_tid": int(best_tid),
-                    "team": int(best_team),
-                    "distance_m": round(pass_dist_m, 1),
-                }
-                pass_event = {
-                    "from_tid": int(self._prev_ball_owner_tid),
-                    "to_tid": int(best_tid),
-                    "team": int(best_team),
-                    "distance_m": round(pass_dist_m, 1),
-                }
-                self._pass_flash_counter = PASS_FLASH_FRAMES
-                self._last_pass_info = pass_info
-
-        if best_tid is not None:
-            self._prev_ball_owner_tid = best_tid
-            self._prev_ball_owner_team = best_team
-            self._prev_ball_owner_pitch = best_pitch
-        elif ball_owner_idx is None:
-            # No player bbox overlaps the ball this frame AND we don't
-            # have a previous owner to fall back on → drop pass state so
-            # the next overlap isn't compared against a stale owner.
-            self._prev_ball_owner_tid = None
-            self._prev_ball_owner_team = None
-            self._prev_ball_owner_pitch = None
-
-        if ball_pitch_pt is not None:
-            self._prev_ball_pitch = np.asarray(ball_pitch_pt, dtype=np.float32).copy()
-        else:
-            # Ball lost from view: clear all pass-detection state so a
-            # later re-detection isn't compared against stale owners.
-            self._prev_ball_owner_tid = None
-            self._prev_ball_owner_team = None
-            self._prev_ball_owner_pitch = None
-            self._prev_ball_pitch = None
-        # Decrement the flash counter every frame so the banner fades out
-        # even when no new pass is detected.
-        if self._pass_flash_counter > 0:
-            self._pass_flash_counter = max(0, self._pass_flash_counter - 1)
+        pass_event = self._update_pass_state(
+            ball_xyxy=ball_xyxy,
+            player_xyxy=player_xyxy,
+            tids_arr=tids_arr,
+            owner_ids_arr=tids_arr,
+            team_ids_arr=team_ids_arr,
+            player_pitch_pts=player_pitch_pts,
+            ball_pitch_pt=ball_pitch_pt,
+        )
 
         # 5. Annotated frames
         used_kpts = H_info.get('used_keypoints', [])
@@ -835,6 +748,28 @@ class KeypointPipeline:
     # ------------------------------------------------------------------
     # Video processing
     # ------------------------------------------------------------------
+    def _reset_pass_state(self):
+        """Reset pass detection without touching model, homography, or teams."""
+        self._prev_ball_owner_tid: Optional[int] = None
+        self._prev_ball_owner_display_tid: Optional[int] = None
+        self._prev_ball_owner_team: Optional[int] = None
+        self._prev_ball_owner_pitch: Optional[np.ndarray] = None
+        self._prev_ball_owner_frames: int = 0
+
+        self._owner_candidate_key: Optional[int] = None
+        self._owner_candidate_display_tid: Optional[int] = None
+        self._owner_candidate_team: Optional[int] = None
+        self._owner_candidate_pitch: Optional[np.ndarray] = None
+        self._owner_candidate_frames: int = 0
+
+        self._pass_candidate: Optional[dict] = None
+        self._pass_cooldown_frames: int = 0
+        self._last_pass_edge: Optional[tuple[int, int]] = None
+        self._missing_ball_frames: int = 0
+        self._prev_ball_pitch: Optional[np.ndarray] = None
+        self._pass_flash_counter: int = 0
+        self._last_pass_info: dict = {}
+
     def _reset_video_state(self, reset_team_analyzer: bool = True,
                            reset_homography: bool = True):
         if reset_team_analyzer and self.team_analyzer is not None:
@@ -842,13 +777,7 @@ class KeypointPipeline:
         if reset_homography:
             self.last_H = None
         self.ball_trajectory = []
-        self._prev_ball_owner_tid = None
-        self._prev_ball_owner_display_tid = None
-        self._prev_ball_owner_team = None
-        self._prev_ball_owner_pitch = None
-        self._prev_ball_pitch = None
-        self._pass_flash_counter = 0
-        self._last_pass_info = {}
+        self._reset_pass_state()
         self._team_x_ema = {TEAM0: None, TEAM1: None}
 
     def _analyze_frame_for_sequence(self, frame: np.ndarray, frame_idx: int):
@@ -1046,91 +975,288 @@ class KeypointPipeline:
             'pitch_mask': None,
         }
 
-    def _update_pass_state(self, ball_xyxy, player_xyxy, tids_arr, owner_ids_arr,
-                           team_ids_arr, player_pitch_pts, ball_pitch_pt) -> Optional[dict]:
-        pass_info: dict = {}
-        pass_event: Optional[dict] = None
-        ball_owner_idx: Optional[int] = None
-        if len(ball_xyxy) > 0 and len(player_xyxy) > 0:
-            ball_owner_idx, _owner_score = self._find_ball_owner_by_bbox_overlap(
-                ball_xyxy, player_xyxy,
-            )
+    def _clear_stable_ball_owner(self):
+        self._prev_ball_owner_tid = None
+        self._prev_ball_owner_display_tid = None
+        self._prev_ball_owner_team = None
+        self._prev_ball_owner_pitch = None
+        self._prev_ball_owner_frames = 0
 
+    def _clear_observed_owner_candidate(self):
+        self._owner_candidate_key = None
+        self._owner_candidate_display_tid = None
+        self._owner_candidate_team = None
+        self._owner_candidate_pitch = None
+        self._owner_candidate_frames = 0
+
+    def _clear_pass_candidate(self):
+        self._pass_candidate = None
+
+    def _tick_pass_flash(self):
+        if self._pass_flash_counter > 0:
+            self._pass_flash_counter = max(0, self._pass_flash_counter - 1)
+
+    def _resolve_pass_owner(self, ball_xyxy, player_xyxy, tids_arr, owner_ids_arr,
+                            team_ids_arr, player_pitch_pts) -> Optional[dict]:
+        """Resolve current ball owner from bbox overlap, or None."""
+        if ball_xyxy is None or player_xyxy is None:
+            return None
+        if len(ball_xyxy) == 0 or len(player_xyxy) == 0:
+            return None
+
+        ball_owner_idx, _owner_score = self._find_ball_owner_by_bbox_overlap(
+            ball_xyxy, player_xyxy,
+        )
+        if ball_owner_idx is None:
+            return None
+
+        tids_arr = np.asarray(tids_arr, dtype=np.int32)
+        team_ids_arr = np.asarray(team_ids_arr, dtype=np.int32)
+        player_pitch_pts = np.asarray(player_pitch_pts, dtype=np.float32)
         if owner_ids_arr is None or len(owner_ids_arr) == 0:
             owner_ids_arr = tids_arr
         owner_ids_arr = np.asarray(owner_ids_arr, dtype=np.int32)
 
-        best_key: Optional[int] = None
-        best_display_tid: Optional[int] = None
-        best_team: Optional[int] = None
-        best_pitch: Optional[np.ndarray] = None
-        if ball_owner_idx is not None:
-            n = min(len(tids_arr), len(owner_ids_arr), len(team_ids_arr), len(player_xyxy), len(player_pitch_pts))
-            if ball_owner_idx < n:
-                owner_team = int(team_ids_arr[ball_owner_idx])
-                if owner_team in (TEAM0, TEAM1):
-                    proj_pt = player_pitch_pts[ball_owner_idx]
-                    if (-2 <= proj_pt[0] <= PITCH_LENGTH + 2
-                            and -2 <= proj_pt[1] <= PITCH_WIDTH + 2):
-                        key = int(owner_ids_arr[ball_owner_idx])
-                        if key < 0:
-                            key = int(tids_arr[ball_owner_idx])
-                        best_key = key
-                        best_display_tid = int(tids_arr[ball_owner_idx])
-                        best_team = owner_team
-                        best_pitch = np.asarray(proj_pt, dtype=np.float32).copy()
+        n = min(len(tids_arr), len(owner_ids_arr), len(team_ids_arr),
+                len(player_xyxy), len(player_pitch_pts))
+        if ball_owner_idx >= n:
+            return None
 
-        if (best_key is not None
-                and self._prev_ball_owner_tid is not None
-                and best_key != self._prev_ball_owner_tid
-                and self._prev_ball_owner_team is not None
-                and best_team == self._prev_ball_owner_team):
-            pass_dist_m = 0.0
-            if self._prev_ball_owner_pitch is not None and best_pitch is not None:
-                pass_dist_m = float(np.linalg.norm(self._prev_ball_owner_pitch - best_pitch))
-            ball_disp_m = 0.0
-            if self._prev_ball_pitch is not None and ball_pitch_pt is not None:
-                ball_disp_m = float(np.linalg.norm(
-                    np.asarray(self._prev_ball_pitch, dtype=np.float32)
-                    - np.asarray(ball_pitch_pt, dtype=np.float32)))
-            if (pass_dist_m >= MIN_PASS_DISTANCE_M
-                    and ball_disp_m >= MIN_BALL_DISPLACEMENT_M):
-                from_tid = (self._prev_ball_owner_display_tid
-                            if self._prev_ball_owner_display_tid is not None
-                            else self._prev_ball_owner_tid)
-                pass_info = {
-                    "from_tid": int(from_tid),
-                    "to_tid": int(best_display_tid if best_display_tid is not None else best_key),
-                    "from_identity_id": int(self._prev_ball_owner_tid),
-                    "to_identity_id": int(best_key),
-                    "team": int(best_team),
-                    "distance_m": round(pass_dist_m, 1),
-                }
-                pass_event = dict(pass_info)
-                self._pass_flash_counter = PASS_FLASH_FRAMES
-                self._last_pass_info = pass_info
+        owner_team = int(team_ids_arr[ball_owner_idx])
+        if owner_team not in (TEAM0, TEAM1):
+            return None
 
-        if best_key is not None:
-            self._prev_ball_owner_tid = best_key
-            self._prev_ball_owner_display_tid = best_display_tid
-            self._prev_ball_owner_team = best_team
-            self._prev_ball_owner_pitch = best_pitch
-        elif ball_owner_idx is None:
-            self._prev_ball_owner_tid = None
-            self._prev_ball_owner_display_tid = None
-            self._prev_ball_owner_team = None
-            self._prev_ball_owner_pitch = None
+        proj_pt = player_pitch_pts[ball_owner_idx]
+        if not (-2 <= proj_pt[0] <= PITCH_LENGTH + 2
+                and -2 <= proj_pt[1] <= PITCH_WIDTH + 2):
+            return None
 
+        key = int(owner_ids_arr[ball_owner_idx])
+        display_tid = int(tids_arr[ball_owner_idx])
+        if key < 0:
+            key = display_tid
+        return {
+            "key": key,
+            "display_tid": display_tid,
+            "team": owner_team,
+            "pitch": np.asarray(proj_pt, dtype=np.float32).copy(),
+        }
+
+    def _observe_owner_candidate(self, owner: dict):
+        key = int(owner["key"])
+        if self._owner_candidate_key == key:
+            self._owner_candidate_frames += 1
+        else:
+            self._owner_candidate_key = key
+            self._owner_candidate_frames = 1
+        self._owner_candidate_display_tid = int(owner["display_tid"])
+        self._owner_candidate_team = int(owner["team"])
+        self._owner_candidate_pitch = np.asarray(owner["pitch"], dtype=np.float32).copy()
+
+    def _promote_observed_owner_to_stable(self):
+        if self._owner_candidate_key is None:
+            return
+        self._prev_ball_owner_tid = int(self._owner_candidate_key)
+        self._prev_ball_owner_display_tid = int(
+            self._owner_candidate_display_tid
+            if self._owner_candidate_display_tid is not None
+            else self._owner_candidate_key
+        )
+        self._prev_ball_owner_team = int(self._owner_candidate_team)
+        self._prev_ball_owner_pitch = np.asarray(
+            self._owner_candidate_pitch, dtype=np.float32,
+        ).copy()
+        self._prev_ball_owner_frames = int(self._owner_candidate_frames)
+
+    def _refresh_stable_owner(self, owner: dict):
+        self._prev_ball_owner_tid = int(owner["key"])
+        self._prev_ball_owner_display_tid = int(owner["display_tid"])
+        self._prev_ball_owner_team = int(owner["team"])
+        self._prev_ball_owner_pitch = np.asarray(owner["pitch"], dtype=np.float32).copy()
+        self._prev_ball_owner_frames = max(
+            int(self._prev_ball_owner_frames) + 1,
+            int(self._owner_candidate_frames),
+        )
+
+    def _start_pass_candidate(self, ball_pitch_pt: Optional[np.ndarray],
+                              initial_travel_m: float = 0.0):
+        if self._prev_ball_owner_tid is None:
+            return
+        start_ball = None
+        if ball_pitch_pt is not None:
+            start_ball = np.asarray(ball_pitch_pt, dtype=np.float32).copy()
+        elif self._prev_ball_pitch is not None:
+            start_ball = np.asarray(self._prev_ball_pitch, dtype=np.float32).copy()
+        self._pass_candidate = {
+            "source_key": int(self._prev_ball_owner_tid),
+            "source_display_tid": int(
+                self._prev_ball_owner_display_tid
+                if self._prev_ball_owner_display_tid is not None
+                else self._prev_ball_owner_tid
+            ),
+            "source_team": int(self._prev_ball_owner_team),
+            "source_pitch": np.asarray(
+                self._prev_ball_owner_pitch, dtype=np.float32,
+            ).copy() if self._prev_ball_owner_pitch is not None else None,
+            "source_stable_frames": int(self._prev_ball_owner_frames),
+            "start_ball_pitch": start_ball,
+            "ball_travel_m": float(max(0.0, initial_travel_m)),
+            "frames": 1,
+            "missing_frames": 1 if ball_pitch_pt is None else 0,
+        }
+
+    def _age_pass_candidate(self, ball_step_m: float = 0.0, missing_ball: bool = False):
+        if self._pass_candidate is None:
+            return
+        self._pass_candidate["frames"] = int(self._pass_candidate.get("frames", 0)) + 1
+        self._pass_candidate["ball_travel_m"] = float(
+            self._pass_candidate.get("ball_travel_m", 0.0)
+            + max(0.0, float(ball_step_m))
+        )
+        if missing_ball:
+            self._pass_candidate["missing_frames"] = int(
+                self._pass_candidate.get("missing_frames", 0)
+            ) + 1
+        else:
+            self._pass_candidate["missing_frames"] = 0
+
+    def _pass_candidate_expired(self) -> bool:
+        if self._pass_candidate is None:
+            return False
+        return (int(self._pass_candidate.get("frames", 0)) > MAX_PASS_TRANSIT_FRAMES
+                or int(self._pass_candidate.get("missing_frames", 0)) > MAX_PASS_BALL_MISSING_FRAMES)
+
+    def _finish_pass_frame(self, ball_pitch_pt: Optional[np.ndarray]):
         if ball_pitch_pt is not None:
             self._prev_ball_pitch = np.asarray(ball_pitch_pt, dtype=np.float32).copy()
-        else:
-            self._prev_ball_owner_tid = None
-            self._prev_ball_owner_display_tid = None
-            self._prev_ball_owner_team = None
-            self._prev_ball_owner_pitch = None
-            self._prev_ball_pitch = None
-        if self._pass_flash_counter > 0:
-            self._pass_flash_counter = max(0, self._pass_flash_counter - 1)
+        self._tick_pass_flash()
+
+    def _update_pass_state(self, ball_xyxy, player_xyxy, tids_arr, owner_ids_arr,
+                           team_ids_arr, player_pitch_pts, ball_pitch_pt) -> Optional[dict]:
+        if self._pass_cooldown_frames > 0:
+            self._pass_cooldown_frames = max(0, self._pass_cooldown_frames - 1)
+
+        current_ball: Optional[np.ndarray] = None
+        if ball_pitch_pt is not None:
+            ball_arr = np.asarray(ball_pitch_pt, dtype=np.float32).reshape(-1)
+            if ball_arr.size >= 2:
+                current_ball = ball_arr[:2].copy()
+
+        ball_step_m = 0.0
+        if current_ball is not None and self._prev_ball_pitch is not None:
+            ball_step_m = float(np.linalg.norm(
+                np.asarray(self._prev_ball_pitch, dtype=np.float32) - current_ball,
+            ))
+
+        observed_owner = self._resolve_pass_owner(
+            ball_xyxy, player_xyxy, tids_arr, owner_ids_arr, team_ids_arr,
+            player_pitch_pts,
+        ) if current_ball is not None else None
+
+        if current_ball is None:
+            self._missing_ball_frames += 1
+            self._clear_observed_owner_candidate()
+            if self._prev_ball_owner_tid is not None:
+                if self._pass_candidate is None:
+                    self._start_pass_candidate(None, initial_travel_m=0.0)
+                else:
+                    self._age_pass_candidate(missing_ball=True)
+            if (self._missing_ball_frames > MAX_PASS_BALL_MISSING_FRAMES
+                    or self._pass_candidate_expired()):
+                self._clear_stable_ball_owner()
+                self._clear_pass_candidate()
+                self._prev_ball_pitch = None
+            self._tick_pass_flash()
+            return None
+
+        self._missing_ball_frames = 0
+        if self._pass_candidate is not None:
+            self._age_pass_candidate(ball_step_m=ball_step_m, missing_ball=False)
+            if self._pass_candidate_expired():
+                self._clear_pass_candidate()
+                self._clear_stable_ball_owner()
+
+        if observed_owner is None:
+            self._clear_observed_owner_candidate()
+            if self._prev_ball_owner_tid is not None and self._pass_candidate is None:
+                self._start_pass_candidate(current_ball, initial_travel_m=ball_step_m)
+            if self._pass_candidate_expired():
+                self._clear_pass_candidate()
+                self._clear_stable_ball_owner()
+            self._finish_pass_frame(current_ball)
+            return None
+
+        self._observe_owner_candidate(observed_owner)
+
+        if self._prev_ball_owner_tid is None:
+            if self._owner_candidate_frames >= MIN_PASSER_STABLE_FRAMES:
+                self._promote_observed_owner_to_stable()
+                self._clear_pass_candidate()
+            self._finish_pass_frame(current_ball)
+            return None
+
+        if int(observed_owner["key"]) == int(self._prev_ball_owner_tid):
+            self._refresh_stable_owner(observed_owner)
+            self._clear_pass_candidate()
+            self._finish_pass_frame(current_ball)
+            return None
+
+        if self._pass_candidate is None:
+            self._start_pass_candidate(current_ball, initial_travel_m=ball_step_m)
+
+        if self._owner_candidate_frames < MIN_RECEIVER_STABLE_FRAMES:
+            self._finish_pass_frame(current_ball)
+            return None
+
+        pass_event: Optional[dict] = None
+        source = self._pass_candidate or {}
+        source_key = int(source.get("source_key", self._prev_ball_owner_tid))
+        source_display_tid = int(source.get(
+            "source_display_tid",
+            self._prev_ball_owner_display_tid
+            if self._prev_ball_owner_display_tid is not None
+            else self._prev_ball_owner_tid,
+        ))
+        source_team = int(source.get("source_team", self._prev_ball_owner_team))
+        source_pitch = source.get("source_pitch", self._prev_ball_owner_pitch)
+        source_stable_frames = int(source.get(
+            "source_stable_frames", self._prev_ball_owner_frames,
+        ))
+
+        pass_dist_m = 0.0
+        if source_pitch is not None and observed_owner["pitch"] is not None:
+            pass_dist_m = float(np.linalg.norm(
+                np.asarray(source_pitch, dtype=np.float32)
+                - np.asarray(observed_owner["pitch"], dtype=np.float32),
+            ))
+        ball_travel_m = float(source.get("ball_travel_m", 0.0))
+        edge = (source_key, int(observed_owner["key"]))
+
+        if (source_team == int(observed_owner["team"])
+                and source_stable_frames >= MIN_PASSER_STABLE_FRAMES
+                and pass_dist_m >= MIN_PASS_DISTANCE_M
+                and ball_travel_m >= MIN_PASS_BALL_TRAVEL_M
+                and self._pass_cooldown_frames == 0
+                and source_key != int(observed_owner["key"])):
+            pass_info = {
+                "from_tid": int(source_display_tid),
+                "to_tid": int(observed_owner["display_tid"]),
+                "from_identity_id": int(source_key),
+                "to_identity_id": int(observed_owner["key"]),
+                "team": int(observed_owner["team"]),
+                "distance_m": round(pass_dist_m, 1),
+            }
+            pass_event = dict(pass_info)
+            self._pass_flash_counter = PASS_FLASH_FRAMES
+            self._last_pass_info = pass_info
+            self._pass_cooldown_frames = PASS_COOLDOWN_FRAMES
+            self._last_pass_edge = edge
+
+        # Once the receiver is stable, promote it even for non-pass events
+        # (short touches or turnovers) so the same transition is not retried.
+        self._promote_observed_owner_to_stable()
+        self._clear_pass_candidate()
+        self._finish_pass_frame(current_ball)
         return pass_event
 
     def _write_draft_frame(self, writer, frame, pitch_canvas, frame_w: int, frame_h: int):

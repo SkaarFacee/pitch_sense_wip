@@ -1355,7 +1355,7 @@ with tab_videos:
                             continue
                         st.image(
                             frame_to_rgb(bgr),
-                            caption=label, use_container_width=True,
+                            caption=label,
                         )
 
                 # Frame-length sanity check
