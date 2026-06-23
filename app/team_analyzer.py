@@ -27,6 +27,7 @@ Tiers implemented (all gated behind flags in `constants.py`):
 * Tier 3.3 — Two-stage jersey → shorts disambiguation for uncertain tracks.
 """
 from collections import deque
+from typing import Optional
 import numpy as np
 import cv2
 from sklearn.cluster import KMeans
@@ -118,6 +119,7 @@ class TeamColorAnalyzer:
     TEAM1 = 1
     GK = -1
     REF = -2
+    UNKNOWN = -99
 
     REF_BBOX_AREA = 60.0 * 120.0
 
@@ -290,7 +292,7 @@ class TeamColorAnalyzer:
             'track_feature': None,      # (6,) [B_jersey, G_jersey, R_jersey, B_shorts, G_shorts, R_shorts]
             'track_ema_bgr': None,                            # Tier 1.3 (BGR version)
             'team_id': None,
-            'team_votes': {0: 0, 1: 0, self.GK: 0, self.REF: 0},
+            'team_votes': {0: 0, 1: 0, self.GK: 0, self.REF: 0, self.UNKNOWN: 0},
             'team_votes_history': deque(maxlen=TRACK_HISTORY_SHORT_TERM),  # Tier 2.3
             'frames_seen': 0,
             'last_seen_frame': 0,
@@ -394,7 +396,7 @@ class TeamColorAnalyzer:
         # outlier (yellow/lime/cyan linesman).
         colored = []
         for t in stable_tracks:
-            if t['track_feature'][1] < REF_SATURATION_THRESHOLD:
+            if self._track_median_saturation(t) < REF_SATURATION_THRESHOLD:
                 continue  # gray/black/white → skip
             jersey_bgr = t['track_feature'][:3]
             colorfulness = float(max(jersey_bgr) - min(jersey_bgr))
@@ -403,7 +405,7 @@ class TeamColorAnalyzer:
             colored.append(t)
         if len(colored) < 2:
             colored = [t for t in stable_tracks
-                       if t['track_feature'][1] >= REF_SATURATION_THRESHOLD]
+                       if self._track_median_saturation(t) >= REF_SATURATION_THRESHOLD]
         if len(colored) < 2:
             colored = stable_tracks
         if len(colored) < 2:
@@ -494,7 +496,7 @@ class TeamColorAnalyzer:
             med = float(np.median(xs))
             label = 0 if med < global_median else 1
             # Reset vote history so the position-based label dominates
-            t['team_votes'] = {0: 0, 1: 0, self.GK: 0, self.REF: 0}
+            t['team_votes'] = {0: 0, 1: 0, self.GK: 0, self.REF: 0, self.UNKNOWN: 0}
             t['team_votes_history'].clear()
             t['team_votes'][label] = 6
             t['team_id'] = label
@@ -523,7 +525,7 @@ class TeamColorAnalyzer:
                 if min(d0, d1) > 40.0:
                     return self.REF
         if self.team_centroids_bgr_feat is None or len(self.team_centroids_bgr_feat) == 0:
-            return self.GK
+            return self.UNKNOWN
         dists = [self._feature_distance(t['track_feature'], c) for c in self.team_centroids_bgr_feat]
         return int(np.argmin(dists))
 
@@ -538,7 +540,7 @@ class TeamColorAnalyzer:
         # yellow/cyan/lime.
         colored = []
         for t in stable_tracks:
-            if t['track_feature'][1] < REF_SATURATION_THRESHOLD:
+            if self._track_median_saturation(t) < REF_SATURATION_THRESHOLD:
                 continue
             jersey_bgr = t['track_feature'][:3]
             colorfulness = float(max(jersey_bgr) - min(jersey_bgr))
@@ -845,17 +847,12 @@ class TeamColorAnalyzer:
         (b) Rewrites the GK rule to be position-based:
           * After the sticky-label branch resolves a TEAM0/TEAM1 label,
             ``_decide_gk_by_position`` is consulted. A track that has
-            spent ``GK_BOX_MIN_FRAMES`` consecutive frames inside
-            either 18-yard or 6-yard box is promoted to GK.
-          * A track that is the leftmost or rightmost player on the
-            pitch (within margin of the nearest penalty spot) for
-            ``GK_EDGE_MIN_FRAMES`` frames is also promoted — this
-            catches sweeper-keepers and GKs caught a step outside the
-            box.
+            spent ``GK_BOX_MIN_FRAMES`` consecutive frames inside its
+            team's defensive 18-yard box is promoted to GK.
           * Colour-based GK detection (the old
             ``GK_COLOR_DIST_THRESHOLD`` rule) is REMOVED.
         """
-        team_ids = np.full(len(track_ids), self.GK, dtype=np.int32)
+        team_ids = np.full(len(track_ids), self.UNKNOWN, dtype=np.int32)
         centroids_close = self._centroids_too_close()
 
         # Spatial-continuity team lock: before any per-frame reassignment,
@@ -1059,6 +1056,39 @@ class TeamColorAnalyzer:
     def _has_enough_positions(t) -> bool:
         return len(t.get('pitch_positions', [])) >= POSITION_MIN_SAMPLES
 
+    @staticmethod
+    def _track_median_saturation(t) -> float:
+        sats = list(t.get('sat_obs', []))
+        if sats:
+            return float(np.median(np.asarray(sats, dtype=np.float32)))
+        feat = t.get('track_feature')
+        if feat is None:
+            return 255.0
+        sample = np.array([[[float(feat[0]), float(feat[1]), float(feat[2])]]], dtype=np.uint8)
+        try:
+            return float(cv2.cvtColor(sample, cv2.COLOR_BGR2HSV)[0, 0, 1])
+        except Exception:
+            return float(max(feat[:3]) - min(feat[:3]))
+
+    def _team_defensive_side(self, team: int) -> Optional[str]:
+        if team not in (self.TEAM0, self.TEAM1):
+            return None
+        xs_by_team = {self.TEAM0: [], self.TEAM1: []}
+        for tr in self.tracks.values():
+            label = tr.get('team_id')
+            if label not in (self.TEAM0, self.TEAM1):
+                continue
+            pts = list(tr.get('pitch_positions', []))
+            if len(pts) < 2:
+                continue
+            xs_by_team[label].append(float(np.median([p[0] for p in pts])))
+        if xs_by_team[self.TEAM0] and xs_by_team[self.TEAM1]:
+            mean0 = float(np.mean(xs_by_team[self.TEAM0]))
+            mean1 = float(np.mean(xs_by_team[self.TEAM1]))
+            left_team = self.TEAM0 if mean0 <= mean1 else self.TEAM1
+            return "left" if team == left_team else "right"
+        return None
+
     def _sticky_label_for_track(self, t) -> int:
         """Decide the track's team using its running median feature
         (``track_feature``) instead of the current frame's observation.
@@ -1075,7 +1105,7 @@ class TeamColorAnalyzer:
 
         feat = t['track_feature']
         if self.team_centroids_bgr_feat is None or len(self.team_centroids_bgr_feat) == 0:
-            return self.GK
+            return self.UNKNOWN
         dists = [self._feature_distance(feat, c) for c in self.team_centroids_bgr_feat]
         return int(np.argmin(dists))
 
@@ -1118,7 +1148,7 @@ class TeamColorAnalyzer:
                                H, all_track_pitches, current_label) -> int:
         """Plan (b): position-driven GK decision.
 
-        Returns GK if any position-based criterion fires, otherwise
+        Returns GK if a position-based criterion fires, otherwise
         returns ``current_label`` (the label already resolved by the
         sticky-label branch — typically a TEAM0/TEAM1 or REF label).
         This avoids the stale-``t['team_id']`` trap where the track's
@@ -1127,15 +1157,12 @@ class TeamColorAnalyzer:
 
         The position-based criteria are checked in priority order:
 
-          1. Inside either 18-yard (penalty) box — bump box_frames.
-          2. Inside either 6-yard / 5-yard (goal area) box — bump
-             goal_area_frames.
-          3. Combined box+goal-area count >= GK_BOX_MIN_FRAMES → GK
-             AND set ``gk_candidate_locked = True``.
-          4. Leftmost or rightmost player on the pitch AND pitch-X
-             within margin of the nearest penalty spot — bump
-             leftmost/rightmost streak.
-          5. Either streak >= GK_EDGE_MIN_FRAMES → GK AND lock.
+          1. Preserve REF labels; referees are never upgraded to GK.
+          2. Require a TEAM0/TEAM1 label and an inferred defensive side.
+          3. Inside that team's own 18-yard box — bump box_frames.
+          4. box_frames >= GK_BOX_MIN_FRAMES → GK.
+          5. A strict leftmost/rightmost fallback can fire only on the
+             same defensive side and within the penalty-area Y band.
 
         ``all_track_pitches`` is a list[(track_id_int, pitch_x, pitch_y)]
         built by the caller so we know the leftmost / rightmost
@@ -1145,8 +1172,10 @@ class TeamColorAnalyzer:
         # provided `player_pitch_pts[i]`; fall back to projecting the
         # bbox with H. If NEITHER is available, this function is a
         # no-op — return the label the caller already resolved.
+        if current_label == self.REF:
+            return self.REF
         if player_xyxy is None:
-            return current_label if current_label is not None else self.GK
+            return current_label if current_label is not None else self.UNKNOWN
         px = None
         py = None
         try:
@@ -1163,33 +1192,26 @@ class TeamColorAnalyzer:
             px = None
             py = None
         if px is None or py is None:
-            return current_label if current_label is not None else self.GK 
+            return current_label if current_label is not None else self.UNKNOWN
 
         in_left_pen = (px <= LEFT_PENALTY_X) and (PENALTY_Y_TOP <= py <= PENALTY_Y_BOTTOM)
         in_right_pen = (px >= RIGHT_PENALTY_X) and (PENALTY_Y_TOP <= py <= PENALTY_Y_BOTTOM)
         in_left_goal = (px <= LEFT_GOAL_AREA_X) and (GOAL_AREA_Y_TOP <= py <= GOAL_AREA_Y_BOTTOM)
         in_right_goal = (px >= RIGHT_GOAL_AREA_X) and (GOAL_AREA_Y_TOP <= py <= GOAL_AREA_Y_BOTTOM)
+        side_now = "left" if in_left_pen else "right" if in_right_pen else None
+        expected_side = self._team_defensive_side(current_label)
+        in_own_box_now = side_now is not None and expected_side is not None and side_now == expected_side
 
-        # The 6-yd box is geometrically inside the 18-yd box, so a
-        # player in the 6-yd strip is ALWAYS counted as "in the 18-yd
-        # box" too. We use a single `box_frames` consecutive counter
-        # that increments while the player is in either box and
-        # resets the moment they step out. This is what prevents a
-        # track that was in the box 4 frames ago (and is now in
-        # midfield) from being promoted to GK — and crucially prevents
-        # the locked-team→GK demote path in _apply_gk_defensive_prior
-        # from firing on a track whose box visit was already over.
-        in_box_now = in_left_pen or in_right_pen or in_left_goal or in_right_goal
-        if in_box_now:
+        if in_own_box_now:
             t['box_frames'] += 1
-            t['goal_area_frames'] += 1
+            t['goal_area_frames'] = t['goal_area_frames'] + 1 if (in_left_goal or in_right_goal) else 0
         else:
             t['box_frames'] = 0
             t['goal_area_frames'] = 0
 
         # Hysteresis: require GK_BOX_MIN_FRAMES CONSECUTIVE frames
-        # inside either box before promoting.
-        if (t['box_frames'] + t['goal_area_frames']) >= GK_BOX_MIN_FRAMES:
+        # inside the team's own 18-yard box before promoting.
+        if t['box_frames'] >= GK_BOX_MIN_FRAMES:
             t['gk_candidate_locked'] = True
             return self.GK
 
@@ -1208,10 +1230,19 @@ class TeamColorAnalyzer:
             else:
                 med_x = px
 
-            # A leftmost track whose median X is within margin of
-            # LEFT_PENALTY_X is a GK candidate. (Symmetric for right.)
-            left_gk_zone = (px <= LEFT_PENALTY_X + GK_LEFTMOST_X_MARGIN)
-            right_gk_zone = (px >= RIGHT_PENALTY_X - GK_RIGHTMOST_X_MARGIN)
+            # Strict fallback: the player must be extreme on the pitch,
+            # near the same defensive end, and inside/near the penalty Y band.
+            in_pen_y_band = (PENALTY_Y_TOP - 2.0) <= py <= (PENALTY_Y_BOTTOM + 2.0)
+            left_gk_zone = (
+                expected_side == "left"
+                and px <= LEFT_PENALTY_X + GK_LEFTMOST_X_MARGIN
+                and in_pen_y_band
+            )
+            right_gk_zone = (
+                expected_side == "right"
+                and px >= RIGHT_PENALTY_X - GK_RIGHTMOST_X_MARGIN
+                and in_pen_y_band
+            )
 
             if is_leftmost and left_gk_zone:
                 t['leftmost_streak'] += 1
@@ -1230,7 +1261,7 @@ class TeamColorAnalyzer:
                 return self.GK
 
         # No GK criterion fired — keep the caller's resolved label.
-        return current_label if current_label is not None else self.GK
+        return current_label if current_label is not None else self.UNKNOWN
 
     def _vote_for_label(self, t, obs_feature):
         """Pick a label (team 0/1, GK, REF) to cast a vote for this frame.
@@ -1275,29 +1306,25 @@ class TeamColorAnalyzer:
             return self.REF
 
         if self.team_centroids_bgr_feat is None or len(self.team_centroids_bgr_feat) == 0:
-            return self.GK
+            return self.UNKNOWN
 
         dists = [self._feature_distance(obs_feature, c) for c in self.team_centroids_bgr_feat]
         md = float(min(dists))
         mean_d = float(np.mean(dists))
         std_d = float(np.std(dists))
 
-        # Strong outlier from BOTH teams → referee
-        if md > mean_d * 1.8 + REF_SATURATION_THRESHOLD * 0.05:
+        # Strong outlier from BOTH teams → referee. Use an absolute distance
+        # gate; comparing min(distance) to the mean of those distances is not
+        # a reliable outlier test.
+        obs_colorfulness = float(np.max(obs_feature[:3]) - np.min(obs_feature[:3]))
+        if md > 58.0 or (md > 42.0 and obs_colorfulness > 70.0):
             return self.REF
 
-        # Tier 3.4: per-team "only one GK" prior — kept as a SAFETY NET for
-        # the warm-up window only. If a team already has many outfielders,
-        # any further mildly-outlier track is promoted to GK (matches the
-        # legacy behaviour during the first 12 frames; after that the
-        # position-based GK logic takes over).
         nearest_team = int(np.argmin(dists))
-        if (t['frames_seen'] >= 10
-                and md > mean_d + 2.0 * (std_d + 1e-6)
-                and self._outfielder_count(nearest_team) >= GK_MAX_OUTFIELDERS_PER_TEAM):
-            return self.GK
+        if md > 70.0 and std_d < 12.0:
+            return self.REF
 
-        return int(np.argmin(dists))
+        return nearest_team
 
     def _outfielder_count(self, team: int) -> int:
         """Count tracks currently labelled as the given team that are NOT
@@ -1350,7 +1377,7 @@ class TeamColorAnalyzer:
 
     def _fallback_label(self, t):
         if t['track_feature'] is None:
-            return self.GK
+            return self.UNKNOWN
         # Low HSV saturation jersey → REF
         bgr_only = np.array([[
             [float(t['track_feature'][0]), float(t['track_feature'][1]), float(t['track_feature'][2])]
@@ -1363,7 +1390,7 @@ class TeamColorAnalyzer:
         if s < REF_SATURATION_THRESHOLD:
             return self.REF
         if self.team_centroids_bgr_feat is None or len(self.team_centroids_bgr_feat) == 0:
-            return self.GK
+            return self.UNKNOWN
         dists = [self._feature_distance(t['track_feature'], c) for c in self.team_centroids_bgr_feat]
         return int(np.argmin(dists))
 
@@ -1401,9 +1428,6 @@ class TeamColorAnalyzer:
     def _outlier_score_says_ref(self, t) -> bool:
         """Tier 1.6: strong outlier from BOTH team centroids in 6D BGR.
 
-        min(track_feature, centroid) / mean(track_feature, centroid)
-        ratio >= REF_OUTLIER_MIN_DIST_RATIO AND min_dist > 30.
-
         Catches single-color ref shirts (yellow, cyan, lime) that don't
         match either team's centroid in BGR feature space.
         """
@@ -1414,11 +1438,14 @@ class TeamColorAnalyzer:
         d0 = self._feature_distance(t['track_feature'], self.team_centroids_bgr_feat[0])
         d1 = self._feature_distance(t['track_feature'], self.team_centroids_bgr_feat[1])
         min_d = min(d0, d1)
-        mean_d = (d0 + d1) / 2.0
-        if mean_d <= 1e-6:
-            return False
-        ratio = min_d / mean_d
-        return ratio >= REF_OUTLIER_MIN_DIST_RATIO and min_d > 30.0
+        jersey_bgr = np.asarray(t['track_feature'][:3], dtype=np.float32)
+        colorfulness = float(np.max(jersey_bgr) - np.min(jersey_bgr))
+        med_sat = self._track_median_saturation(t)
+        if min_d > 58.0:
+            return True
+        if min_d > 42.0 and (colorfulness > 70.0 or med_sat < REF_SATURATION_THRESHOLD):
+            return True
+        return False
 
     def _peak_hue_says_ref(self, t) -> bool:
         """Tier 1.6: peaked single-hue ref shirt (uni-color).
@@ -1636,7 +1663,7 @@ class TeamColorAnalyzer:
         # counters which are bumped monotonically by _decide_gk_by_position.
         if (t.get('team_locked', False)
                 and current_label in (self.TEAM0, self.TEAM1)
-                and (t['box_frames'] + t['goal_area_frames']) >= GK_BOX_MIN_FRAMES):
+                and t['box_frames'] >= GK_BOX_MIN_FRAMES):
             t['gk_candidate_locked'] = True
             return self.GK
 
@@ -1939,10 +1966,14 @@ class TeamColorAnalyzer:
                 team_membership[i] = self.TEAM0
                 role_ids[i] = ROLE_OUTFIELD
                 team_colors.append(tuple(map(int, centroids[0])) if centroids is not None else self.DEFAULT_TEAM_COLORS[0])
-            else:
+            elif label == self.TEAM1:
                 team_membership[i] = self.TEAM1
                 role_ids[i] = ROLE_OUTFIELD
                 team_colors.append(tuple(map(int, centroids[1])) if centroids is not None and len(centroids) > 1 else self.DEFAULT_TEAM_COLORS[1])
+            else:
+                team_membership[i] = NO_TEAM
+                role_ids[i] = ROLE_UNKNOWN
+                team_colors.append((128, 128, 128))
 
         t1 = tuple(map(int, centroids[0])) if centroids is not None else self.DEFAULT_TEAM_COLORS[0]
         t2 = tuple(map(int, centroids[1])) if centroids is not None and len(centroids) > 1 else self.DEFAULT_TEAM_COLORS[1]

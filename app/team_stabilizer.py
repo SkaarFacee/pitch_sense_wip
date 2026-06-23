@@ -559,7 +559,8 @@ class TeamSequenceStabilizer:
                 obs.extend(fragments[tid])
             obs.sort(key=lambda o: (o.frame_idx, o.detection_idx))
             feature, quality = _identity_feature(obs)
-            gk_side = _gk_side_for_observations(obs)
+            gk_evidence = _gk_evidence_for_observations(obs)
+            gk_side = gk_evidence.get("side")
             identities[identity_id] = IdentityTrack(
                 identity_id=int(identity_id),
                 track_ids=[int(t) for t in track_ids],
@@ -572,6 +573,7 @@ class TeamSequenceStabilizer:
                     "frame_start": int(obs[0].frame_idx) if obs else None,
                     "frame_end": int(obs[-1].frame_idx) if obs else None,
                     "gk_side": gk_side,
+                    "gk_evidence": gk_evidence,
                 },
             )
         return identities
@@ -585,10 +587,13 @@ class TeamSequenceStabilizer:
             identity_id: self.calibration.role_override_for(identity_id, identity.track_ids)
             for identity_id, identity in identities.items()
         }
-        prelim_gk_ids = {
+        manual_gk_ids = {
+            identity_id for identity_id, role in role_overrides.items()
+            if role == ROLE_GK
+        }
+        auto_gk_candidate_ids = {
             identity_id for identity_id, identity in identities.items()
-            if role_overrides.get(identity_id) == ROLE_GK
-            or (role_overrides.get(identity_id) is None and identity.gk_side is not None)
+            if role_overrides.get(identity_id) is None and identity.gk_side is not None
         }
         ref_override_ids = {
             identity_id for identity_id, role in role_overrides.items()
@@ -599,7 +604,8 @@ class TeamSequenceStabilizer:
             identity for identity_id, identity in identities.items()
             if identity.feature is not None
             and identity_id not in ref_override_ids
-            and identity_id not in prelim_gk_ids
+            and identity_id not in manual_gk_ids
+            and identity_id not in auto_gk_candidate_ids
         ]
         if len(centroid_pool) < 2:
             centroid_pool = [
@@ -619,7 +625,45 @@ class TeamSequenceStabilizer:
                 self.feature_distance_fn(identity.feature, c) for c in centroids_feat
             ]))
 
-        team_mean_x = _team_mean_x(identities, provisional_team, exclude_ids=prelim_gk_ids | ref_override_ids)
+        team_mean_x = _team_mean_x(
+            identities, provisional_team,
+            exclude_ids=manual_gk_ids | auto_gk_candidate_ids | ref_override_ids,
+        )
+
+        # Referee detection must run before automatic GK promotion. A ref-like
+        # outlier should not become a goalkeeper just because they appeared near
+        # an end line for a few frames.
+        ref_like_ids = {
+            identity_id for identity_id, identity in identities.items()
+            if role_overrides.get(identity_id) is None
+            and identity_id not in auto_gk_candidate_ids
+            and _looks_like_ref(identity, centroids_feat, self.feature_distance_fn)
+        }
+
+        # Select at most one automatic goalkeeper per team, and only when the
+        # penalty-box side matches that team's inferred defensive side.
+        auto_gk_rows: List[tuple[float, int, int]] = []
+        for identity_id in auto_gk_candidate_ids:
+            identity = identities[identity_id]
+            if identity_id in ref_like_ids:
+                continue
+            team = _team_for_goalkeeper(
+                identity, centroids_feat, team_mean_x, self.feature_distance_fn,
+            )
+            if team not in (TEAM0, TEAM1):
+                continue
+            if not _gk_side_matches_team(identity.gk_side, team, team_mean_x):
+                continue
+            if _gk_feature_conflicts_team(identity, team, centroids_feat, self.feature_distance_fn):
+                continue
+            auto_gk_rows.append((_gk_evidence_score(identity), int(identity_id), int(team)))
+        selected_auto_gks: Dict[int, int] = {}
+        selected_auto_gk_team: Dict[int, int] = {}
+        for score, identity_id, team in sorted(auto_gk_rows, reverse=True):
+            if team in selected_auto_gks:
+                continue
+            selected_auto_gks[team] = identity_id
+            selected_auto_gk_team[identity_id] = team
 
         for identity_id, identity in identities.items():
             role_override = role_overrides.get(identity_id)
@@ -627,7 +671,9 @@ class TeamSequenceStabilizer:
 
             if role_override is not None:
                 role = role_override
-            elif identity.gk_side is not None:
+            elif identity_id in ref_like_ids:
+                role = ROLE_REF
+            elif identity_id in selected_auto_gk_team:
                 role = ROLE_GK
             else:
                 role = ROLE_OUTFIELD if identity.feature is not None else ROLE_UNKNOWN
@@ -639,10 +685,14 @@ class TeamSequenceStabilizer:
             elif identity.feature is None:
                 team = NO_TEAM
             elif role == ROLE_GK:
-                team = _team_for_goalkeeper(identity, centroids_feat, team_mean_x, self.feature_distance_fn)
+                team = selected_auto_gk_team.get(identity_id)
+                if team is None:
+                    team = _team_for_goalkeeper(
+                        identity, centroids_feat, team_mean_x, self.feature_distance_fn,
+                    )
             else:
                 nearest = int(np.argmin([self.feature_distance_fn(identity.feature, c) for c in centroids_feat]))
-                if _looks_like_ref(identity, centroids_feat, self.feature_distance_fn):
+                if identity_id in ref_like_ids:
                     team = NO_TEAM
                     role = ROLE_REF
                 else:
@@ -662,8 +712,16 @@ class TeamSequenceStabilizer:
                 "role_override": role_override,
                 "assigned_team": int(team),
                 "assigned_role": int(role),
+                "auto_gk_selected": identity_id in selected_auto_gk_team,
+                "ref_like": identity_id in ref_like_ids,
             })
 
+        cluster_diag = dict(cluster_diag)
+        cluster_diag["auto_gk_candidates"] = [int(i) for i in sorted(auto_gk_candidate_ids)]
+        cluster_diag["auto_gk_selected"] = {
+            int(team): int(identity_id) for team, identity_id in selected_auto_gks.items()
+        }
+        cluster_diag["ref_like_identities"] = [int(i) for i in sorted(ref_like_ids)]
         return centroids_feat, centroids_bgr, cluster_diag
 
     def _team_centroids(self, identity_pool: List[IdentityTrack]
@@ -824,40 +882,80 @@ def _center_distance_px(a: dict, b: dict, gap: int) -> float:
     return float(np.linalg.norm(predicted - b["first_center"]))
 
 
-def _gk_side_for_observations(observations: List[DetectionObservation]) -> Optional[str]:
+def _gk_evidence_for_observations(observations: List[DetectionObservation]) -> dict:
     pts = [o.pitch_pt for o in observations if o.pitch_pt is not None]
     if len(pts) < 3:
-        return None
-    left_pen = right_pen = left_goal = right_goal = 0
-    on_pitch_x: List[float] = []
+        return {"side": None, "score": 0.0, "left_frac": 0.0, "right_frac": 0.0, "samples": len(pts)}
+    left_pen = right_pen = 0
+    valid_pts = 0
     for pt in pts:
         x = float(pt[0])
         y = float(pt[1])
         if -3 <= x <= PITCH_LENGTH + 3 and -3 <= y <= PITCH_WIDTH + 3:
-            on_pitch_x.append(x)
+            valid_pts += 1
         if x <= LEFT_PENALTY_X and PENALTY_Y_TOP <= y <= PENALTY_Y_BOTTOM:
             left_pen += 1
         if x >= RIGHT_PENALTY_X and PENALTY_Y_TOP <= y <= PENALTY_Y_BOTTOM:
             right_pen += 1
-        if x <= LEFT_GOAL_AREA_X and GOAL_AREA_Y_TOP <= y <= GOAL_AREA_Y_BOTTOM:
-            left_goal += 1
-        if x >= RIGHT_GOAL_AREA_X and GOAL_AREA_Y_TOP <= y <= GOAL_AREA_Y_BOTTOM:
-            right_goal += 1
-    total = max(len(pts), 1)
-    left_score = (left_pen + 0.75 * left_goal) / total
-    right_score = (right_pen + 0.75 * right_goal) / total
-    min_frac = max(0.35, float(GK_PENALTY_BOX_MIN_FRAC) * 0.75)
-    if left_score >= min_frac and left_score >= right_score:
-        return "left"
-    if right_score >= min_frac and right_score > left_score:
-        return "right"
-    if len(on_pitch_x) >= 6:
-        med_x = float(np.median(on_pitch_x))
-        if med_x <= LEFT_PENALTY_X + GK_LEFTMOST_X_MARGIN:
-            return "left"
-        if med_x >= RIGHT_PENALTY_X - GK_RIGHTMOST_X_MARGIN:
-            return "right"
-    return None
+    total = max(valid_pts, 1)
+    left_frac = left_pen / total
+    right_frac = right_pen / total
+    min_frac = float(GK_PENALTY_BOX_MIN_FRAC)
+    min_count = max(3, int(np.ceil(min_frac * total)))
+    side = None
+    if left_pen >= min_count and left_frac >= min_frac and left_frac >= right_frac + 0.15:
+        side = "left"
+    elif right_pen >= min_count and right_frac >= min_frac and right_frac >= left_frac + 0.15:
+        side = "right"
+    score = max(left_frac, right_frac)
+    return {
+        "side": side,
+        "score": round(float(score), 3),
+        "left_frac": round(float(left_frac), 3),
+        "right_frac": round(float(right_frac), 3),
+        "left_count": int(left_pen),
+        "right_count": int(right_pen),
+        "samples": int(total),
+    }
+
+
+def _gk_side_for_observations(observations: List[DetectionObservation]) -> Optional[str]:
+    return _gk_evidence_for_observations(observations).get("side")
+
+
+def _gk_evidence_score(identity: IdentityTrack) -> float:
+    evidence = identity.diagnostics.get("gk_evidence", {}) if identity.diagnostics else {}
+    try:
+        return float(evidence.get("score", 0.0))
+    except Exception:
+        return 0.0
+
+
+def _gk_side_matches_team(side: Optional[str], team: int, team_mean_x: Dict[int, float]) -> bool:
+    if side not in {"left", "right"} or team not in (TEAM0, TEAM1):
+        return False
+    if TEAM0 not in team_mean_x or TEAM1 not in team_mean_x:
+        return True
+    left_team = TEAM0 if team_mean_x[TEAM0] <= team_mean_x[TEAM1] else TEAM1
+    right_team = TEAM1 if left_team == TEAM0 else TEAM0
+    return (side == "left" and team == left_team) or (side == "right" and team == right_team)
+
+
+def _gk_feature_conflicts_team(identity: IdentityTrack, team: int, centroids: np.ndarray,
+                               distance_fn: Callable[[np.ndarray, np.ndarray], float]) -> bool:
+    """Reject attacker-in-opponent-box false GKs.
+
+    A true keeper often wears a unique kit and may be far from both outfield
+    centroids. We only reject when the identity is a strong visual match for
+    the *other* team's outfield kit and clearly not the side/team implied by
+    penalty-box location.
+    """
+    if identity.feature is None or team not in (TEAM0, TEAM1) or len(centroids) < 2:
+        return False
+    other = TEAM1 if team == TEAM0 else TEAM0
+    d_team = float(distance_fn(identity.feature, centroids[team]))
+    d_other = float(distance_fn(identity.feature, centroids[other]))
+    return d_other < 45.0 and d_other + 18.0 < d_team
 
 
 def _team_for_goalkeeper(identity: IdentityTrack, centroids: np.ndarray,
