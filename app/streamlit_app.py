@@ -336,7 +336,7 @@ with st.sidebar:
     enable_team_colors = st.checkbox("Team colour clustering", value=True)
     flip_projection_x = st.checkbox("Flip projection (X — long axis)", value=False,
                                     help="Mirror the long axis of the pitch if the camera is behind the opposite goal.")
-    flip_projection_y = st.checkbox("Flip projection (Y — short axis)", value=True,
+    flip_projection_y = st.checkbox("Flip projection (Y — short axis)", value=False,
                                     help="Mirror the short axis if the ball/players appear on the wrong side of the top-down pitch canvas.")
     with st.expander("Advanced team calibration", expanded=False):
         team_calibration_text = st.text_area(

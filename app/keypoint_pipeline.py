@@ -776,6 +776,8 @@ class KeypointPipeline:
             self.team_analyzer.reset()
         if reset_homography:
             self.last_H = None
+            if hasattr(self.keypoint_computer, "smoothed_H"):
+                self.keypoint_computer.smoothed_H = None
         self.ball_trajectory = []
         self._reset_pass_state()
         self._team_x_ema = {TEAM0: None, TEAM1: None}
