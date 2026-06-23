@@ -6,6 +6,8 @@ All builders accept the theme palette (dict) so dark/light modes look consistent
 Charts produced:
     • build_possession_donut       — donut % chart for nearest-player possession
     • build_possession_timeline    — area chart of rolling possession
+    • build_xg_timeline            — cumulative tracking-proxy xG timeline
+    • build_xg_chance_map          — chance locations sized by xG
     • build_team_radar             — 5-axis tactical DNA radar
     • build_territory_grid         — 3×3 dominance heatmap (with hover details)
     • build_density_heatmap        — Player density heatmap on a pitch (interactive tooltips)
@@ -16,8 +18,8 @@ Charts produced:
     • build_zone_timeline          — Multi-line timeline of region detections
     • build_attacking_direction_diagram — Two-arrow pitch diagram showing attack direction
     • build_passing_network        — Directed player→player pass graph on a pitch
+    • build_passing_network_by_thirds — Combined passing network colored by pitch third
     • build_player_region_distance_bar — Team distance split by pitch third
-    • build_player_region_top_speed_bar — Team top speed split by pitch third
     • build_team_pressing_by_region_timeline — Team pressing split by pitch third
 """
 from __future__ import annotations
@@ -250,6 +252,100 @@ def build_possession_timeline(palette: dict, game_data: list, window: int = 30) 
     return fig
 
 
+def build_xg_timeline(palette: dict, xg: dict) -> go.Figure:
+    """Cumulative tracking-proxy xG by frame for both teams."""
+    timeline = (xg or {}).get("timeline", {})
+    xs = list(timeline.get("x", []))
+    t1 = list(timeline.get("team1_cumulative_xg", []))
+    t2 = list(timeline.get("team2_cumulative_xg", []))
+    if not xs or (not t1 and not t2):
+        return _empty_fig(palette, "No xG events detected")
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=xs, y=t1, mode="lines+markers",
+        name="Team 1", line=dict(color=palette["team1"], width=2.8),
+        marker=dict(color=palette["team1"], size=7),
+        fill="tozeroy", fillcolor=_alpha(palette["team1"], 0.12),
+        hovertemplate="Frame %{x}<br><b>Team 1</b> cumulative xG: %{y:.2f}<extra></extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=xs, y=t2, mode="lines+markers",
+        name="Team 2", line=dict(color=palette["team2"], width=2.8),
+        marker=dict(color=palette["team2"], size=7),
+        fill="tozeroy", fillcolor=_alpha(palette["team2"], 0.12),
+        hovertemplate="Frame %{x}<br><b>Team 2</b> cumulative xG: %{y:.2f}<extra></extra>",
+    ))
+    layout = _base_layout(palette, height=340)
+    layout.update(dict(
+        xaxis=dict(title="Frame", gridcolor=palette["grid"], zerolinecolor=palette["grid"]),
+        yaxis=dict(title="Cumulative xG", rangemode="tozero",
+                   gridcolor=palette["grid"], zerolinecolor=palette["grid"]),
+    ))
+    fig.update_layout(layout)
+    fig.update_layout(legend_title_text="")
+    return fig
+
+
+def build_xg_chance_map(palette: dict, xg: dict) -> go.Figure:
+    """Pitch map of estimated chance events sized by xG value."""
+    events = list((xg or {}).get("events", []))
+    if not events:
+        return _empty_fig(palette, "No xG chance locations")
+
+    fig = go.Figure()
+    for team_id, name, color in [
+        (0, "Team 1", palette["team1"]),
+        (1, "Team 2", palette["team2"]),
+    ]:
+        rows = [e for e in events if int(e.get("team", -1)) == team_id]
+        if not rows:
+            continue
+        xs = [float(e.get("x", 0.0)) for e in rows]
+        ys = [float(e.get("y", 0.0)) for e in rows]
+        xgs = [max(0.0, float(e.get("xg", 0.0) or 0.0)) for e in rows]
+        sizes = [max(10.0, min(38.0, 10.0 + v * 95.0)) for v in xgs]
+        custom = [[
+            float(e.get("xg", 0.0) or 0.0),
+            int(e.get("frame_idx", 0)),
+            float(e.get("distance_to_goal_m", 0.0) or 0.0),
+            float(e.get("goal_angle_deg", 0.0) or 0.0),
+            float(e.get("nearest_defender_m", 0.0) or 0.0),
+            int(e.get("blockers", 0) or 0),
+            float(e.get("confidence", 0.0) or 0.0),
+        ] for e in rows]
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys, mode="markers",
+            name=name,
+            marker=dict(
+                color=color, size=sizes, opacity=0.72,
+                line=dict(color="#ffffff", width=1.4),
+            ),
+            customdata=custom,
+            hovertemplate=(
+                f"<b>{name} chance</b><br>Frame %{{customdata[1]}}<br>"
+                "xG: %{customdata[0]:.3f}<br>"
+                "Distance: %{customdata[2]:.1f} m<br>"
+                "Angle: %{customdata[3]:.1f} deg<br>"
+                "Nearest defender: %{customdata[4]:.1f} m<br>"
+                "Blockers: %{customdata[5]}<br>"
+                "Confidence: %{customdata[6]:.2f}<extra></extra>"
+            ),
+        ))
+
+    layout = _pitch_axes(palette, height=420)
+    layout["showlegend"] = True
+    fig.update_layout(layout)
+    fig.add_annotation(
+        x=PITCH_LENGTH / 2, y=PITCH_WIDTH + 1.5, showarrow=False,
+        text=(f"<b>Tracking-proxy xG</b> · "
+              f"T1 {(xg or {}).get('team1_xg', 0.0):.2f} · "
+              f"T2 {(xg or {}).get('team2_xg', 0.0):.2f}"),
+        font=dict(color=palette["text"], size=12), xanchor="center",
+    )
+    return fig
+
+
 
 # ─── Team radar ──────────────────────────────────────────────────────────────
 def build_team_radar(palette: dict, formation: dict, stats: dict, possession: dict) -> go.Figure:
@@ -472,11 +568,10 @@ def build_formation_scatter(palette: dict, game_data: list,
     t1_xs, t1_ys, t1_fr = [], [], []
     t2_xs, t2_ys, t2_fr = [], [], []
     for entry in game_data[::step]:
-        tids = entry.get("track_ids")
-        positions = entry.get("player_positions")
+        tids, positions = GameAnalyzer._ids_positions_for_entry(entry)
         fi = int(entry.get("frame_idx", 0))
         if registry.has_track_ids and tids is not None and positions is not None:
-            for i, tid in enumerate(np.asarray(tids)):
+            for i, tid in enumerate(tids):
                 rec = registry.tracks.get(int(tid))
                 if rec is None:
                     continue
@@ -786,6 +881,143 @@ def build_passing_network(palette: dict, network: dict, team_label: str,
     return fig
 
 
+# Colors used to encode each pitch third on the combined passing network.
+# Picked to stay legible on both dark and light green pitch backgrounds.
+_THIRD_COLORS = {
+    "defensive": "#4dd0e1",  # cyan
+    "middle":    "#ffb74d",  # amber
+    "attacking": "#ec407a",  # pink/magenta
+}
+
+
+def build_passing_network_by_thirds(palette: dict, network: dict,
+                                    team_label: str, team_color: str) -> go.Figure:
+    """Combined passing network where each edge is colored by its pitch third.
+
+    Renders all passes (across defensive, middle, and attacking thirds) on a
+    single pitch layout. Edges are grouped/colored by the pass-time pitch
+    third so one plot replaces the per-third grid of plots.
+    """
+    nodes = (network or {}).get("nodes", [])
+    edges = (network or {}).get("edges", [])
+    if not nodes:
+        return _empty_fig(palette, f"No track data for {team_label}")
+
+    def _finite_float(value):
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            return None
+        return out if np.isfinite(out) else None
+
+    def _third_for_x(x):
+        if x is None:
+            return None
+        for region in PITCH_THIRD_REGIONS:
+            if _x_in_region(x, region):
+                return region["key"]
+        return None
+
+    def _edge_third(edge: dict) -> Optional[str]:
+        events = edge.get("events") or []
+        if events:
+            xs = [_finite_float(e.get("event_x")) for e in events]
+            xs = [v for v in xs if v is not None]
+            if xs:
+                return _third_for_x(float(np.mean(xs)))
+        fx = _finite_float(edge.get("from_x"))
+        tx = _finite_float(edge.get("to_x"))
+        if fx is not None and tx is not None:
+            return _third_for_x((fx + tx) / 2.0)
+        sx = _finite_float(edge.get("ball_start_x"))
+        ex = _finite_float(edge.get("ball_end_x"))
+        if sx is not None and ex is not None:
+            return _third_for_x((sx + ex) / 2.0)
+        return None
+
+    node_lookup = {}
+    for n in nodes:
+        try:
+            node_lookup[int(n.get("track_id"))] = n
+        except (TypeError, ValueError):
+            continue
+
+    edges_by_third: dict[str, list] = {r["key"]: [] for r in PITCH_THIRD_REGIONS}
+    for e in edges:
+        t = _edge_third(e)
+        if t in edges_by_third:
+            edges_by_third[t].append(e)
+
+    fig = go.Figure()
+
+    # One trace per pitch third so the legend shows the three colors.
+    # Width is scaled per edge by pass count, drawn as individual segments.
+    max_w = max((e.get("count", 1) for e in edges), default=1) or 1
+    for region in PITCH_THIRD_REGIONS:
+        region_edges = edges_by_third[region["key"]]
+        if not region_edges:
+            continue
+        for e in region_edges:
+            a = node_lookup.get(int(e.get("from"))) if e.get("from") is not None else None
+            b = node_lookup.get(int(e.get("to"))) if e.get("to") is not None else None
+            if a is None or b is None:
+                continue
+            x0 = float(e.get("from_x", a["x"]))
+            y0 = float(e.get("from_y", a["y"]))
+            x1 = float(e.get("to_x", b["x"]))
+            y1 = float(e.get("to_y", b["y"]))
+            w = max(1.0, 6.0 * float(e.get("count", 1)) / max_w)
+            fig.add_trace(go.Scatter(
+                x=[x0, x1], y=[y0, y1],
+                mode="lines",
+                line=dict(color=_THIRD_COLORS[region["key"]], width=w),
+                opacity=0.6,
+                hoverinfo="skip",
+                showlegend=False,
+            ))
+        # Invisible legend trace so the third shows up in the legend.
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="lines",
+            line=dict(color=_THIRD_COLORS[region["key"]], width=4),
+            name=f"{region['short']} ({len(region_edges)})",
+            showlegend=True,
+        ))
+
+    # Nodes (team-colored)
+    nx = [n["x"] for n in nodes]
+    ny = [n["y"] for n in nodes]
+    nlabels = [f"#{n['track_id']}" for n in nodes]
+    fig.add_trace(go.Scatter(
+        x=nx, y=ny, mode="markers+text",
+        marker=dict(color=team_color, size=18, line=dict(color="#ffffff", width=2)),
+        text=nlabels, textposition="top center",
+        textfont=dict(color=palette["text"], size=10),
+        name=team_label,
+        hovertemplate=f"<b>{team_label}</b><br>Track #%{{text}}<br>"
+                      "x %{x:.1f} · y %{y:.1f}<extra></extra>",
+        showlegend=False,
+    ))
+
+    layout = _pitch_axes(palette, height=420)
+    layout["showlegend"] = True
+    layout["legend"] = dict(
+        orientation="h", yanchor="bottom", y=1.02,
+        xanchor="center", x=0.5,
+        font=dict(color=palette["text"], size=11),
+        bgcolor="rgba(0,0,0,0)",
+    )
+    layout["xaxis"].update(dict(showticklabels=False))
+    layout["yaxis"].update(dict(showticklabels=False))
+    fig.update_layout(layout)
+    total_passes = sum(int(e.get("count", 0)) for e in edges)
+    fig.add_annotation(
+        x=PITCH_LENGTH / 2, y=PITCH_WIDTH + 1.5, showarrow=False,
+        text=f"<b>{team_label}</b> · {total_passes} passes · {len(edges)} connections",
+        font=dict(color=palette["text"], size=12), xanchor="center",
+    )
+    return fig
+
+
 def _region_for_key(region_key: str) -> dict:
     for region in PITCH_THIRD_REGIONS:
         if region["key"] == region_key:
@@ -987,55 +1219,6 @@ def build_player_region_distance_bar(palette: dict, profiles: list[dict] | dict,
         showlegend=False,
         xaxis=dict(title="Pitch third", gridcolor=palette["grid"]),
         yaxis=dict(title="Weighted distance (m)", gridcolor=palette["grid"],
-                   rangemode="tozero"),
-    ))
-    fig.update_layout(layout)
-    fig.update_layout(legend_title_text="", showlegend=False)
-    return fig
-
-
-def build_player_region_top_speed_bar(palette: dict, profiles: list[dict] | dict,
-                                      team_id: int, team_label: str) -> go.Figure:
-    """Top speed by dominant pitch third for one team."""
-    rows = [p for p in _profile_rows(profiles) if int(p.get("team", -1)) == int(team_id)]
-    if not rows:
-        return _empty_fig(palette, f"No player profiles for {team_label}")
-    speeds = []
-    track_ids = []
-    for region in PITCH_THIRD_REGIONS:
-        candidates = [
-            p for p in rows
-            if str(p.get("dominant_third", "")).lower().startswith(region["short"].lower())
-        ]
-        if not candidates:
-            speeds.append(0.0)
-            track_ids.append("—")
-            continue
-        top_profile = max(candidates, key=lambda p: float(p.get("top_speed_m_s", 0.0)))
-        speeds.append(float(top_profile.get("top_speed_m_s", 0.0)))
-        track_ids.append(f"#{int(top_profile.get('track_id', 0))}")
-
-    color = palette["team1"] if int(team_id) == 0 else palette["team2"]
-    custom = [[tid] for tid in track_ids]
-    fig = go.Figure(go.Bar(
-        x=_THIRD_SHORTS,
-        y=speeds,
-        name=team_label,
-        marker=dict(color=color, line=dict(width=0)),
-        customdata=custom,
-        text=[f"{v:.1f}" if v > 0 else "—" for v in speeds],
-        textposition="outside",
-        textfont=dict(color=palette["text"]),
-        hovertemplate=(
-            f"<b>{team_label}</b><br>Dominant region: %{{x}}<br>"
-            "Top speed: %{y:.2f} m/s<br>Player: %{customdata[0]}<extra></extra>"
-        ),
-    ))
-    layout = _base_layout(palette, height=320)
-    layout.update(dict(
-        showlegend=False,
-        xaxis=dict(title="Dominant pitch third", gridcolor=palette["grid"]),
-        yaxis=dict(title="Top speed (m/s)", gridcolor=palette["grid"],
                    rangemode="tozero"),
     ))
     fig.update_layout(layout)

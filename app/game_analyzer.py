@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from collections import Counter
+import math
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -56,6 +57,20 @@ BBOX_OWNER_PAD_FRAC = 0.15
 # detection followed by a long ball-loss stretch would carry one team's
 # possession forward indefinitely and inflate its percentage.
 MAX_BALL_LOST_CARRY_FRAMES = 30
+
+# Tracking-proxy xG constants. These values intentionally produce a calibrated
+# looking but clearly heuristic chance estimate from current ball/player tracks;
+# they are not trained shot-event model coefficients.
+GOAL_WIDTH_M = 7.32
+XG_MAX_CHANCE_DISTANCE_M = 35.0
+XG_CLOSE_REBOUND_DISTANCE_M = 8.0
+XG_MIN_TOWARD_GOAL_SPEED_M_S = 0.5
+XG_MIN_EVENT_VALUE = 0.01
+XG_EVENT_COOLDOWN_SECONDS = 2.0
+XG_OWNER_LOOKBACK_SECONDS = 0.75
+XG_BALL_SPEED_CAP_M_S = 35.0
+XG_BLOCKER_CORRIDOR_MIN_M = 1.2
+XG_BLOCKER_CORRIDOR_FRAC = 0.06
 
 
 @dataclass
@@ -110,6 +125,41 @@ class GameAnalyzer:
         if ids is not None and len(ids) > 0:
             return ids
         return entry.get("track_ids")
+
+    @staticmethod
+    def _ids_positions_for_entry(entry: dict) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """Return parallel identity IDs and pitch positions, safely truncated.
+
+        Some frames can carry identity/team arrays from the tracker while the
+        homography projection produced no valid pitch points. Track-aware
+        analytics must not assume those arrays have identical length.
+        """
+        ids = GameAnalyzer._ids_for_entry(entry)
+        positions = entry.get("player_positions")
+        if ids is None or positions is None:
+            return None, None
+        try:
+            ids_arr = np.asarray(ids)
+            pos_arr = np.asarray(positions, dtype=np.float32)
+        except (TypeError, ValueError):
+            return None, None
+        if ids_arr.ndim == 0:
+            ids_arr = ids_arr.reshape(1)
+        if pos_arr.size == 0:
+            return None, None
+        if pos_arr.ndim == 1:
+            if pos_arr.size < 2:
+                return None, None
+            if pos_arr.size % 2 == 0:
+                pos_arr = pos_arr.reshape(-1, 2)
+            else:
+                pos_arr = pos_arr.reshape(1, -1)
+        if pos_arr.shape[1] < 2:
+            return None, None
+        n = min(len(ids_arr), len(pos_arr))
+        if n <= 0:
+            return None, None
+        return ids_arr[:n], pos_arr[:n, :2]
 
     @staticmethod
     def _normalise_team_role_arrays(entry: dict, n: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -305,13 +355,16 @@ class GameAnalyzer:
         if bbox_owner is not None:
             return bbox_owner
 
-        # Legacy fallback: pitch-distance nearest
-        tids = GameAnalyzer._ids_for_entry(entry)
-        positions = entry.get("player_positions")
-        team_ids_raw = entry.get("team_ids")
+        try:
+            ball_point = np.asarray(ball_arr, dtype=np.float32).reshape(-1)[:2]
+        except (TypeError, ValueError):
+            return None
+        if ball_point.size < 2 or not np.all(np.isfinite(ball_point)):
+            return None
 
-        if (registry.has_track_ids and tids is not None and positions is not None
-                and len(tids) == len(positions) and len(tids) > 0):
+        # Legacy fallback: pitch-distance nearest
+        tids, positions = GameAnalyzer._ids_positions_for_entry(entry)
+        if registry.has_track_ids and tids is not None and positions is not None:
             best_tid = None
             best_dist = float("inf")
             for i, tid in enumerate(tids):
@@ -320,7 +373,7 @@ class GameAnalyzer:
                     continue
                 if rec.canonical_team not in (TEAM0, TEAM1):
                     continue
-                d = float(np.linalg.norm(np.asarray(positions[i], dtype=np.float32) - ball_arr[0]))
+                d = float(np.linalg.norm(np.asarray(positions[i], dtype=np.float32) - ball_point))
                 if d < best_dist:
                     best_dist = d
                     best_tid = int(tid)
@@ -335,7 +388,7 @@ class GameAnalyzer:
         # because its average distance is large when one of its players is
         # right on the ball. This matches the track-aware branch above,
         # which also uses the single closest player.
-        dists = np.linalg.norm(valid_pos - ball_arr, axis=1)
+        dists = np.linalg.norm(valid_pos - ball_point, axis=1)
         min1 = float(np.min(dists[valid_tid == 0])) if len(t1) > 0 else float("inf")
         min2 = float(np.min(dists[valid_tid == 1])) if len(t2) > 0 else float("inf")
         if min1 <= min2:
@@ -643,12 +696,9 @@ class GameAnalyzer:
         t1_axis = GameAnalyzer._depth_axis_for(t1_dir)
         t2_axis = GameAnalyzer._depth_axis_for(t2_dir)
         for entry in game_data:
-            tids = GameAnalyzer._ids_for_entry(entry)
-            positions = entry.get("player_positions")
-            if tids is None or positions is None or len(tids) == 0:
+            tids, positions = GameAnalyzer._ids_positions_for_entry(entry)
+            if tids is None or positions is None:
                 continue
-            tids = np.asarray(tids)
-            positions = np.asarray(positions)
             t1_pts, t2_pts = [], []
             for i, tid in enumerate(tids):
                 rec = registry.tracks.get(int(tid))
@@ -699,11 +749,10 @@ class GameAnalyzer:
         step = max(1, len(game_data) // max_frames)
         for entry in game_data[::step]:
             if registry.has_track_ids:
-                tids = GameAnalyzer._ids_for_entry(entry)
-                positions = entry.get("player_positions")
+                tids, positions = GameAnalyzer._ids_positions_for_entry(entry)
                 if tids is None or positions is None:
                     continue
-                for i, tid in enumerate(np.asarray(tids)):
+                for i, tid in enumerate(tids):
                     rec = registry.tracks.get(int(tid))
                     if rec is None:
                         continue
@@ -741,13 +790,8 @@ class GameAnalyzer:
 
         if registry.has_track_ids:
             for entry in game_data:
-                tids = GameAnalyzer._ids_for_entry(entry)
-                positions = entry.get("player_positions")
+                tids, positions = GameAnalyzer._ids_positions_for_entry(entry)
                 if tids is None or positions is None:
-                    continue
-                tids = np.asarray(tids)
-                positions = np.asarray(positions)
-                if len(tids) != len(positions) or len(tids) == 0:
                     continue
                 for i, tid in enumerate(tids):
                     rec = registry.tracks.get(int(tid))
@@ -849,14 +893,11 @@ class GameAnalyzer:
         per_track_frames: Dict[int, int] = {}
 
         for entry in game_data:
-            tids = GameAnalyzer._ids_for_entry(entry)
-            positions = entry.get("player_positions")
-            if tids is None or positions is None or len(tids) == 0:
+            tids, positions = GameAnalyzer._ids_positions_for_entry(entry)
+            if tids is None or positions is None:
                 t1_counts.append(0)
                 t2_counts.append(0)
             else:
-                tids = np.asarray(tids)
-                positions = np.asarray(positions)
                 t1_pts, t2_pts = [], []
                 for i, tid in enumerate(tids):
                     rec = registry.tracks.get(int(tid))
@@ -949,9 +990,8 @@ class GameAnalyzer:
             ball = entry.get("ball_position")
             if ball is None:
                 continue
-            tids = GameAnalyzer._ids_for_entry(entry)
-            positions = entry.get("player_positions")
-            if tids is None or positions is None or len(tids) == 0:
+            tids, positions = GameAnalyzer._ids_positions_for_entry(entry)
+            if tids is None or positions is None:
                 continue
             ball_arr = np.asarray(ball, dtype=np.float32)
             best_tid = None
@@ -1392,7 +1432,557 @@ class GameAnalyzer:
         return empty
 
     # ------------------------------------------------------------------
-    # 9. DEEPER ANALYTICS — PLAYER, TACTICAL, AND PHASE-LEVEL METRICS
+    # 9. EXPECTED GOALS + XG-ONLY WIN EXPECTANCY
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _xg_empty_result(warnings: Optional[list[str]] = None,
+                         inputs_used: Optional[list[str]] = None) -> dict:
+        return {
+            "model_version": "tracking_proxy_v1",
+            "method": "tracking_proxy",
+            "team1_xg": 0.0,
+            "team2_xg": 0.0,
+            "team1_event_count": 0,
+            "team2_event_count": 0,
+            "team1_events": [],
+            "team2_events": [],
+            "events": [],
+            "timeline": {
+                "x": [],
+                "team1_cumulative_xg": [],
+                "team2_cumulative_xg": [],
+            },
+            "inputs_used": inputs_used or [],
+            "warnings": list(warnings or []),
+        }
+
+    @staticmethod
+    def _xg_finite_float(value) -> Optional[float]:
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            return None
+        return out if np.isfinite(out) else None
+
+    @staticmethod
+    def _xg_pitch_point(value) -> Optional[tuple[float, float]]:
+        if value is None:
+            return None
+        try:
+            arr = np.asarray(value, dtype=np.float32).reshape(-1)
+        except (TypeError, ValueError):
+            return None
+        if arr.size < 2:
+            return None
+        x, y = float(arr[0]), float(arr[1])
+        if not (np.isfinite(x) and np.isfinite(y)):
+            return None
+        if not (-2 <= x <= PITCH_LENGTH + 2 and -2 <= y <= PITCH_WIDTH + 2):
+            return None
+        return (x, y)
+
+    @staticmethod
+    def _xg_target_goal(direction_info: dict, team: int) -> Optional[tuple[float, float]]:
+        key = "team1_attacks" if int(team) == TEAM0 else "team2_attacks"
+        direction = (direction_info or {}).get(key)
+        if direction == "right":
+            return (PITCH_LENGTH, CENTER_Y)
+        if direction == "left":
+            return (0.0, CENTER_Y)
+        return None
+
+    @staticmethod
+    def _xg_goal_angle(x: float, y: float, target_x: float) -> float:
+        top_post = np.array([target_x, CENTER_Y - GOAL_WIDTH_M / 2.0], dtype=np.float32)
+        bottom_post = np.array([target_x, CENTER_Y + GOAL_WIDTH_M / 2.0], dtype=np.float32)
+        ball = np.array([x, y], dtype=np.float32)
+        v1 = top_post - ball
+        v2 = bottom_post - ball
+        cross = float(v1[0] * v2[1] - v1[1] * v2[0])
+        dot = float(np.dot(v1, v2))
+        return float(min(math.pi, abs(math.atan2(cross, dot))))
+
+    @staticmethod
+    def _xg_in_target_penalty_box(x: float, y: float, target_x: float) -> bool:
+        in_y = PENALTY_Y_TOP <= y <= PENALTY_Y_BOTTOM
+        if target_x >= PITCH_LENGTH / 2.0:
+            return bool(x >= RIGHT_PENALTY_X and in_y)
+        return bool(x <= LEFT_PENALTY_X and in_y)
+
+    @staticmethod
+    def _xg_ball_confidence(entry: dict) -> float:
+        conf = entry.get("ball_conf")
+        if conf is None:
+            return 0.6
+        try:
+            arr = np.asarray(conf, dtype=np.float32).reshape(-1)
+        except (TypeError, ValueError):
+            val = GameAnalyzer._xg_finite_float(conf)
+            return float(max(0.0, min(1.0, val if val is not None else 0.6)))
+        if arr.size == 0:
+            return 0.6
+        val = GameAnalyzer._xg_finite_float(arr[0])
+        return float(max(0.0, min(1.0, val if val is not None else 0.6)))
+
+    @staticmethod
+    def _xg_owner_track_for_entry(entry: dict, team: int,
+                                  ball_xy: tuple[float, float],
+                                  registry: GameRegistry) -> Optional[dict]:
+        tids = GameAnalyzer._ids_for_entry(entry)
+        positions = entry.get("player_positions")
+        if tids is None or positions is None:
+            return None
+        try:
+            tids = np.asarray(tids)
+            positions = np.asarray(positions, dtype=np.float32)
+        except (TypeError, ValueError):
+            return None
+        if len(tids) == 0 or len(positions) == 0:
+            return None
+        n = min(len(tids), len(positions))
+        team_ids, role_ids = GameAnalyzer._normalise_team_role_arrays(entry, n)
+        ball = np.asarray(ball_xy, dtype=np.float32)
+        best: Optional[dict] = None
+        for i in range(n):
+            px, py = float(positions[i][0]), float(positions[i][1])
+            if not (-2 <= px <= PITCH_LENGTH + 2 and -2 <= py <= PITCH_WIDTH + 2):
+                continue
+            tid = int(tids[i])
+            rec = registry.tracks.get(tid)
+            canonical_team = rec.canonical_team if rec is not None else int(team_ids[i])
+            canonical_role = rec.canonical_role if rec is not None else int(role_ids[i])
+            if canonical_team != int(team) or canonical_role == ROLE_REF:
+                continue
+            dist = float(np.linalg.norm(np.asarray([px, py], dtype=np.float32) - ball))
+            quality = float(rec.canonical_quality) if rec is not None else 0.6
+            if best is None or dist < best["distance_m"]:
+                best = {
+                    "track_id": tid,
+                    "distance_m": dist,
+                    "quality": max(0.0, min(1.0, quality)),
+                }
+        return best
+
+    @staticmethod
+    def _xg_opponent_points_for_entry(entry: dict, team: int,
+                                      registry: GameRegistry) -> np.ndarray:
+        positions = entry.get("player_positions")
+        if positions is None:
+            return np.empty((0, 2), dtype=np.float32)
+        try:
+            positions = np.asarray(positions, dtype=np.float32)
+        except (TypeError, ValueError):
+            return np.empty((0, 2), dtype=np.float32)
+        if len(positions) == 0:
+            return np.empty((0, 2), dtype=np.float32)
+        tids = GameAnalyzer._ids_for_entry(entry)
+        tids = np.asarray(tids) if tids is not None else None
+        n = len(positions) if tids is None else min(len(positions), len(tids))
+        team_ids, role_ids = GameAnalyzer._normalise_team_role_arrays(entry, n)
+        points: list[tuple[float, float]] = []
+        for i in range(n):
+            px, py = float(positions[i][0]), float(positions[i][1])
+            if not (-2 <= px <= PITCH_LENGTH + 2 and -2 <= py <= PITCH_WIDTH + 2):
+                continue
+            rec = registry.tracks.get(int(tids[i])) if tids is not None else None
+            canonical_team = rec.canonical_team if rec is not None else int(team_ids[i])
+            canonical_role = rec.canonical_role if rec is not None else int(role_ids[i])
+            if canonical_role == ROLE_REF:
+                continue
+            if canonical_team in (TEAM0, TEAM1) and canonical_team != int(team):
+                points.append((px, py))
+        return np.asarray(points, dtype=np.float32) if points else np.empty((0, 2), dtype=np.float32)
+
+    @staticmethod
+    def _xg_blocker_count(ball_xy: tuple[float, float], goal_xy: tuple[float, float],
+                          opponent_points: np.ndarray) -> int:
+        if opponent_points is None or len(opponent_points) == 0:
+            return 0
+        ball = np.asarray(ball_xy, dtype=np.float32)
+        goal = np.asarray(goal_xy, dtype=np.float32)
+        segment = goal - ball
+        seg_len_sq = float(np.dot(segment, segment))
+        if seg_len_sq <= 1e-6:
+            return 0
+        corridor = max(
+            XG_BLOCKER_CORRIDOR_MIN_M,
+            math.sqrt(seg_len_sq) * XG_BLOCKER_CORRIDOR_FRAC,
+        )
+        blockers = 0
+        for pt in np.asarray(opponent_points, dtype=np.float32):
+            rel = pt - ball
+            t = float(np.dot(rel, segment) / seg_len_sq)
+            if t <= 0.0 or t >= 1.0:
+                continue
+            closest = ball + t * segment
+            if float(np.linalg.norm(pt - closest)) <= corridor:
+                blockers += 1
+        return int(blockers)
+
+    @staticmethod
+    def _xg_sigmoid(value: float) -> float:
+        if value >= 0:
+            z = math.exp(-value)
+            return 1.0 / (1.0 + z)
+        z = math.exp(value)
+        return z / (1.0 + z)
+
+    @staticmethod
+    def _xg_chance_probability(distance_to_goal_m: float, goal_angle_rad: float,
+                                in_penalty_box: bool, toward_goal_speed_m_s: float,
+                                centrality: float, nearest_defender_m: float,
+                                blockers: int) -> float:
+        distance_score = math.exp(-max(distance_to_goal_m, 0.0) / 18.0)
+        angle_score = max(0.0, min(1.0, goal_angle_rad / 0.75))
+        speed_score = max(0.0, min(1.0, toward_goal_speed_m_s / 20.0))
+        if np.isfinite(nearest_defender_m):
+            pressure_penalty = 0.35 * max(0.0, min(1.0, (2.5 - nearest_defender_m) / 2.5))
+        else:
+            pressure_penalty = 0.0
+        blocker_penalty = 0.18 * min(max(int(blockers), 0), 4)
+        logit = (
+            -4.0
+            + 2.4 * distance_score
+            + 1.4 * angle_score
+            + 0.45 * float(bool(in_penalty_box))
+            + 0.35 * speed_score
+            + 0.25 * max(0.0, min(1.0, centrality))
+            - pressure_penalty
+            - blocker_penalty
+        )
+        return float(max(0.005, min(0.65, GameAnalyzer._xg_sigmoid(logit))))
+
+    @staticmethod
+    def _xg_candidate_confidence(direction_confidence: float, ball_confidence: float,
+                                  owner_info: Optional[dict], ball_speed_m_s: float) -> float:
+        owner_distance = float(owner_info.get("distance_m", 4.0)) if owner_info else 4.0
+        owner_quality = float(owner_info.get("quality", 0.5)) if owner_info else 0.5
+        owner_score = max(0.0, min(1.0, (4.0 - owner_distance) / 4.0))
+        speed_penalty = 0.2 if ball_speed_m_s > XG_BALL_SPEED_CAP_M_S else 0.0
+        conf = (
+            0.2
+            + 0.25 * max(0.0, min(1.0, direction_confidence))
+            + 0.2 * max(0.0, min(1.0, ball_confidence))
+            + 0.2 * owner_score
+            + 0.15 * max(0.0, min(1.0, owner_quality))
+            - speed_penalty
+        )
+        return float(max(0.0, min(1.0, conf)))
+
+    @staticmethod
+    def _xg_dedupe_candidates(candidates: list[dict], fps: float) -> list[dict]:
+        if not candidates:
+            return []
+        cooldown = max(1, int(round(max(float(fps), 1e-3) * XG_EVENT_COOLDOWN_SECONDS)))
+        output: list[dict] = []
+        for team in (TEAM0, TEAM1):
+            team_events = sorted(
+                [c for c in candidates if int(c.get("team", NO_TEAM)) == team],
+                key=lambda e: int(e.get("frame_idx", 0)),
+            )
+            if not team_events:
+                continue
+            group_start = int(team_events[0].get("frame_idx", 0))
+            best = team_events[0]
+            for event in team_events[1:]:
+                frame_idx = int(event.get("frame_idx", 0))
+                if frame_idx - group_start <= cooldown:
+                    if float(event.get("xg", 0.0)) > float(best.get("xg", 0.0)):
+                        best = event
+                    continue
+                output.append(best)
+                group_start = frame_idx
+                best = event
+            output.append(best)
+        return sorted(output, key=lambda e: int(e.get("frame_idx", 0)))
+
+    @staticmethod
+    def _xg_timeline(events: list[dict]) -> dict:
+        x_values: list[int] = []
+        t1_values: list[float] = []
+        t2_values: list[float] = []
+        t1 = 0.0
+        t2 = 0.0
+        for event in sorted(events, key=lambda e: int(e.get("frame_idx", 0))):
+            if int(event.get("team", NO_TEAM)) == TEAM0:
+                t1 += float(event.get("xg", 0.0))
+            elif int(event.get("team", NO_TEAM)) == TEAM1:
+                t2 += float(event.get("xg", 0.0))
+            else:
+                continue
+            x_values.append(int(event.get("frame_idx", 0)))
+            t1_values.append(round(t1, 3))
+            t2_values.append(round(t2, 3))
+        return {
+            "x": x_values,
+            "team1_cumulative_xg": t1_values,
+            "team2_cumulative_xg": t2_values,
+        }
+
+    @staticmethod
+    def compute_expected_goals(game_data: List[dict], fps: float = 30.0) -> dict:
+        """Estimate xG from current tracking data using danger-peak events.
+
+        This is a tracking-proxy model. It does not require labeled shots and
+        should not be interpreted as calibrated event-data xG.
+        """
+        inputs_used = [
+            "ball_position", "player_positions", "team_ids",
+            "identity_ids_or_track_ids", "attacking_direction",
+        ]
+        base_warning = "No explicit shot events; xG is estimated from tracking danger peaks."
+        warnings = [base_warning]
+        if not game_data:
+            warnings.append("No game data available.")
+            return GameAnalyzer._xg_empty_result(warnings, inputs_used)
+
+        try:
+            fps = max(float(fps), 1e-3)
+        except (TypeError, ValueError):
+            fps = 30.0
+
+        ball_frames = sum(1 for e in game_data if GameAnalyzer._xg_pitch_point(e.get("ball_position")) is not None)
+        if ball_frames == 0:
+            warnings.append("No valid ball-position frames were available.")
+            return GameAnalyzer._xg_empty_result(warnings, inputs_used)
+
+        registry = GameAnalyzer.build_registry(game_data)
+        if not registry.has_track_ids:
+            warnings.append("Track IDs were missing; owner and defender context used per-frame team labels.")
+
+        direction_info = GameAnalyzer.infer_attacking_direction(game_data) or {}
+        targets = {
+            TEAM0: GameAnalyzer._xg_target_goal(direction_info, TEAM0),
+            TEAM1: GameAnalyzer._xg_target_goal(direction_info, TEAM1),
+        }
+        if targets[TEAM0] is None or targets[TEAM1] is None:
+            warnings.append("Attacking direction could not be inferred for both teams.")
+            return GameAnalyzer._xg_empty_result(warnings, inputs_used)
+
+        owners = GameAnalyzer.compute_ball_owner_per_frame(game_data)
+        candidates: list[dict] = []
+        prev_ball: Optional[tuple[float, float]] = None
+        prev_frame: Optional[int] = None
+        last_owner_team: Optional[int] = None
+        last_owner_frame: Optional[int] = None
+        owner_lookback_frames = max(1, int(round(fps * XG_OWNER_LOOKBACK_SECONDS)))
+        direction_confidence = float(direction_info.get("confidence", 0.0) or 0.0)
+
+        for idx, entry in enumerate(game_data):
+            frame_idx = int(entry.get("frame_idx", idx))
+            ball_xy = GameAnalyzer._xg_pitch_point(entry.get("ball_position"))
+            owner_team = owners[idx] if idx < len(owners) else None
+            if owner_team in (TEAM0, TEAM1):
+                last_owner_team = int(owner_team)
+                last_owner_frame = frame_idx
+            elif (last_owner_team in (TEAM0, TEAM1)
+                  and last_owner_frame is not None
+                  and frame_idx - last_owner_frame <= owner_lookback_frames):
+                owner_team = int(last_owner_team)
+
+            if ball_xy is None:
+                prev_ball = None
+                prev_frame = None
+                continue
+            if owner_team not in (TEAM0, TEAM1):
+                prev_ball = ball_xy
+                prev_frame = frame_idx
+                continue
+
+            goal_xy = targets[int(owner_team)]
+            if goal_xy is None:
+                prev_ball = ball_xy
+                prev_frame = frame_idx
+                continue
+
+            ball_arr = np.asarray(ball_xy, dtype=np.float32)
+            goal_arr = np.asarray(goal_xy, dtype=np.float32)
+            to_goal = goal_arr - ball_arr
+            distance_to_goal = float(np.linalg.norm(to_goal))
+            if distance_to_goal > XG_MAX_CHANCE_DISTANCE_M:
+                prev_ball = ball_xy
+                prev_frame = frame_idx
+                continue
+
+            ball_speed = 0.0
+            toward_goal_speed = 0.0
+            if prev_ball is not None and prev_frame is not None:
+                delta_frames = max(1, frame_idx - prev_frame)
+                seconds = max(delta_frames / fps, 1e-3)
+                velocity = (ball_arr - np.asarray(prev_ball, dtype=np.float32)) / seconds
+                ball_speed = float(np.linalg.norm(velocity))
+                if distance_to_goal > 1e-6:
+                    toward_goal_speed = float(np.dot(velocity, to_goal / distance_to_goal))
+            capped_toward_speed = max(0.0, min(XG_BALL_SPEED_CAP_M_S, toward_goal_speed))
+            if (capped_toward_speed < XG_MIN_TOWARD_GOAL_SPEED_M_S
+                    and distance_to_goal > XG_CLOSE_REBOUND_DISTANCE_M):
+                prev_ball = ball_xy
+                prev_frame = frame_idx
+                continue
+
+            goal_angle = GameAnalyzer._xg_goal_angle(ball_xy[0], ball_xy[1], goal_xy[0])
+            in_box = GameAnalyzer._xg_in_target_penalty_box(ball_xy[0], ball_xy[1], goal_xy[0])
+            centrality = max(0.0, min(1.0, 1.0 - abs(ball_xy[1] - CENTER_Y) / max(CENTER_Y, 1.0)))
+            opponents = GameAnalyzer._xg_opponent_points_for_entry(entry, int(owner_team), registry)
+            if len(opponents) > 0:
+                nearest_defender = float(np.min(np.linalg.norm(opponents - ball_arr, axis=1)))
+            else:
+                nearest_defender = float("inf")
+            blockers = GameAnalyzer._xg_blocker_count(ball_xy, goal_xy, opponents)
+            xg_value = GameAnalyzer._xg_chance_probability(
+                distance_to_goal, goal_angle, in_box, capped_toward_speed,
+                centrality, nearest_defender, blockers,
+            )
+            if xg_value < XG_MIN_EVENT_VALUE:
+                prev_ball = ball_xy
+                prev_frame = frame_idx
+                continue
+
+            owner_info = GameAnalyzer._xg_owner_track_for_entry(
+                entry, int(owner_team), ball_xy, registry,
+            )
+            ball_confidence = GameAnalyzer._xg_ball_confidence(entry)
+            confidence = GameAnalyzer._xg_candidate_confidence(
+                direction_confidence, ball_confidence, owner_info, ball_speed,
+            )
+            event = {
+                "frame_idx": frame_idx,
+                "team": int(owner_team),
+                "x": float(ball_xy[0]),
+                "y": float(ball_xy[1]),
+                "xg": float(xg_value),
+                "distance_to_goal_m": distance_to_goal,
+                "goal_angle_deg": math.degrees(goal_angle),
+                "in_penalty_box": bool(in_box),
+                "ball_speed_m_s": min(float(ball_speed), XG_BALL_SPEED_CAP_M_S),
+                "toward_goal_speed_m_s": capped_toward_speed,
+                "nearest_defender_m": nearest_defender,
+                "blockers": int(blockers),
+                "confidence": confidence,
+            }
+            if owner_info is not None:
+                event["owner_track_id"] = int(owner_info["track_id"])
+                event["owner_distance_m"] = float(owner_info["distance_m"])
+            candidates.append(event)
+            prev_ball = ball_xy
+            prev_frame = frame_idx
+
+        events = GameAnalyzer._xg_dedupe_candidates(candidates, fps=fps)
+        if not events:
+            warnings.append("No chance-quality events passed the tracking-proxy gates.")
+            return GameAnalyzer._xg_empty_result(warnings, inputs_used)
+
+        team1_xg = float(sum(float(e.get("xg", 0.0)) for e in events if int(e.get("team", NO_TEAM)) == TEAM0))
+        team2_xg = float(sum(float(e.get("xg", 0.0)) for e in events if int(e.get("team", NO_TEAM)) == TEAM1))
+
+        formatted_events: list[dict] = []
+        for event in events:
+            out = dict(event)
+            for key in (
+                "x", "y", "xg", "distance_to_goal_m", "goal_angle_deg",
+                "ball_speed_m_s", "toward_goal_speed_m_s", "nearest_defender_m",
+                "confidence", "owner_distance_m",
+            ):
+                if key not in out:
+                    continue
+                val = GameAnalyzer._xg_finite_float(out.get(key))
+                if val is None:
+                    out[key] = None
+                elif key == "xg":
+                    out[key] = round(val, 3)
+                elif key == "confidence":
+                    out[key] = round(val, 2)
+                else:
+                    out[key] = round(val, 2)
+            formatted_events.append(out)
+
+        team1_events = [e for e in formatted_events if int(e.get("team", NO_TEAM)) == TEAM0]
+        team2_events = [e for e in formatted_events if int(e.get("team", NO_TEAM)) == TEAM1]
+        return {
+            "model_version": "tracking_proxy_v1",
+            "method": "tracking_proxy",
+            "team1_xg": round(team1_xg, 2),
+            "team2_xg": round(team2_xg, 2),
+            "team1_event_count": len(team1_events),
+            "team2_event_count": len(team2_events),
+            "team1_events": team1_events,
+            "team2_events": team2_events,
+            "events": formatted_events,
+            "timeline": GameAnalyzer._xg_timeline(formatted_events),
+            "inputs_used": inputs_used,
+            "warnings": warnings,
+            "attacking_direction": direction_info,
+            "candidate_count_before_deduplication": len(candidates),
+        }
+
+    @staticmethod
+    def _poisson_probs(lam: float, max_goals: int) -> list[float]:
+        lam = max(0.0, float(lam))
+        max_goals = max(0, int(max_goals))
+        if lam <= 0.0:
+            return [1.0] + [0.0] * max_goals
+        probs = [math.exp(-lam)]
+        for k in range(1, max_goals + 1):
+            probs.append(probs[-1] * lam / float(k))
+        return probs
+
+    @staticmethod
+    def compute_win_probability_from_xg(xg_summary: dict, max_goals: int = 10) -> dict:
+        """Convert team xG totals into xG-only Poisson win expectancy."""
+        warnings = list((xg_summary or {}).get("warnings", []))
+        team1_xg = max(0.0, float((xg_summary or {}).get("team1_xg", 0.0) or 0.0))
+        team2_xg = max(0.0, float((xg_summary or {}).get("team2_xg", 0.0) or 0.0))
+        if team1_xg == 0.0 and team2_xg == 0.0:
+            if "No xG events available; win expectancy is a 0-0 draw by construction." not in warnings:
+                warnings.append("No xG events available; win expectancy is a 0-0 draw by construction.")
+            return {
+                "method": "independent_poisson_xg",
+                "team1_xg": 0.0,
+                "team2_xg": 0.0,
+                "team1_win_pct": 0.0,
+                "draw_pct": 100.0,
+                "team2_win_pct": 0.0,
+                "top_scorelines": [{"team1_goals": 0, "team2_goals": 0, "prob_pct": 100.0}],
+                "warnings": warnings,
+            }
+
+        max_goals = max(1, int(max_goals))
+        p1 = np.asarray(GameAnalyzer._poisson_probs(team1_xg, max_goals), dtype=np.float64)
+        p2 = np.asarray(GameAnalyzer._poisson_probs(team2_xg, max_goals), dtype=np.float64)
+        matrix = np.outer(p1, p2)
+        total_mass = float(matrix.sum())
+        if total_mass <= 0.0:
+            matrix = np.zeros((max_goals + 1, max_goals + 1), dtype=np.float64)
+            matrix[0, 0] = 1.0
+            total_mass = 1.0
+        matrix = matrix / total_mass
+
+        team1_win = float(np.tril(matrix, k=-1).sum())
+        draw = float(np.trace(matrix))
+        team2_win = float(np.triu(matrix, k=1).sum())
+        scorelines: list[dict] = []
+        for i in range(max_goals + 1):
+            for j in range(max_goals + 1):
+                scorelines.append({
+                    "team1_goals": int(i),
+                    "team2_goals": int(j),
+                    "prob_pct": round(float(matrix[i, j] * 100.0), 1),
+                })
+        scorelines.sort(key=lambda row: row["prob_pct"], reverse=True)
+
+        return {
+            "method": "independent_poisson_xg",
+            "team1_xg": round(team1_xg, 2),
+            "team2_xg": round(team2_xg, 2),
+            "team1_win_pct": round(team1_win * 100.0, 1),
+            "draw_pct": round(draw * 100.0, 1),
+            "team2_win_pct": round(team2_win * 100.0, 1),
+            "top_scorelines": scorelines[:5],
+            "warnings": warnings,
+        }
+
+    # ------------------------------------------------------------------
+    # 10. DEEPER ANALYTICS — PLAYER, TACTICAL, AND PHASE-LEVEL METRICS
     # ------------------------------------------------------------------
     # The methods below intentionally use the same `registry`-aware design
     # as the rest of the file: they aggregate per-frame entries into
@@ -1647,9 +2237,8 @@ class GameAnalyzer:
                 ball = entry.get("ball_position")
                 if ball is None:
                     continue
-                tids = GameAnalyzer._ids_for_entry(entry)
-                positions = entry.get("player_positions")
-                if tids is None or positions is None or len(tids) == 0:
+                tids, positions = GameAnalyzer._ids_positions_for_entry(entry)
+                if tids is None or positions is None:
                     continue
                 ball_arr = np.asarray(ball, dtype=np.float32)
                 best_tid = None
@@ -1805,11 +2394,10 @@ class GameAnalyzer:
 
         for entry in game_data:
             ball = entry.get("ball_position")
-            tids = GameAnalyzer._ids_for_entry(entry)
-            positions = entry.get("player_positions")
+            tids, positions = GameAnalyzer._ids_positions_for_entry(entry)
             fi = int(entry.get("frame_idx", len(x_axis) + 1))
             x_axis.append(fi)
-            if ball is None or tids is None or positions is None or len(tids) == 0:
+            if ball is None or tids is None or positions is None:
                 buf_t1.append(None); buf_t2.append(None)
                 if len(buf_t1) > window: buf_t1.pop(0)
                 if len(buf_t2) > window: buf_t2.pop(0)
@@ -1817,8 +2405,6 @@ class GameAnalyzer:
                 series_t2.append(_rolling(buf_t2))
                 continue
             ball_arr = np.asarray(ball, dtype=np.float32)
-            tids = np.asarray(tids)
-            positions = np.asarray(positions)
             # Identify the ball-owning team's nearest opponent and the
             # opponent team's nearest opponent distance to the ball.
             owner_team = GameAnalyzer._nearest_team_to_ball(entry, ball_arr, registry)
@@ -1909,13 +2495,11 @@ class GameAnalyzer:
         t2_series: list[Optional[float]] = []
 
         for entry in game_data:
-            tids = GameAnalyzer._ids_for_entry(entry)
-            positions = entry.get("player_positions")
+            tids, positions = GameAnalyzer._ids_positions_for_entry(entry)
             fi = int(entry.get("frame_idx", len(x_axis) + 1))
             x_axis.append(fi)
-            if tids is None or positions is None or len(tids) == 0:
+            if tids is None or positions is None:
                 t1_series.append(None); t2_series.append(None); continue
-            tids = np.asarray(tids); positions = np.asarray(positions)
             t1_gk = _gk_track_id(TEAM0)
             t2_gk = _gk_track_id(TEAM1)
             t1_xs, t2_xs = [], []
@@ -2168,11 +2752,9 @@ class GameAnalyzer:
         n_frames = 0
 
         for entry in game_data:
-            tids = GameAnalyzer._ids_for_entry(entry)
-            positions = entry.get("player_positions")
-            if tids is None or positions is None or len(tids) == 0:
+            tids, positions = GameAnalyzer._ids_positions_for_entry(entry)
+            if tids is None or positions is None:
                 continue
-            tids = np.asarray(tids); positions = np.asarray(positions)
             t1_best = np.full(shape, np.inf, dtype=np.float32)
             t2_best = np.full(shape, np.inf, dtype=np.float32)
             any_player = False

@@ -651,6 +651,7 @@ with tab_processing:
                     "team2_bgr": team2_bgr,
                     "ball_position": result.get("ball_pitch_pt"),
                     "ball_xyxy": result.get("ball_xyxy", np.empty((0, 4))),
+                    "ball_conf": result.get("ball_conf", np.empty((0,))),
                     "player_conf": result.get("player_conf", np.empty((0,))),
                     "pass_event": result.get("pass_event"),
                 })
@@ -745,6 +746,9 @@ with tab_match:
         formation = GameAnalyzer.compute_formation(game_data)
         territory = GameAnalyzer.compute_territory(game_data)
         stats = GameAnalyzer.compute_match_stats(game_data)
+        fps_val = float(st.session_state.get("scrubber_fps", 30.0))
+        xg = GameAnalyzer.compute_expected_goals(game_data, fps=fps_val)
+        win = GameAnalyzer.compute_win_probability_from_xg(xg)
 
         # Override the team1/team2 colours in the active palette with the
         # BGR centroids detected by the team_analyzer. The values are
@@ -815,6 +819,63 @@ with tab_match:
                                      chip=f"{territory['team1_total_presence'] + territory['team2_total_presence']:,} player-frames"),
                         unsafe_allow_html=True)
             fig = ch.build_territory_grid(detected_palette, territory)
+            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+            st.markdown(ui.card_close(), unsafe_allow_html=True)
+
+        # Expected goals and xG-only win expectancy ---------------------------
+        total_xg_events = xg.get("team1_event_count", 0) + xg.get("team2_event_count", 0)
+        scoreline_text = ""
+        if win.get("top_scorelines"):
+            scoreline_text = " · likely scores " + ", ".join(
+                f"{s['team1_goals']}-{s['team2_goals']} ({s['prob_pct']:.1f}%)"
+                for s in win.get("top_scorelines", [])[:3]
+            )
+        st.markdown(
+            ui.card_open(
+                "Expected Goals And Win Expectancy",
+                "Tracking-proxy estimate from ball/player positions; no explicit shot labels.",
+                chip=f"{total_xg_events} events",
+            ),
+            unsafe_allow_html=True,
+        )
+        st.markdown(ui.kpi_grid([
+            ("Team 1 xG", f"{xg.get('team1_xg', 0.0):.2f}",
+             f"{xg.get('team1_event_count', 0)} chance events"),
+            ("Team 2 xG", f"{xg.get('team2_xg', 0.0):.2f}",
+             f"{xg.get('team2_event_count', 0)} chance events"),
+            ("Team 1 Win", f"{win.get('team1_win_pct', 0.0):.1f}%",
+             "xG-only Poisson"),
+            ("Draw", f"{win.get('draw_pct', 0.0):.1f}%",
+             "xG-only Poisson"),
+            ("Team 2 Win", f"{win.get('team2_win_pct', 0.0):.1f}%",
+             "xG-only Poisson"),
+        ]), unsafe_allow_html=True)
+        st.markdown(
+            f"<div class='ps-card__sub'>Method: {xg.get('model_version', 'tracking_proxy')}"
+            f"{scoreline_text}</div>",
+            unsafe_allow_html=True,
+        )
+        warnings = [w for w in (xg.get("warnings") or []) if "No explicit shot events" not in str(w)]
+        if warnings:
+            st.markdown(
+                f"<div class='ps-card__sub'>Caveat: {warnings[0]}</div>",
+                unsafe_allow_html=True,
+            )
+        st.markdown(ui.card_close(), unsafe_allow_html=True)
+
+        xg_cols = st.columns(2)
+        with xg_cols[0]:
+            st.markdown(ui.card_open("Cumulative xG Timeline",
+                                     "Chance-quality accumulation over processed frames"),
+                        unsafe_allow_html=True)
+            fig = ch.build_xg_timeline(detected_palette, xg)
+            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+            st.markdown(ui.card_close(), unsafe_allow_html=True)
+        with xg_cols[1]:
+            st.markdown(ui.card_open("xG Chance Map",
+                                     "Marker size reflects estimated chance quality"),
+                        unsafe_allow_html=True)
+            fig = ch.build_xg_chance_map(detected_palette, xg)
             st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
             st.markdown(ui.card_close(), unsafe_allow_html=True)
 
@@ -1048,14 +1109,12 @@ with tab_players:
         total_passes = (network.get("total_passes_team1", 0)
                         + network.get("total_passes_team2", 0))
         total_dist = sum(float(p.get("distance_m", 0.0)) for p in profile_rows)
-        top_speed = max((float(p.get("top_speed_m_s", 0.0)) for p in profile_rows),
-                        default=0.0)
         total_setpieces = setpieces.get("total", 0)
         kpi = ui.kpi_grid([
             ("Tracked Players", f"{len(profile_rows)}",
              "with team assignment"),
-            ("Top Speed",       f"{top_speed:.1f} m/s",
-             f"{total_dist / 1000:.1f} km covered total"),
+            ("Distance Covered", f"{total_dist / 1000:.1f} km",
+             "cumulative across all tracked players"),
             ("Passes Detected", f"{total_passes:,}",
              f"T1 {network.get('total_passes_team1', 0)} · "
              f"T2 {network.get('total_passes_team2', 0)}"),
@@ -1066,33 +1125,29 @@ with tab_players:
         ])
         st.markdown(kpi, unsafe_allow_html=True)
 
-        # --- Passing networks by pitch third --------------------------------
-        st.markdown("#### Passing Networks By Team And Pitch Third")
-        for region in ch.PITCH_THIRD_REGIONS:
-            net_cols = st.columns(2)
-            for col, team_key, team_label, team_color in [
-                (net_cols[0], "team1", "Team 1", detected_palette["team1"]),
-                (net_cols[1], "team2", "Team 2", detected_palette["team2"]),
-            ]:
-                with col:
-                    region_network = ch.filter_passing_network_by_pitch_third(
-                        network.get(team_key, {}), region["key"],
-                    )
-                    st.markdown(
-                        ui.card_open(
-                            f"{team_label} {region['short']} Network",
-                            "Directed player→player passes filtered to this pitch third",
-                            chip=f"{region['x_min']:.0f}-{region['x_max']:.0f} m",
-                        ),
-                        unsafe_allow_html=True,
-                    )
-                    fig = ch.build_passing_network(
-                        detected_palette, region_network,
-                        f"{team_label} · {region['short']}", team_color,
-                    )
-                    st.plotly_chart(fig, use_container_width=True,
-                                    config={"displayModeBar": False})
-                    st.markdown(ui.card_close(), unsafe_allow_html=True)
+        # --- Passing networks by team (edges colored by pitch third) --------
+        st.markdown("#### Passing Networks By Team")
+        net_cols = st.columns(2)
+        for col, team_key, team_label, team_color in [
+            (net_cols[0], "team1", "Team 1", detected_palette["team1"]),
+            (net_cols[1], "team2", "Team 2", detected_palette["team2"]),
+        ]:
+            with col:
+                st.markdown(
+                    ui.card_open(
+                        f"{team_label} Passing Network",
+                        "Directed player→player passes; edge color encodes the pitch third where each pass occurred",
+                        chip="color = pitch third",
+                    ),
+                    unsafe_allow_html=True,
+                )
+                fig = ch.build_passing_network_by_thirds(
+                    detected_palette, network.get(team_key, {}),
+                    team_label, team_color,
+                )
+                st.plotly_chart(fig, use_container_width=True,
+                                config={"displayModeBar": False})
+                st.markdown(ui.card_close(), unsafe_allow_html=True)
 
         # --- Player profile regions ----------------------------------------
         st.markdown("#### Player Profiles By Team And Pitch Third")
@@ -1107,23 +1162,6 @@ with tab_players:
                     "Distance weighted by each player's time in Defensive, Middle, and Attacking thirds"),
                     unsafe_allow_html=True)
                 fig = ch.build_player_region_distance_bar(
-                    detected_palette, profile_rows, team_id, team_label,
-                )
-                st.plotly_chart(fig, use_container_width=True,
-                                config={"displayModeBar": False})
-                st.markdown(ui.card_close(), unsafe_allow_html=True)
-
-        speed_cols = st.columns(2)
-        for col, team_id, team_label in [
-            (speed_cols[0], 0, "Team 1"),
-            (speed_cols[1], 1, "Team 2"),
-        ]:
-            with col:
-                st.markdown(ui.card_open(
-                    f"{team_label} Top Speed By Region",
-                    "Fastest player whose dominant pitch third matches each region"),
-                    unsafe_allow_html=True)
-                fig = ch.build_player_region_top_speed_bar(
                     detected_palette, profile_rows, team_id, team_label,
                 )
                 st.plotly_chart(fig, use_container_width=True,
