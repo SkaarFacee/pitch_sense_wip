@@ -746,9 +746,13 @@ def build_passing_network(palette: dict, network: dict, team_label: str,
         b = next((n for n in nodes if n["track_id"] == e["to"]), None)
         if a is None or b is None:
             continue
+        x0 = float(e.get("from_x", a["x"]))
+        y0 = float(e.get("from_y", a["y"]))
+        x1 = float(e.get("to_x", b["x"]))
+        y1 = float(e.get("to_y", b["y"]))
         w = max(1.0, 6.0 * e["count"] / max_w)
         fig.add_trace(go.Scatter(
-            x=[a["x"], b["x"]], y=[a["y"], b["y"]],
+            x=[x0, x1], y=[y0, y1],
             mode="lines",
             line=dict(color=team_color, width=w),
             opacity=0.55,
@@ -773,9 +777,10 @@ def build_passing_network(palette: dict, network: dict, team_label: str,
     layout["xaxis"].update(dict(showticklabels=False))
     layout["yaxis"].update(dict(showticklabels=False))
     fig.update_layout(layout)
+    total_passes = sum(int(e.get("count", 0)) for e in edges)
     fig.add_annotation(
         x=PITCH_LENGTH / 2, y=PITCH_WIDTH + 1.5, showarrow=False,
-        text=f"<b>{team_label}</b> · {len(edges)} passing connections",
+        text=f"<b>{team_label}</b> · {total_passes} passes · {len(edges)} connections",
         font=dict(color=palette["text"], size=12), xanchor="center",
     )
     return fig
@@ -809,17 +814,75 @@ def _profile_rows(profiles: list[dict] | dict) -> list[dict]:
 
 
 def filter_passing_network_by_pitch_third(network: dict, region_key: str) -> dict:
-    """Return a passing network containing only nodes inside one pitch third."""
+    """Return passes whose pass-time location falls inside one pitch third.
+
+    Newer networks carry per-pass event coordinates derived from the same
+    pitch-space ball/player positions used by the ball trail. Use those to
+    decide the third, then rebuild node positions from pass-time endpoints.
+    Legacy networks without event coordinates fall back to the old node-X
+    filtering behavior.
+    """
     region = _region_for_key(region_key)
-    nodes = []
+    source_nodes = {}
     for node in (network or {}).get("nodes", []):
         try:
-            x = float(node.get("x", float("nan")))
+            source_nodes[int(node.get("track_id"))] = dict(node)
         except (TypeError, ValueError):
             continue
-        if np.isfinite(x) and _x_in_region(x, region):
-            nodes.append(dict(node))
-    node_ids = {int(n["track_id"]) for n in nodes if "track_id" in n}
+
+    def _finite_float(value):
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            return None
+        return out if np.isfinite(out) else None
+
+    def _event_filter_x(event: dict, edge: dict):
+        for key in ("event_x", "ball_mid_x", "ball_end_x", "to_x"):
+            value = _finite_float(event.get(key))
+            if value is not None:
+                return value
+        if all(k in event for k in ("ball_start_x", "ball_end_x")):
+            start_x = _finite_float(event.get("ball_start_x"))
+            end_x = _finite_float(event.get("ball_end_x"))
+            if start_x is not None and end_x is not None:
+                return (start_x + end_x) / 2.0
+        for key in ("event_x", "ball_end_x", "to_x"):
+            value = _finite_float(edge.get(key))
+            if value is not None:
+                return value
+        return None
+
+    def _point(event: dict, prefix: str):
+        x = _finite_float(event.get(f"{prefix}_x"))
+        y = _finite_float(event.get(f"{prefix}_y"))
+        if x is None or y is None:
+            return None
+        return (x, y)
+
+    def _average(events: list[dict], key: str):
+        values = [_finite_float(event.get(key)) for event in events]
+        values = [value for value in values if value is not None]
+        if not values:
+            return None
+        return float(np.mean(values))
+
+    def _with_averages(edge: dict, events: list[dict]) -> dict:
+        out = dict(edge)
+        out["events"] = [dict(event) for event in events]
+        out["count"] = len(events)
+        for key in (
+            "from_x", "from_y", "to_x", "to_y",
+            "ball_start_x", "ball_start_y", "ball_end_x", "ball_end_y",
+            "event_x", "event_y",
+        ):
+            value = _average(events, key)
+            if value is not None:
+                out[key] = value
+        return out
+
+    node_ids: set[int] = set()
+    node_samples: dict[int, list[tuple[float, float]]] = {}
     edges = []
     for edge in (network or {}).get("edges", []):
         try:
@@ -827,8 +890,58 @@ def filter_passing_network_by_pitch_third(network: dict, region_key: str) -> dic
             b = int(edge.get("to"))
         except (TypeError, ValueError):
             continue
-        if a in node_ids and b in node_ids:
+        events = [dict(event) for event in edge.get("events", [])]
+        if events:
+            region_events = []
+            has_event_locations = False
+            for event in events:
+                event_x = _event_filter_x(event, edge)
+                if event_x is None:
+                    continue
+                has_event_locations = True
+                if _x_in_region(event_x, region):
+                    region_events.append(event)
+            if has_event_locations:
+                if not region_events:
+                    continue
+                edges.append(_with_averages(edge, region_events))
+                node_ids.update((a, b))
+                for event in region_events:
+                    from_point = _point(event, "from")
+                    to_point = _point(event, "to")
+                    if from_point is not None:
+                        node_samples.setdefault(a, []).append(from_point)
+                    if to_point is not None:
+                        node_samples.setdefault(b, []).append(to_point)
+                continue
+
+        edge_x = _event_filter_x({}, edge)
+        if edge_x is not None:
+            if _x_in_region(edge_x, region):
+                edges.append(dict(edge))
+                node_ids.update((a, b))
+            continue
+
+        # Legacy fallback: old networks only had node positions.
+        node_a = source_nodes.get(a)
+        node_b = source_nodes.get(b)
+        ax = _finite_float((node_a or {}).get("x"))
+        bx = _finite_float((node_b or {}).get("x"))
+        if (ax is not None and bx is not None
+                and _x_in_region(ax, region) and _x_in_region(bx, region)):
             edges.append(dict(edge))
+            node_ids.update((a, b))
+
+    nodes = []
+    for node_id in sorted(node_ids):
+        node = dict(source_nodes.get(node_id, {"track_id": node_id}))
+        samples = node_samples.get(node_id, [])
+        if samples:
+            arr = np.asarray(samples, dtype=np.float32)
+            node["x"] = float(arr[:, 0].mean())
+            node["y"] = float(arr[:, 1].mean())
+        if "x" in node and "y" in node:
+            nodes.append(node)
     return {"nodes": nodes, "edges": edges}
 
 

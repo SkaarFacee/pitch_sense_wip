@@ -1238,6 +1238,35 @@ class KeypointPipeline:
                 and ball_travel_m >= MIN_PASS_BALL_TRAVEL_M
                 and self._pass_cooldown_frames == 0
                 and source_key != int(observed_owner["key"])):
+            def _pitch_point(prefix: str, point) -> dict:
+                if point is None:
+                    return {}
+                arr = np.asarray(point, dtype=np.float32).reshape(-1)
+                if arr.size < 2:
+                    return {}
+                x, y = float(arr[0]), float(arr[1])
+                if not (np.isfinite(x) and np.isfinite(y)):
+                    return {}
+                return {f"{prefix}_x": round(x, 3), f"{prefix}_y": round(y, 3)}
+
+            receiver_pitch = observed_owner.get("pitch")
+            start_ball = source.get("start_ball_pitch")
+            end_ball = current_ball
+            if start_ball is not None and end_ball is not None:
+                event_point = (
+                    np.asarray(start_ball, dtype=np.float32).reshape(-1)[:2]
+                    + np.asarray(end_ball, dtype=np.float32).reshape(-1)[:2]
+                ) / 2.0
+            elif end_ball is not None:
+                event_point = end_ball
+            elif source_pitch is not None and receiver_pitch is not None:
+                event_point = (
+                    np.asarray(source_pitch, dtype=np.float32).reshape(-1)[:2]
+                    + np.asarray(receiver_pitch, dtype=np.float32).reshape(-1)[:2]
+                ) / 2.0
+            else:
+                event_point = receiver_pitch
+
             pass_info = {
                 "from_tid": int(source_display_tid),
                 "to_tid": int(observed_owner["display_tid"]),
@@ -1246,6 +1275,11 @@ class KeypointPipeline:
                 "team": int(observed_owner["team"]),
                 "distance_m": round(pass_dist_m, 1),
             }
+            pass_info.update(_pitch_point("from", source_pitch))
+            pass_info.update(_pitch_point("to", receiver_pitch))
+            pass_info.update(_pitch_point("ball_start", start_ball))
+            pass_info.update(_pitch_point("ball_end", end_ball))
+            pass_info.update(_pitch_point("event", event_point))
             pass_event = dict(pass_info)
             self._pass_flash_counter = PASS_FLASH_FRAMES
             self._last_pass_info = pass_info

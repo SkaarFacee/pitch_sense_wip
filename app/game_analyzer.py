@@ -1554,6 +1554,76 @@ class GameAnalyzer:
         # canonical source per spec). Fall back to nearest-pitch-distance
         # transitions for legacy data without ``pass_event``.
         edge_counts: dict[tuple[int, int], int] = {}
+        edge_events: dict[tuple[int, int], list[dict]] = {}
+
+        def _finite_float(value) -> Optional[float]:
+            try:
+                out = float(value)
+            except (TypeError, ValueError):
+                return None
+            return out if np.isfinite(out) else None
+
+        def _event_from_pass_event(ev: dict, entry: dict,
+                                   from_id: int, to_id: int) -> dict:
+            frame_idx = int(entry.get("frame_idx", 0))
+            event: dict = {"frame_idx": int(frame_idx)}
+            for key in (
+                "from_x", "from_y", "to_x", "to_y",
+                "ball_start_x", "ball_start_y", "ball_end_x", "ball_end_y",
+                "event_x", "event_y",
+            ):
+                value = _finite_float(ev.get(key))
+                if value is not None:
+                    event[key] = value
+
+            ids = GameAnalyzer._ids_for_entry(entry)
+            positions = entry.get("player_positions")
+            if ids is not None and positions is not None and len(ids) == len(positions):
+                for tid, pos in zip(np.asarray(ids), np.asarray(positions)):
+                    try:
+                        tid_int = int(tid)
+                    except (TypeError, ValueError):
+                        continue
+                    arr = np.asarray(pos, dtype=np.float32).reshape(-1)
+                    if arr.size < 2:
+                        continue
+                    x, y = float(arr[0]), float(arr[1])
+                    if not (np.isfinite(x) and np.isfinite(y)):
+                        continue
+                    if tid_int == from_id and ("from_x" not in event or "from_y" not in event):
+                        event["from_x"], event["from_y"] = x, y
+                    if tid_int == to_id and ("to_x" not in event or "to_y" not in event):
+                        event["to_x"], event["to_y"] = x, y
+
+            ball = entry.get("ball_position")
+            if ball is not None and ("ball_end_x" not in event or "ball_end_y" not in event):
+                ball_arr = np.asarray(ball, dtype=np.float32).reshape(-1)
+                if ball_arr.size >= 2:
+                    x, y = float(ball_arr[0]), float(ball_arr[1])
+                    if np.isfinite(x) and np.isfinite(y):
+                        event["ball_end_x"], event["ball_end_y"] = x, y
+
+            if "event_x" not in event or "event_y" not in event:
+                derived = None
+                if all(k in event for k in (
+                        "ball_start_x", "ball_start_y", "ball_end_x", "ball_end_y")):
+                    derived = (
+                        (event["ball_start_x"] + event["ball_end_x"]) / 2.0,
+                        (event["ball_start_y"] + event["ball_end_y"]) / 2.0,
+                    )
+                elif all(k in event for k in ("from_x", "from_y", "to_x", "to_y")):
+                    derived = (
+                        (event["from_x"] + event["to_x"]) / 2.0,
+                        (event["from_y"] + event["to_y"]) / 2.0,
+                    )
+                elif all(k in event for k in ("ball_end_x", "ball_end_y")):
+                    derived = (event["ball_end_x"], event["ball_end_y"])
+                elif all(k in event for k in ("to_x", "to_y")):
+                    derived = (event["to_x"], event["to_y"])
+                if derived is not None:
+                    event["event_x"], event["event_y"] = derived
+            return event
+
         used_bbox_events = False
         for entry in game_data:
             ev = entry.get("pass_event")
@@ -1565,6 +1635,10 @@ class GameAnalyzer:
             if a == b:
                 continue
             edge_counts[(a, b)] = edge_counts.get((a, b), 0) + 1
+            event = _event_from_pass_event(
+                ev, entry=entry, from_id=a, to_id=b,
+            )
+            edge_events.setdefault((a, b), []).append(event)
 
         if not used_bbox_events:
             prev_owner_tid: Optional[int] = None
@@ -1600,13 +1674,42 @@ class GameAnalyzer:
                 prev_owner_tid = best_tid
                 prev_owner_team = new_team
 
-        # Node layouts: only players who actually participated in a pass
-        # (as ``from`` or ``to`` in some recorded edge), positioned at their
-        # LAST on-pitch position rather than their average. This keeps the
-        # graph focused on the players who moved the ball.
+        def _event_point(event: dict, prefix: str) -> Optional[tuple[float, float]]:
+            x = _finite_float(event.get(f"{prefix}_x"))
+            y = _finite_float(event.get(f"{prefix}_y"))
+            if x is None or y is None:
+                return None
+            return (x, y)
+
+        def _average_event_value(events: list[dict], key: str) -> Optional[float]:
+            values = [_finite_float(e.get(key)) for e in events]
+            values = [v for v in values if v is not None]
+            if not values:
+                return None
+            return float(np.mean(values))
+
+        def _last_on_pitch_position(rec: TrackRecord) -> Optional[tuple[float, float]]:
+            if not rec.positions:
+                return None
+            xs = np.array([p[0] for p in rec.positions], dtype=np.float32)
+            ys = np.array([p[1] for p in rec.positions], dtype=np.float32)
+            mask = ((xs >= -2) & (xs <= PITCH_LENGTH + 2)
+                    & (ys >= -2) & (ys <= PITCH_WIDTH + 2))
+            if not np.any(mask):
+                return None
+            for px, py in reversed(rec.positions):
+                if -2 <= px <= PITCH_LENGTH + 2 and -2 <= py <= PITCH_WIDTH + 2:
+                    return (float(px), float(py))
+            return (float(xs[mask][-1]), float(ys[mask][-1]))
+
+        # Node layouts: only players who actually participated in a pass.
+        # Prefer the source/receiver coordinates captured at pass time so
+        # the network uses the same pitch-space moments as the ball trail.
+        # Legacy runs without pass coordinates fall back to the last known
+        # on-pitch track position.
         def _nodes_for(team: int) -> list[dict]:
-            # Track ids that touched a pass edge belonging to this team.
             participants: set[int] = set()
+            pass_samples: dict[int, list[tuple[float, float]]] = {}
             for (a, b), c in edge_counts.items():
                 if c <= 0:
                     continue
@@ -1614,35 +1717,35 @@ class GameAnalyzer:
                 tb = registry.canonical_team(b)
                 if ta == team:
                     participants.add(a)
+                    for event in edge_events.get((a, b), []):
+                        point = _event_point(event, "from")
+                        if point is not None:
+                            pass_samples.setdefault(a, []).append(point)
                 if tb == team:
                     participants.add(b)
+                    for event in edge_events.get((a, b), []):
+                        point = _event_point(event, "to")
+                        if point is not None:
+                            pass_samples.setdefault(b, []).append(point)
 
             nodes = []
-            for tid, rec in registry.tracks.items():
-                if rec.canonical_team != team or not rec.positions:
+            for tid in sorted(participants):
+                rec = registry.tracks.get(int(tid))
+                if rec is None or rec.canonical_team != team:
                     continue
-                if tid not in participants:
-                    continue
-                xs = np.array([p[0] for p in rec.positions], dtype=np.float32)
-                ys = np.array([p[1] for p in rec.positions], dtype=np.float32)
-                mask = ((xs >= -2) & (xs <= PITCH_LENGTH + 2)
-                        & (ys >= -2) & (ys <= PITCH_WIDTH + 2))
-                if not np.any(mask):
-                    continue
-                # Last on-pitch position: walk the recorded positions
-                # backwards and take the first that is on-pitch.
-                last_x = last_y = None
-                for px, py in reversed(rec.positions):
-                    if -2 <= px <= PITCH_LENGTH + 2 and -2 <= py <= PITCH_WIDTH + 2:
-                        last_x, last_y = float(px), float(py)
-                        break
-                if last_x is None:
-                    last_x = float(xs[mask][-1])
-                    last_y = float(ys[mask][-1])
+                samples = pass_samples.get(int(tid), [])
+                if samples:
+                    arr = np.asarray(samples, dtype=np.float32)
+                    x, y = float(arr[:, 0].mean()), float(arr[:, 1].mean())
+                else:
+                    fallback = _last_on_pitch_position(rec)
+                    if fallback is None:
+                        continue
+                    x, y = fallback
                 nodes.append({
                     "track_id": int(tid),
-                    "x": last_x,
-                    "y": last_y,
+                    "x": x,
+                    "y": y,
                     "frames": int(rec.frames_seen),
                 })
             return nodes
@@ -1653,7 +1756,19 @@ class GameAnalyzer:
                 ta = registry.canonical_team(a)
                 tb = registry.canonical_team(b)
                 if ta == team and tb == team:
-                    edges.append({"from": a, "to": b, "count": int(c)})
+                    events = [dict(e) for e in edge_events.get((a, b), [])]
+                    edge = {"from": a, "to": b, "count": int(c)}
+                    if events:
+                        edge["events"] = events
+                        for key in (
+                            "from_x", "from_y", "to_x", "to_y",
+                            "ball_start_x", "ball_start_y", "ball_end_x", "ball_end_y",
+                            "event_x", "event_y",
+                        ):
+                            value = _average_event_value(events, key)
+                            if value is not None:
+                                edge[key] = value
+                    edges.append(edge)
             return edges
 
         t1_nodes = _nodes_for(TEAM0)

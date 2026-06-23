@@ -1,13 +1,62 @@
 # PitchSense ⚽
 
-**PitchSense** is a football (soccer) video analysis pipeline that processes tactical/broadcast footage to produce:
+**PitchSense** turns ordinary football match footage into tactical telemetry: player and ball coordinates projected onto a real pitch, stabilized team identities, possession and spatial analytics, and synchronized review videos without GPS vests, sensor rigs, or manual tagging.
 
-- **Keypoint detection** → pitch registration via homography
-- **Player detection & tracking** → ByteTrack + full-sequence team stabilization
-- **Ball detection** → dedicated YOLO model + trajectory trail
-- **Pitch segmentation** → region overlay (penalty areas, center circle, etc.)
-- **Top-down pitch map** → projected player + ball positions with trail
-- **Game analytics** → possession, heatmaps, formation, territory control, match stats
+For a university techfest, PitchSense is both a product pitch and a hiring signal. It solves a real sports-analysis access problem for teams that cannot afford proprietary tracking systems, while demonstrating an end-to-end applied AI system across model inference, geometric computer vision, tracking, analytics, and product UX.
+
+---
+
+## Techfest Pitch
+
+**Core pitch:** professional-style match intelligence from one normal video file.
+
+| Audience | Pitch | What to show |
+|----------|-------|--------------|
+| **Judges** | PitchSense makes advanced football telemetry accessible to schools, clubs, and student teams by replacing expensive hardware with computer vision. | Standard video input, four-model CV stack, homography to a 105 m x 68 m pitch, top-down replay, possession, territory, and pass analytics. |
+| **Prospective employers** | This is not just a model demo; it is a full applied-AI product with modular services, sequence-level stabilization, interactive analytics, and a coach-facing dashboard. | `KeypointPipeline`, two-pass processing, ByteTrack integration, team stabilizer, Plotly/Streamlit UI, clean data contracts, and documented architecture. |
+| **Other students** | PitchSense is a hackable sports-AI platform that shows how raw pixels become useful tactical insight. | Clear Python modules, visual outputs, Mermaid docs, extensible analytics, and readable pipeline stages. |
+| **End users** | Upload a match and get coaching insight: who controlled the ball, where each team played, how compact they were, and which moments deserve review. | Possession timeline, density heatmaps, formation scatter, passing networks, pressing by region, set pieces, and frame inspector. |
+
+---
+
+## What to Emphasize in a Demo
+
+| Signal | Existing feature to emphasize | Why it matters |
+|--------|------------------------------|----------------|
+| Market viability | No-special-hardware workflow from standard `.mp4`, `.webm`, `.avi`, `.mov`, or `.mkv` footage | Lowers adoption cost for clubs, schools, and analysts. |
+| Technical merit | Four-model perception stack: keypoint YOLO-Pose, player detection, dedicated ball detection, and pitch segmentation | Shows breadth across detection, pose/keypoints, segmentation, and small-object tracking. |
+| Computer vision depth | 29 pitch landmarks mapped through DLT homography with EMA smoothing | Converts broadcast perspective into real pitch coordinates rather than only drawing boxes. |
+| Robustness | ByteTrack plus full-sequence team/role stabilization | Reduces identity/team flicker and proves attention to temporal consistency. |
+| Sports intelligence | Possession, heatmaps, formation, territory, passing networks, pressing, set pieces, distance, and speed | Turns detections into decisions coaches understand. |
+| Product polish | Streamlit dashboard with Match Centre, Pitch Analysis, Player Analytics, Outputs, and frame inspector | Makes the system demoable and usable beyond notebooks. |
+| Recruiting signal | Modular services, documented architecture, explicit configuration, and generated artifacts | Demonstrates software engineering judgment, not just ML experimentation. |
+
+---
+
+## Features That Would Strengthen Appeal
+
+| Priority | New feature | Market and hiring impact |
+|----------|-------------|--------------------------|
+| 1 | Surface advanced analytics already available in code paths, including xT heatmaps, Voronoi pitch control, defensive-line timelines, and possession-chain histograms | Converts hidden technical work into visible demo value. |
+| 2 | Exportable coach report as PDF/HTML with key charts, pass maps, set pieces, and review frames | Makes PitchSense easier to share with coaches and judges after a live demo. |
+| 3 | CSV/JSON telemetry exports for player tracks, ball positions, passes, possession, and profiles | Appeals to analysts, researchers, and employers looking for clean data products. |
+| 4 | Confidence and evaluation dashboard for ball detection rate, homography quality, track quality, and pass confidence | Shows production thinking, trust calibration, and measurable model quality. |
+| 5 | Human-in-the-loop correction for team colors, projection flips, player relabeling, and pass confirmation | Makes the tool more reliable in real club workflows. |
+| 6 | Automatic highlight clips for set pieces, turnovers, long possession chains, and high-press moments | Increases end-user value and creates memorable techfest demos. |
+| 7 | Reproducible one-command demo with pinned dependencies, sample footage, and optional Docker packaging | Strengthens hiring signal by proving deployment and handoff readiness. |
+
+---
+
+## Current Capabilities
+
+PitchSense processes tactical or broadcast footage to produce:
+
+- **Keypoint detection** -> pitch registration via homography
+- **Player detection and tracking** -> ByteTrack plus full-sequence team stabilization
+- **Ball detection** -> dedicated YOLO model plus trajectory trail
+- **Pitch segmentation** -> region overlay for penalty areas, center circle, and pitch halves
+- **Top-down pitch map** -> projected player and ball positions with trail
+- **Game analytics** -> possession, heatmaps, formation, territory control, pass networks, pressing, set pieces, match stats
 
 ---
 
@@ -15,10 +64,10 @@
 
 - Python 3.10+
 - [Ultralytics](https://github.com/ultralytics/ultralytics) (YOLO)
-- OpenCV, NumPy, Matplotlib, Streamlit, scikit-learn
+- OpenCV, NumPy, Matplotlib, Streamlit, scikit-learn, Plotly
 
 ```bash
-pip install ultralytics opencv-python numpy matplotlib streamlit scikit-learn
+pip install ultralytics opencv-python numpy matplotlib streamlit scikit-learn plotly
 ```
 
 ---
@@ -32,9 +81,9 @@ Place YOLO `.pt` weights in the following paths (configured in [`app/constants.p
 | Keypoint (YOLO-Pose) | [`models/keypoint_model/26n_pipeline/no_aug/weights/best.pt`](models/keypoint_model/26n_pipeline/no_aug/weights/best.pt) |
 | Player detection | [`models/player_model/best.pt`](models/player_model/best.pt) |
 | Segmentation | [`models/segmentation/best.pt`](models/segmentation/best.pt) |
-| Ball detection | [`models/ball_model/yolo_11_best.pt`](models/ball_model/yolo_11_best.pt) |
+| Ball detection | [`models/ball_model/yolo26_best.pt`](models/ball_model/yolo26_best.pt) |
 
-To use different paths, edit the [`MODEL_PATHS`](app/streamlit_app.py:52) dict in [`app/streamlit_app.py`](app/streamlit_app.py).
+To use different paths, edit the `MODEL_PATHS` dict in [`app/streamlit_app.py`](app/streamlit_app.py).
 
 ---
 
@@ -46,19 +95,23 @@ To use different paths, edit the [`MODEL_PATHS`](app/streamlit_app.py:52) dict i
 streamlit run app/streamlit_app.py
 ```
 
-Opens a browser UI with three tabs:
+Opens a browser UI with five tabs:
 
-1. **🎬 Processing** — Select a video, configure options, run the full pipeline, view 5 output videos
-2. **📊 Pitch Analytics** — Region detection frequency from segmentation data
-3. **🎮 Game Analysis** — Possession, heatmaps, formation scatter, territory control, match stats
+1. **🎬 Processing** — Select a video, configure options, and run the full pipeline
+2. **📊 Match Centre** — Possession, momentum timeline, team DNA radar, territory control, attacking direction
+3. **🗺️ Pitch Analysis** — Heatmaps, formation scatter, ball trail, segmentation regions, zone timelines
+4. **👤 Player Analytics** — Passing networks, pressing by region, distance/speed by third, set pieces
+5. **🎥 Outputs** — Generated videos plus frame-by-frame inspector
 
 ### Processing Options (sidebar)
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | Max frames | 0 (all) | Limit processing to N frames for testing |
-| Process every N frames | 1 | Higher = faster but less smooth |
-| Enable team colors | ✅ | Run jersey color clustering per frame |
+| Team colour clustering | Enabled | Run jersey colour analysis and team assignment |
+| Flip projection X | Off | Mirror the long pitch axis if the camera orientation is reversed |
+| Flip projection Y | On | Mirror the short pitch axis if players appear on the wrong side |
+| Advanced team calibration | Empty JSON | Optional seed colours and track/identity overrides |
 
 ---
 
@@ -106,7 +159,7 @@ All source files are in [`app/`](app/). The pipeline flows through these modules
 
 | File | Purpose |
 |------|---------|
-| [`streamlit_app.py`](app/streamlit_app.py) | Streamlit UI (Processing, Match Centre, Pitch Analysis, Outputs) |
+| [`streamlit_app.py`](app/streamlit_app.py) | Streamlit UI (Processing, Match Centre, Pitch Analysis, Player Analytics, Outputs) |
 | [`keypoint_pipeline.py`](app/keypoint_pipeline.py) | Core pipeline orchestrator, two-pass video processing, rendering, video writers |
 | [`team_stabilizer.py`](app/team_stabilizer.py) | Sequence-level identity linking, stable team membership, role assignment, diagnostics |
 | [`game_analyzer.py`](app/game_analyzer.py) | Possession, heatmaps, formation, territory, match stats, player profiles |
@@ -147,7 +200,7 @@ Outputs are saved to [`output/processed_{video_name}/`](output/) with 5 video fi
 
 ### Per-frame game data dict
 
-Collected during processing for the Game Analysis tab:
+Collected during processing for the analytics dashboard tabs:
 
 ```python
 {
@@ -170,17 +223,24 @@ Full-video processing uses a two-pass stabilizer. The zero-switch guarantee appl
 
 ## Analytics Outputs
 
-**Pitch Analytics tab:**
-- Total frames, frames with segments, coverage %
-- Region detection frequency bar chart + breakdown
-- Raw frame-by-frame JSON export
+**Match Centre tab:**
+- Ball possession % using bbox overlap and sticky carry-forward logic
+- Rolling possession timeline and possession donut
+- Team DNA radar, attacking direction, and 9-zone territory control
 
-**Game Analysis tab:**
-- Ball possession % (bbox/proximity-based; GKs are team members, refs are excluded)
-- Player density heatmaps (per team on pitch outline)
-- Formation scatter + defensive depth metrics
-- 9-zone territory control grid
-- Match stats (detection rates, player counts, spread, ball progression)
+**Pitch Analysis tab:**
+- Player density heatmaps per team on a pitch outline
+- Formation scatter, average spread, and ball trajectory trail
+- Region detection frequency charts and pitch-zone timelines
+
+**Player Analytics tab:**
+- Passing networks by team and pitch third
+- Pressing intensity by pitch region
+- Per-player distance, top speed, dominant third, and set-piece counts
+
+**Outputs tab:**
+- Generated analysis videos
+- Frame inspector with synchronized previews, ball location, possession, and region tags
 
 ---
 
