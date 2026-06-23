@@ -58,7 +58,6 @@ SUPPORTED_EXTENSIONS = (".webm", ".mp4", ".avi", ".mov", ".mkv")
 
 OUTPUT_VIDEOS = [
     ("final_draft.mp4",          "Final Draft", "Original + PiP top-down pitch map"),
-    ("annotated_video.mp4",      "Annotated",   "Keypoints, team bboxes, ball"),
     ("deep_analysis.mp4",        "Deep Analysis", "Segmentation overlay + ball"),
     ("full_pitch_debug_map.mp4", "Pitch Map",   "Top-down view + ball trail"),
     ("keypoint_annotations.mp4", "Keypoints",   "Skeleton over the original"),
@@ -129,6 +128,27 @@ def _ball_owner_by_frame(game_data) -> dict:
                 owner_map[fi] = int(owner)
     st.session_state["ball_owner_map"] = {"_n": n, "map": owner_map}
     return owner_map
+
+
+def _half_possession_summary(game_data: list[dict]) -> dict:
+    """First/second half possession without computing hidden ball-rate KPIs."""
+    if not game_data:
+        return {"first": {}, "second": {}, "first_frames": 0, "second_frames": 0,
+                "split_frame": 0}
+    frame_indices = [int(e.get("frame_idx", i)) for i, e in enumerate(game_data)]
+    if not frame_indices:
+        return {"first": {}, "second": {}, "first_frames": 0, "second_frames": 0,
+                "split_frame": 0}
+    mid = (min(frame_indices) + max(frame_indices)) // 2
+    first = [e for e, fi in zip(game_data, frame_indices) if fi <= mid]
+    second = [e for e, fi in zip(game_data, frame_indices) if fi > mid]
+    return {
+        "first_frames": len(first),
+        "second_frames": len(second),
+        "split_frame": mid,
+        "first": GameAnalyzer.compute_possession(first),
+        "second": GameAnalyzer.compute_possession(second),
+    }
 
 
 # ─── Page setup ───────────────────────────────────────────────────────────────
@@ -203,7 +223,7 @@ def get_output_videos(output_dir: Path) -> list[tuple[Path, str, str]]:
 def get_scrubber_bounds(output_dir: Path) -> tuple[int, float, list[tuple[Path, str, int]]]:
     """Return (min_total_frames, fps, [(path, label, frames), ...]) for all
     output videos that exist. ``min_total_frames`` is the smallest frame
-    count across the 5 outputs, which is the safe upper bound for the
+    count across displayed outputs, which is the safe upper bound for the
     scrubber slider.
     """
     fps = 30.0
@@ -466,10 +486,10 @@ with tab_processing:
                             font-weight:700;font-size:0.78rem;">4</div>
                 <div>
                   <div style="color:var(--ps-text);font-weight:700;font-size:0.9rem;">
-                    Ball Detection
+                    Ball Tracking
                   </div>
                   <div style="color:var(--ps-text-dim);font-size:0.82rem;line-height:1.45;">
-                    Detects the ball frame-by-frame and builds a smooth movement trail.
+                    Tracks the ball frame-by-frame and builds a smooth movement trail.
                   </div>
                 </div>
               </div>
@@ -540,9 +560,9 @@ with tab_processing:
                 sublabel=f"Initialising pipeline on <code>{Path(selected_path).name}</code>",
                 stat_pairs=[
                     ("Frames", f"0 / {total_frames:,}"),
-                    ("Ball Detections", "0"),
-                    ("Players/Frame", "—"),
+                    ("Phase", "Starting"),
                     ("Homography", "—"),
+                    ("Status", "Queued"),
                 ],
             ),
             unsafe_allow_html=True,
@@ -584,9 +604,9 @@ with tab_processing:
                                 sublabel=phase_sub,
                                 stat_pairs=[
                                     ("Frames", f"{phase_count:,} / {total_frames:,}"),
-                                    ("Ball Detections", f"{ball_count:,}"),
-                                    ("Players/Frame", "—"),
+                                    ("Homography", "—"),
                                     ("Phase", phase_label),
+                                    ("Status", "Running"),
                                 ],
                             ),
                             unsafe_allow_html=True,
@@ -637,7 +657,6 @@ with tab_processing:
 
                 pct = float(result.get("progress_pct", (processed / max(total_frames, 1)) * 100))
                 h_mode = result.get("H_info", {}).get("mode", "N/A")
-                n_players = int(len(result.get("player_pitch_pts", [])))
 
                 # Update ring every 2 frames to avoid bottleneck
                 if processed % 2 == 0 or processed == total_frames:
@@ -649,9 +668,9 @@ with tab_processing:
                                      f"{'⚽ ball in view' if has_ball else 'no ball this frame'}",
                             stat_pairs=[
                                 ("Frames", f"{processed:,} / {total_frames:,}"),
-                                ("Ball Detections", f"{ball_count:,}"),
-                                ("Players/Frame", f"{n_players}"),
+                                ("Phase", "Rendering"),
                                 ("Homography", str(h_mode)),
+                                ("Status", "Running"),
                             ],
                         ),
                         unsafe_allow_html=True,
@@ -665,9 +684,9 @@ with tab_processing:
                              f"Ball detected in <b>{ball_count:,}</b> ({(ball_count/max(processed,1)*100):.0f}%).",
                     stat_pairs=[
                         ("Frames", f"{processed:,} / {total_frames:,}"),
-                        ("Ball Detections", f"{ball_count:,}"),
-                        ("Players/Frame", "—"),
+                        ("Phase", "Complete"),
                         ("Status", "Done"),
+                        ("Homography", "Final"),
                     ],
                 ),
                 unsafe_allow_html=True,
@@ -762,19 +781,6 @@ with tab_match:
             unsafe_allow_html=True,
         )
 
-        # KPI row
-        avg_p_total = stats["avg_players_total"]
-        ball_pct = stats["ball_detection_rate"]
-        kpi_html = ui.kpi_grid([
-            ("Total Frames",       f"{stats['total_frames']:,}",          "frames analysed"),
-            ("Ball Detection",     f"{ball_pct:.1f}%",                    f"{stats['ball_detection_frames']:,} frames"),
-            ("Players / Frame",    f"{avg_p_total:.1f}",                  f"T1 {stats['avg_players_team1']:.1f} · T2 {stats['avg_players_team2']:.1f}"),
-            ("Avg Spread",         f"{stats['avg_player_spread']} m",     "distance from team centre"),
-            ("Ball Progression",   f"{stats['ball_progression_m']} m",    "total ball travel"),
-            ("Possession Lead",    f"{abs(t1_pct - t2_pct):.1f}%",        ("Team 1 leads" if t1_pct >= t2_pct else "Team 2 leads")),
-        ])
-        st.markdown(kpi_html, unsafe_allow_html=True)
-
         # Charts -- top row
         row1 = st.columns(2)
         with row1[0]:
@@ -797,7 +803,7 @@ with tab_match:
         row2 = st.columns(2)
         with row2[0]:
             st.markdown(ui.card_open("Team DNA Radar",
-                                     "6-axis tactical profile (0 – 100)"),
+                                     "5-axis tactical profile (0 – 100)"),
                         unsafe_allow_html=True)
             fig = ch.build_team_radar(detected_palette, formation, stats, possession)
             st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
@@ -917,15 +923,9 @@ with tab_pitch:
 
             # Formation KPI cards ----------------------------------------------
             formation = GameAnalyzer.compute_formation(st.session_state.game_data)
-            t1c = formation["team1_avg_center"] or [0, 0]
-            t2c = formation["team2_avg_center"] or [0, 0]
             form_kpi = ui.kpi_grid([
-                ("T1 Avg Position",      f"({t1c[0]:.1f}, {t1c[1]:.1f}) m", "centre of mass"),
                 ("T1 Avg Spread",        f"{formation['team1_avg_spread']:.1f} m",  "team compactness"),
-                ("T1 Deepest Player",    f"{formation['team1_defensive_depth']:.1f} m", "avg min-X position"),
-                ("T2 Avg Position",      f"({t2c[0]:.1f}, {t2c[1]:.1f}) m", "centre of mass"),
                 ("T2 Avg Spread",        f"{formation['team2_avg_spread']:.1f} m",  "team compactness"),
-                ("T2 Deepest Player",    f"{formation['team2_defensive_depth']:.1f} m", "avg min-X position"),
             ])
             st.markdown(form_kpi, unsafe_allow_html=True)
 
@@ -934,7 +934,6 @@ with tab_pitch:
             analytics = build_seg_analytics(st.session_state.analytics_data)
 
             seg_kpi = ui.kpi_grid([
-                ("Total Frames",         f"{analytics['total_frames']:,}",     "processed"),
                 ("Frames w/ Segments",   f"{analytics['frames_with_seg']:,}",  "with pitch regions"),
                 ("Segmentation Coverage", f"{analytics['coverage_pct']:.1f}%",  "of all frames"),
                 ("Region Detections",    f"{analytics['total_detections']:,}",  "across all regions"),
@@ -1039,24 +1038,21 @@ with tab_players:
         )
 
         profiles = GameAnalyzer.compute_player_profiles(gd, fps=fps_val)
+        profile_rows = profiles.get("profiles", [])
         network = GameAnalyzer.compute_passing_network(gd)
         pressing = GameAnalyzer.compute_pressing_timeline(gd, window=30)
-        dline = GameAnalyzer.compute_defensive_line_height(gd)
         setpieces = GameAnalyzer.compute_set_pieces(gd, fps=fps_val)
-        xt = GameAnalyzer.compute_xt_heatmap(gd)
-        voronoi = GameAnalyzer.compute_voronoi_control(gd)
-        chains = GameAnalyzer.compute_possession_chains(gd)
-        halves = GameAnalyzer.compute_half_comparison(gd)
+        halves = _half_possession_summary(gd)
 
         # --- KPI strip -------------------------------------------------------
         total_passes = (network.get("total_passes_team1", 0)
                         + network.get("total_passes_team2", 0))
-        total_dist = sum(p["distance_m"] for p in profiles["profiles"])
-        top_speed = max((p["top_speed_m_s"] for p in profiles["profiles"]),
+        total_dist = sum(float(p.get("distance_m", 0.0)) for p in profile_rows)
+        top_speed = max((float(p.get("top_speed_m_s", 0.0)) for p in profile_rows),
                         default=0.0)
         total_setpieces = setpieces.get("total", 0)
         kpi = ui.kpi_grid([
-            ("Tracked Players", f"{len(profiles['profiles'])}",
+            ("Tracked Players", f"{len(profile_rows)}",
              "with team assignment"),
             ("Top Speed",       f"{top_speed:.1f} m/s",
              f"{total_dist / 1000:.1f} km covered total"),
@@ -1067,117 +1063,108 @@ with tab_players:
              f"corners {setpieces['counts'].get('corner', 0)} · "
              f"goal kicks {setpieces['counts'].get('goal_kick', 0)} · "
              f"FK-danger {setpieces['counts'].get('free_kick_dangerous', 0)}"),
-            ("Longest Chain",
-             f"{max(chains['team1'].get('longest', 0), chains['team2'].get('longest', 0))}f",
-             f"T1 {chains['team1'].get('longest', 0)} · T2 {chains['team2'].get('longest', 0)}"),
-            ("Pitch Control",
-             f"T1 {voronoi['team1_pct']:.0f}% · T2 {voronoi['team2_pct']:.0f}%",
-             f"contested {voronoi['contested_pct']:.0f}%"),
         ])
         st.markdown(kpi, unsafe_allow_html=True)
 
-        # --- Passing networks ------------------------------------------------
-        net_cols = st.columns(2)
-        with net_cols[0]:
-            st.markdown(ui.card_open("Team 1 Passing Network",
-                                     "Directed player→player passes overlaid on the pitch"),
-                        unsafe_allow_html=True)
-            fig = ch.build_passing_network(detected_palette, network.get("team1", {}),
-                                           "Team 1", detected_palette["team1"])
-            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-            st.markdown(ui.card_close(), unsafe_allow_html=True)
-        with net_cols[1]:
-            st.markdown(ui.card_open("Team 2 Passing Network",
-                                     "Directed player→player passes overlaid on the pitch"),
-                        unsafe_allow_html=True)
-            fig = ch.build_passing_network(detected_palette, network.get("team2", {}),
-                                           "Team 2", detected_palette["team2"])
-            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-            st.markdown(ui.card_close(), unsafe_allow_html=True)
+        # --- Passing networks by pitch third --------------------------------
+        st.markdown("#### Passing Networks By Team And Pitch Third")
+        for region in ch.PITCH_THIRD_REGIONS:
+            net_cols = st.columns(2)
+            for col, team_key, team_label, team_color in [
+                (net_cols[0], "team1", "Team 1", detected_palette["team1"]),
+                (net_cols[1], "team2", "Team 2", detected_palette["team2"]),
+            ]:
+                with col:
+                    region_network = ch.filter_passing_network_by_pitch_third(
+                        network.get(team_key, {}), region["key"],
+                    )
+                    st.markdown(
+                        ui.card_open(
+                            f"{team_label} {region['short']} Network",
+                            "Directed player→player passes filtered to this pitch third",
+                            chip=f"{region['x_min']:.0f}-{region['x_max']:.0f} m",
+                        ),
+                        unsafe_allow_html=True,
+                    )
+                    fig = ch.build_passing_network(
+                        detected_palette, region_network,
+                        f"{team_label} · {region['short']}", team_color,
+                    )
+                    st.plotly_chart(fig, use_container_width=True,
+                                    config={"displayModeBar": False})
+                    st.markdown(ui.card_close(), unsafe_allow_html=True)
 
-        # --- Pressing + defensive line --------------------------------------
-        tactical_cols = st.columns(2)
-        with tactical_cols[0]:
-            st.markdown(ui.card_open("Pressing Intensity",
-                                     "Rolling 30-frame mean of nearest opponent distance to the ball — lower = more press"),
-                        unsafe_allow_html=True)
-            fig = ch.build_pressing_timeline(detected_palette, pressing)
-            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-            st.markdown(ui.card_close(), unsafe_allow_html=True)
-        with tactical_cols[1]:
-            st.markdown(ui.card_open("Defensive Line Height",
-                                     "Mean X of each team's deepest outfield player (excludes GK)"),
-                        unsafe_allow_html=True)
-            fig = ch.build_defensive_line_timeline(detected_palette, dline)
-            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-            st.markdown(ui.card_close(), unsafe_allow_html=True)
-
-        # --- xT + Voronoi ---------------------------------------------------
-        space_cols = st.columns(2)
-        with space_cols[0]:
-            st.markdown(ui.card_open("Pitch Value (xT)",
-                                     "Danger-weighted ball-possession heatmap"),
-                        unsafe_allow_html=True)
-            xt_cols = st.columns(2)
-            with xt_cols[0]:
-                fig = ch.build_xt_heatmap(detected_palette, xt, team_id=0)
+        # --- Player profile regions ----------------------------------------
+        st.markdown("#### Player Profiles By Team And Pitch Third")
+        dist_cols = st.columns(2)
+        for col, team_id, team_label in [
+            (dist_cols[0], 0, "Team 1"),
+            (dist_cols[1], 1, "Team 2"),
+        ]:
+            with col:
+                st.markdown(ui.card_open(
+                    f"{team_label} Distance By Region",
+                    "Distance weighted by each player's time in Defensive, Middle, and Attacking thirds"),
+                    unsafe_allow_html=True)
+                fig = ch.build_player_region_distance_bar(
+                    detected_palette, profile_rows, team_id, team_label,
+                )
                 st.plotly_chart(fig, use_container_width=True,
                                 config={"displayModeBar": False})
-            with xt_cols[1]:
-                fig = ch.build_xt_heatmap(detected_palette, xt, team_id=1)
+                st.markdown(ui.card_close(), unsafe_allow_html=True)
+
+        speed_cols = st.columns(2)
+        for col, team_id, team_label in [
+            (speed_cols[0], 0, "Team 1"),
+            (speed_cols[1], 1, "Team 2"),
+        ]:
+            with col:
+                st.markdown(ui.card_open(
+                    f"{team_label} Top Speed By Region",
+                    "Fastest player whose dominant pitch third matches each region"),
+                    unsafe_allow_html=True)
+                fig = ch.build_player_region_top_speed_bar(
+                    detected_palette, profile_rows, team_id, team_label,
+                )
                 st.plotly_chart(fig, use_container_width=True,
                                 config={"displayModeBar": False})
-            st.markdown(ui.card_close(), unsafe_allow_html=True)
-        with space_cols[1]:
-            st.markdown(ui.card_open("Pitch Control (Voronoi)",
-                                     "Per-cell ownership by nearest player, signed T1/T2"),
-                        unsafe_allow_html=True)
-            fig = ch.build_voronoi_control(detected_palette, voronoi)
-            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-            st.markdown(ui.card_close(), unsafe_allow_html=True)
+                st.markdown(ui.card_close(), unsafe_allow_html=True)
 
-        # --- Possession chains + halves comparison --------------------------
-        bottom_cols = st.columns(2)
-        with bottom_cols[0]:
-            st.markdown(ui.card_open("Possession Chains",
-                                     "Length distribution of unbroken possession sequences (frames)"),
-                        unsafe_allow_html=True)
-            fig = ch.build_chain_length_histogram(detected_palette, chains)
-            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-            t1c = chains["team1"]; t2c = chains["team2"]
-            st.markdown(
-                f"<div class='ps-card__sub'>"
-                f"T1 longest: <b>{t1c.get('longest', 0)}</b>f · mean "
-                f"<b>{t1c.get('mean', 0):.1f}</b>f · "
-                f"T2 longest: <b>{t2c.get('longest', 0)}</b>f · mean "
-                f"<b>{t2c.get('mean', 0):.1f}</b>f"
-                f"</div>",
-                unsafe_allow_html=True,
-            )
-            st.markdown(ui.card_close(), unsafe_allow_html=True)
-        with bottom_cols[1]:
-            st.markdown(ui.card_open("First Half vs Second Half",
-                                     f"Split at frame {halves.get('split_frame', 0):,}"),
-                        unsafe_allow_html=True)
-            fp = halves.get("first", {}).get("possession", {})
-            sp = halves.get("second", {}).get("possession", {})
-            st.markdown(ui.kpi_grid([
-                ("1H Possession",
-                 f"{fp.get('team1_possession_pct', 0):.0f}% / "
-                 f"{fp.get('team2_possession_pct', 0):.0f}%",
-                 f"{halves.get('first_frames', 0):,} frames"),
-                ("2H Possession",
-                 f"{sp.get('team1_possession_pct', 0):.0f}% / "
-                 f"{sp.get('team2_possession_pct', 0):.0f}%",
-                 f"{halves.get('second_frames', 0):,} frames"),
-                ("1H Ball Rate",
-                 f"{halves.get('first', {}).get('ball_rate', 0):.1f}%",
-                 "frames with ball detected"),
-                ("2H Ball Rate",
-                 f"{halves.get('second', {}).get('ball_rate', 0):.1f}%",
-                 "frames with ball detected"),
-            ]), unsafe_allow_html=True)
-            st.markdown(ui.card_close(), unsafe_allow_html=True)
+        # --- Pressing by pitch third ----------------------------------------
+        press_cols = st.columns(2)
+        for col, team_id, team_label in [
+            (press_cols[0], 0, "Team 1"),
+            (press_cols[1], 1, "Team 2"),
+        ]:
+            with col:
+                st.markdown(ui.card_open(
+                    f"{team_label} Pressing By Region",
+                    "Rolling nearest-opponent distance split by the ball's pitch third"),
+                    unsafe_allow_html=True)
+                fig = ch.build_team_pressing_by_region_timeline(
+                    detected_palette, pressing, gd, team_id, team_label,
+                )
+                st.plotly_chart(fig, use_container_width=True,
+                                config={"displayModeBar": False})
+                st.markdown(ui.card_close(), unsafe_allow_html=True)
+
+        # --- Halves comparison ---------------------------------------------
+        st.markdown(ui.card_open("First Half vs Second Half Possession",
+                                 f"Split at frame {halves.get('split_frame', 0):,}"),
+                    unsafe_allow_html=True)
+        fp = halves.get("first", {})
+        sp = halves.get("second", {})
+        st.markdown(ui.kpi_grid([
+            ("1H Team 1", f"{fp.get('team1_possession_pct', 0):.0f}%",
+             f"{halves.get('first_frames', 0):,} frames"),
+            ("1H Team 2", f"{fp.get('team2_possession_pct', 0):.0f}%",
+             f"{halves.get('first_frames', 0):,} frames"),
+            ("2H Team 1", f"{sp.get('team1_possession_pct', 0):.0f}%",
+             f"{halves.get('second_frames', 0):,} frames"),
+            ("2H Team 2", f"{sp.get('team2_possession_pct', 0):.0f}%",
+             f"{halves.get('second_frames', 0):,} frames"),
+        ]), unsafe_allow_html=True)
+        st.markdown(ui.card_close(), unsafe_allow_html=True)
 
         # --- Set-piece summary ----------------------------------------------
         sp_cols = st.columns(4)
@@ -1210,7 +1197,7 @@ with tab_videos:
             """
             <div class='ps-card' style='text-align:center;padding:40px 24px;'>
               <h3>No outputs yet</h3>
-              <p style='color:var(--ps-text-dim);'>Process a video to see the five generated outputs here.</p>
+              <p style='color:var(--ps-text-dim);'>Process a video to see the generated outputs here.</p>
             </div>
             """,
             unsafe_allow_html=True,
@@ -1250,7 +1237,7 @@ with tab_videos:
 
                 st.markdown(
                     ui.card_open("Frame Inspector",
-                                 "Pick a frame — preview all 5 output videos at that "
+                                 "Pick a frame — preview all available output videos at that "
                                  "timestamp, with match context.",
                                  chip=f"{min_total:,} frames · {fps:.1f} fps"),
                     unsafe_allow_html=True,
@@ -1345,7 +1332,7 @@ with tab_videos:
                         unsafe_allow_html=True,
                     )
 
-                # 5-up preview grid
+                # Preview grid for displayed outputs
                 preview_cols = st.columns(len(frame_rows))
                 for col, (path, label, _total) in zip(preview_cols, frame_rows):
                     with col:

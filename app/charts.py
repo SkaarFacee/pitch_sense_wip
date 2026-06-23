@@ -6,7 +6,7 @@ All builders accept the theme palette (dict) so dark/light modes look consistent
 Charts produced:
     • build_possession_donut       — donut % chart for nearest-player possession
     • build_possession_timeline    — area chart of rolling possession
-    • build_team_radar             — 6-axis tactical DNA radar
+    • build_team_radar             — 5-axis tactical DNA radar
     • build_territory_grid         — 3×3 dominance heatmap (with hover details)
     • build_density_heatmap        — Player density heatmap on a pitch (interactive tooltips)
     • build_formation_scatter      — Combined positioning scatter on a pitch
@@ -16,11 +16,9 @@ Charts produced:
     • build_zone_timeline          — Multi-line timeline of region detections
     • build_attacking_direction_diagram — Two-arrow pitch diagram showing attack direction
     • build_passing_network        — Directed player→player pass graph on a pitch
-    • build_pressing_timeline      — Rolling nearest-opponent distance to ball
-    • build_defensive_line_timeline — Defensive line height (excluding GK)
-    • build_xt_heatmap             — Pitch-value heatmap (danger-weighted)
-    • build_voronoi_control        — Per-cell pitch control heatmap
-    • build_chain_length_histogram — Histogram of possession chain lengths
+    • build_player_region_distance_bar — Team distance split by pitch third
+    • build_player_region_top_speed_bar — Team top speed split by pitch third
+    • build_team_pressing_by_region_timeline — Team pressing split by pitch third
 """
 from __future__ import annotations
 import numpy as np
@@ -35,6 +33,17 @@ from constants import (
     GOAL_AREA_Y_TOP, GOAL_AREA_Y_BOTTOM,
     LEFT_PENALTY_SPOT_X, RIGHT_PENALTY_SPOT_X,
 )
+
+
+PITCH_THIRD_REGIONS = [
+    {"key": "defensive", "short": "Defensive", "label": "Defensive Third",
+     "x_min": 0.0, "x_max": PITCH_LENGTH / 3.0},
+    {"key": "middle", "short": "Middle", "label": "Middle Third",
+     "x_min": PITCH_LENGTH / 3.0, "x_max": 2.0 * PITCH_LENGTH / 3.0},
+    {"key": "attacking", "short": "Attacking", "label": "Attacking Third",
+     "x_min": 2.0 * PITCH_LENGTH / 3.0, "x_max": PITCH_LENGTH},
+]
+_THIRD_SHORTS = [r["short"] for r in PITCH_THIRD_REGIONS]
 
 
 # ─── Layout helpers ──────────────────────────────────────────────────────────
@@ -244,14 +253,12 @@ def build_possession_timeline(palette: dict, game_data: list, window: int = 30) 
 
 # ─── Team radar ──────────────────────────────────────────────────────────────
 def build_team_radar(palette: dict, formation: dict, stats: dict, possession: dict) -> go.Figure:
-    """6-axis tactical DNA radar."""
+    """5-axis tactical DNA radar without defensive-depth metrics."""
     def clip(v, lo=0.0, hi=100.0):
         return float(max(lo, min(hi, v)))
 
     t1_attack = clip(formation["team1_avg_center"][0] / PITCH_LENGTH * 100) if formation.get("team1_avg_center") else 50.0
     t2_attack = clip(formation["team2_avg_center"][0] / PITCH_LENGTH * 100) if formation.get("team2_avg_center") else 50.0
-    t1_def = clip(100 - (formation["team1_defensive_depth"] / PITCH_LENGTH * 100))
-    t2_def = clip(100 - (formation["team2_defensive_depth"] / PITCH_LENGTH * 100))
     max_spread = 40.0
     t1_comp = clip(100 - (formation["team1_avg_spread"] / max_spread * 100))
     t2_comp = clip(100 - (formation["team2_avg_spread"] / max_spread * 100))
@@ -263,9 +270,9 @@ def build_team_radar(palette: dict, formation: dict, stats: dict, possession: di
     t1_tempo = tempo * (t1_poss / 100 + 0.5)
     t2_tempo = tempo * (t2_poss / 100 + 0.5)
 
-    categories = ["Attacking Intent", "Defensive Depth", "Compactness", "Width", "Possession", "Tempo"]
-    t1_vals = [t1_attack, t1_def, t1_comp, t1_width, t1_poss, clip(t1_tempo)]
-    t2_vals = [t2_attack, t2_def, t2_comp, t2_width, t2_poss, clip(t2_tempo)]
+    categories = ["Attacking Intent", "Compactness", "Width", "Possession", "Tempo"]
+    t1_vals = [t1_attack, t1_comp, t1_width, t1_poss, clip(t1_tempo)]
+    t2_vals = [t2_attack, t2_comp, t2_width, t2_poss, clip(t2_tempo)]
 
     # Close the polygon
     cats_loop = categories + [categories[0]]
@@ -771,6 +778,224 @@ def build_passing_network(palette: dict, network: dict, team_label: str,
         text=f"<b>{team_label}</b> · {len(edges)} passing connections",
         font=dict(color=palette["text"], size=12), xanchor="center",
     )
+    return fig
+
+
+def _region_for_key(region_key: str) -> dict:
+    for region in PITCH_THIRD_REGIONS:
+        if region["key"] == region_key:
+            return region
+    return PITCH_THIRD_REGIONS[0]
+
+
+def _x_in_region(x: float, region: dict) -> bool:
+    x = float(x)
+    if region["key"] == "attacking":
+        return region["x_min"] <= x <= region["x_max"]
+    return region["x_min"] <= x < region["x_max"]
+
+
+def _third_key_for_x(x: float) -> Optional[str]:
+    for region in PITCH_THIRD_REGIONS:
+        if _x_in_region(x, region):
+            return region["key"]
+    return None
+
+
+def _profile_rows(profiles: list[dict] | dict) -> list[dict]:
+    if isinstance(profiles, dict):
+        return list(profiles.get("profiles", []))
+    return list(profiles or [])
+
+
+def filter_passing_network_by_pitch_third(network: dict, region_key: str) -> dict:
+    """Return a passing network containing only nodes inside one pitch third."""
+    region = _region_for_key(region_key)
+    nodes = []
+    for node in (network or {}).get("nodes", []):
+        try:
+            x = float(node.get("x", float("nan")))
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(x) and _x_in_region(x, region):
+            nodes.append(dict(node))
+    node_ids = {int(n["track_id"]) for n in nodes if "track_id" in n}
+    edges = []
+    for edge in (network or {}).get("edges", []):
+        try:
+            a = int(edge.get("from"))
+            b = int(edge.get("to"))
+        except (TypeError, ValueError):
+            continue
+        if a in node_ids and b in node_ids:
+            edges.append(dict(edge))
+    return {"nodes": nodes, "edges": edges}
+
+
+def build_player_region_distance_bar(palette: dict, profiles: list[dict] | dict,
+                                     team_id: int, team_label: str) -> go.Figure:
+    """Distance covered by one team, weighted by each player's time in thirds."""
+    rows = [p for p in _profile_rows(profiles) if int(p.get("team", -1)) == int(team_id)]
+    if not rows:
+        return _empty_fig(palette, f"No player profiles for {team_label}")
+    totals = []
+    player_counts = []
+    for idx, _region in enumerate(PITCH_THIRD_REGIONS):
+        total = 0.0
+        count = 0
+        for profile in rows:
+            thirds = profile.get("time_in_thirds_pct") or [0.0, 0.0, 0.0]
+            pct = float(thirds[idx]) if idx < len(thirds) else 0.0
+            if pct > 0.0:
+                count += 1
+            total += float(profile.get("distance_m", 0.0)) * pct / 100.0
+        totals.append(total)
+        player_counts.append(count)
+
+    color = palette["team1"] if int(team_id) == 0 else palette["team2"]
+    custom = [[c, v / 1000.0] for c, v in zip(player_counts, totals)]
+    fig = go.Figure(go.Bar(
+        x=_THIRD_SHORTS,
+        y=totals,
+        name=team_label,
+        marker=dict(color=color, line=dict(width=0)),
+        customdata=custom,
+        text=[f"{v / 1000.0:.2f} km" for v in totals],
+        textposition="outside",
+        textfont=dict(color=palette["text"]),
+        hovertemplate=(
+            f"<b>{team_label}</b><br>Region: %{{x}}<br>"
+            "Distance: %{y:.1f} m (%{customdata[1]:.2f} km)<br>"
+            "Players present: %{customdata[0]}<extra></extra>"
+        ),
+    ))
+    layout = _base_layout(palette, height=320)
+    layout.update(dict(
+        showlegend=False,
+        xaxis=dict(title="Pitch third", gridcolor=palette["grid"]),
+        yaxis=dict(title="Weighted distance (m)", gridcolor=palette["grid"],
+                   rangemode="tozero"),
+    ))
+    fig.update_layout(layout)
+    fig.update_layout(legend_title_text="", showlegend=False)
+    return fig
+
+
+def build_player_region_top_speed_bar(palette: dict, profiles: list[dict] | dict,
+                                      team_id: int, team_label: str) -> go.Figure:
+    """Top speed by dominant pitch third for one team."""
+    rows = [p for p in _profile_rows(profiles) if int(p.get("team", -1)) == int(team_id)]
+    if not rows:
+        return _empty_fig(palette, f"No player profiles for {team_label}")
+    speeds = []
+    track_ids = []
+    for region in PITCH_THIRD_REGIONS:
+        candidates = [
+            p for p in rows
+            if str(p.get("dominant_third", "")).lower().startswith(region["short"].lower())
+        ]
+        if not candidates:
+            speeds.append(0.0)
+            track_ids.append("—")
+            continue
+        top_profile = max(candidates, key=lambda p: float(p.get("top_speed_m_s", 0.0)))
+        speeds.append(float(top_profile.get("top_speed_m_s", 0.0)))
+        track_ids.append(f"#{int(top_profile.get('track_id', 0))}")
+
+    color = palette["team1"] if int(team_id) == 0 else palette["team2"]
+    custom = [[tid] for tid in track_ids]
+    fig = go.Figure(go.Bar(
+        x=_THIRD_SHORTS,
+        y=speeds,
+        name=team_label,
+        marker=dict(color=color, line=dict(width=0)),
+        customdata=custom,
+        text=[f"{v:.1f}" if v > 0 else "—" for v in speeds],
+        textposition="outside",
+        textfont=dict(color=palette["text"]),
+        hovertemplate=(
+            f"<b>{team_label}</b><br>Dominant region: %{{x}}<br>"
+            "Top speed: %{y:.2f} m/s<br>Player: %{customdata[0]}<extra></extra>"
+        ),
+    ))
+    layout = _base_layout(palette, height=320)
+    layout.update(dict(
+        showlegend=False,
+        xaxis=dict(title="Dominant pitch third", gridcolor=palette["grid"]),
+        yaxis=dict(title="Top speed (m/s)", gridcolor=palette["grid"],
+                   rangemode="tozero"),
+    ))
+    fig.update_layout(layout)
+    fig.update_layout(legend_title_text="", showlegend=False)
+    return fig
+
+
+def build_team_pressing_by_region_timeline(palette: dict, pressing: dict,
+                                           game_data: list, team_id: int,
+                                           team_label: str) -> go.Figure:
+    """One team's pressing timeline split by ball-location pitch third."""
+    if not pressing or not pressing.get("x"):
+        return _empty_fig(palette, f"No pressing data for {team_label}")
+
+    team_key = "team1" if int(team_id) == 0 else "team2"
+    x_axis = list(pressing.get("x", []))
+    values = list(pressing.get(team_key, []))
+    n = min(len(x_axis), len(values), len(game_data or []))
+    if n == 0:
+        return _empty_fig(palette, f"No pressing data for {team_label}")
+
+    series = {r["key"]: [None] * n for r in PITCH_THIRD_REGIONS}
+    has_values = False
+    for i in range(n):
+        value = values[i]
+        if value is None:
+            continue
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(value):
+            continue
+        ball = (game_data[i] or {}).get("ball_position")
+        if ball is None:
+            continue
+        arr = np.asarray(ball, dtype=float).reshape(-1)
+        if arr.shape[0] < 2 or not np.isfinite(arr[0]):
+            continue
+        region_key = _third_key_for_x(float(arr[0]))
+        if region_key is None:
+            continue
+        series[region_key][i] = value
+        has_values = True
+
+    if not has_values:
+        return _empty_fig(palette, f"No region-tagged pressing data for {team_label}")
+
+    team_color = palette["team1"] if int(team_id) == 0 else palette["team2"]
+    colors = [palette["accent_1"], palette["warn"], team_color]
+    fig = go.Figure()
+    for region, color in zip(PITCH_THIRD_REGIONS, colors):
+        fig.add_trace(go.Scatter(
+            x=x_axis[:n],
+            y=series[region["key"]],
+            mode="lines",
+            name=region["short"],
+            line=dict(color=color, width=2.0),
+            connectgaps=False,
+            hovertemplate=(
+                f"<b>{team_label}</b><br>Region: {region['label']}<br>"
+                "Frame %{x}<br>Nearest opponent: %{y:.1f} m<extra></extra>"
+            ),
+        ))
+    layout = _base_layout(palette, height=320)
+    layout.update(dict(
+        xaxis=dict(title="Frame", gridcolor=palette["grid"],
+                   zerolinecolor=palette["grid"]),
+        yaxis=dict(title="Nearest opponent to ball (m)", rangemode="tozero",
+                   gridcolor=palette["grid"], zerolinecolor=palette["grid"]),
+    ))
+    fig.update_layout(layout)
+    fig.update_layout(legend_title_text="")
     return fig
 
 
