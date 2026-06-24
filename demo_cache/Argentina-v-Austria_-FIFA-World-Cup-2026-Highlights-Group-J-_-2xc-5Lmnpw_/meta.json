@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "possession": {
+    "team1_pct": 83.3,
+    "team2_pct": 16.7,
+    "team1_frames": 625,
+    "team2_frames": 125
+  },
+  "ball_detection_pct": 40.7,
+  "processed_frames": 918,
+  "source_video": "Argentina-v-Austria_-FIFA-World-Cup-2026-Highlights-Group-J-_-2xc-5Lmnpw_",
+  "fps": 25.0,
+  "total_frames": 918,
+  "source_stem": "Argentina v Austria\uff1a FIFA World Cup 2026 Highlights Group J [-2xc-5Lmnpw]",
+  "source_run_dir": "/Users/adi/Skaarfacee/github/aishowcase/try3/demo_cache/Argentina-v-Austria_-FIFA-World-Cup-2026-Highlights-Group-J-_-2xc-5Lmnpw_"
+}

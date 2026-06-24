@@ -39,22 +39,12 @@ from frame_scrubber import (
     seek_to_frame, frame_to_rgb, regions_for_frame, find_closest_entry,
     get_video_meta,
 )
+from demo_loader import (
+    DEMO_CACHE_DIR, DemoLoadError, list_demos, load_demo, validate_demo,
+)
+from config import MODEL_PATHS, OUTPUT_BASE, SUPPORTED_EXTENSIONS, TEST_DATA_DIR
 import ui_theme as ui
 import charts as ch
-
-
-# ─── Configuration ────────────────────────────────────────────────────────────
-TEST_DATA_DIR = _PROJECT_ROOT / "data" / "matches"
-OUTPUT_BASE = _PROJECT_ROOT / "output"
-
-MODEL_PATHS = {
-    "keypoint": str(_PROJECT_ROOT / "models" / "keypoint_model" / "26n_pipeline" / "no_aug" / "weights" / "best.pt"),
-    "player":   str(_PROJECT_ROOT / "models" / "player_model" / "best.pt"),
-    "seg":      str(_PROJECT_ROOT / "models" / "segmentation" / "best.pt"),
-    "ball":     str(_PROJECT_ROOT / "models" / "ball_model" / "yolo26_best.pt"),
-}
-
-SUPPORTED_EXTENSIONS = (".webm", ".mp4", ".avi", ".mov", ".mkv")
 
 OUTPUT_VIDEOS = [
     ("final_draft.mp4",          "Final Draft", "Original + PiP top-down pitch map"),
@@ -179,6 +169,10 @@ if "scrubber_fps" not in st.session_state:
     st.session_state.scrubber_fps = 30.0
 if "stabilizer_report" not in st.session_state:
     st.session_state.stabilizer_report = None
+if "mode" not in st.session_state:
+    st.session_state.mode = "live"
+if "selected_demo_id" not in st.session_state:
+    st.session_state.selected_demo_id = None
 
 # Inject theme CSS (re-injected every rerun)
 st.markdown(ui.inject_css(st.session_state.theme), unsafe_allow_html=True)
@@ -193,6 +187,76 @@ st.markdown(
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 def _remove_emojis(text: str) -> str:
     return re.sub(r"[^\w\s.\-]", "", text).strip()
+
+
+def _render_demo_card(d, current_id: str | None) -> None:
+    """Render a single demo card with summary KPIs and a Load button."""
+    poss = d.meta.get("possession") or {}
+    t1_pct = poss.get("team1_pct")
+    t2_pct = poss.get("team2_pct")
+    ball_pct = d.meta.get("ball_detection_pct")
+    frames = d.meta.get("processed_frames") or d.total_frames
+
+    badges = []
+    if isinstance(t1_pct, (int, float)):
+        badges.append(f"T1 {t1_pct:.0f}%")
+    if isinstance(t2_pct, (int, float)):
+        badges.append(f"T2 {t2_pct:.0f}%")
+    if isinstance(ball_pct, (int, float)):
+        badges.append(f"Ball {ball_pct:.0f}%")
+    if frames:
+        badges.append(f"{int(frames):,} fr")
+    badge_line = " · ".join(badges)
+
+    warnings = validate_demo(d.id)
+    warn_html = ""
+    if warnings:
+        warn_html = (
+            "<div class='ps-card__sub' style='margin-top:6px;color:#e0a23a;'>"
+            "⚠ " + "; ".join(warnings[:3]) + "</div>"
+        )
+
+    is_current = (current_id == d.id)
+    accent = "var(--ps-accent)" if is_current else "var(--ps-text)"
+
+    st.markdown(
+        f"""
+        <div class='ps-card' style='margin-bottom:12px;border-left:3px solid {accent};'>
+          <div style='font-weight:700;font-size:1rem;color:var(--ps-text);'>
+            {_remove_emojis(d.title)[:80]}
+          </div>
+          <div class='ps-card__sub' style='margin-top:4px;'>
+            {_remove_emojis(d.source_video)[:80]}
+          </div>
+          <div class='ps-card__sub' style='margin-top:6px;'>
+            {badge_line}
+          </div>
+          {warn_html}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    btn_label = "✓ Loaded" if is_current else "Load Demo"
+    btn_type = "secondary" if is_current else "primary"
+    if st.button(btn_label, key=f"demo_load_{d.id}", type=btn_type,
+                 use_container_width=True):
+        try:
+            loaded = load_demo(d.id)
+        except DemoLoadError as exc:
+            st.error(f"Could not load demo: {exc}")
+            return
+        st.session_state.game_data = loaded["game_data"]
+        st.session_state.analytics_data = loaded.get("analytics_data") or []
+        st.session_state.last_output_dir = loaded["last_output_dir"]
+        st.session_state.last_video_name = loaded["info"].title
+        st.session_state.processing_done = True
+        st.session_state.selected_demo_id = d.id
+        st.session_state.scrubber_fps = float(loaded.get("fps") or 30.0)
+        st.session_state.scrubber_frame_idx = 1
+        st.session_state.ball_owner_map = None
+        st.session_state.stabilizer_report = None
+        st.success(f"Loaded '{d.title}'. Open Match Centre, Pitch Analysis, etc.")
+        st.rerun()
 
 
 def get_video_files() -> list[Path]:
@@ -247,6 +311,21 @@ def get_scrubber_bounds(output_dir: Path) -> tuple[int, float, list[tuple[Path, 
 
 def check_models() -> dict[str, bool]:
     return {name: Path(path).exists() for name, path in MODEL_PATHS.items()}
+
+
+def _mode_badge_label(statuses: dict, mode: str) -> str:
+    """Return the small status badge text under the header.
+
+    Defined BEFORE its first use in the module so that downstream scripts
+    (e.g. ``scripts/setup_demo_cache.py``) can ``from streamlit_app import
+    MODEL_PATHS`` without triggering a NameError when the entire module
+    is executed top-to-bottom during the import.
+    """
+    if mode == "demo":
+        return "Demo Mode · pre-cached"
+    if not all(statuses.values()):
+        return "Models missing"
+    return "All models loaded"
 
 
 def build_seg_analytics(analytics_data: list) -> dict:
@@ -311,9 +390,71 @@ with st.sidebar:
 
     st.markdown("---")
 
+    # Mode switcher: Live = run the full pipeline; Demo = load a pre-cached
+    # match from demo_cache/. Reset all session-state results when the
+    # mode changes so the other tabs always render the right data.
+    st.markdown("<div style='font-weight:600;font-size:0.82rem;margin-bottom:6px;color:var(--ps-text-dim);'>MODE</div>", unsafe_allow_html=True)
+    mode_cols = st.columns(2)
+    with mode_cols[0]:
+        if st.button("▶  Live", use_container_width=True,
+                     disabled=(st.session_state.mode == "live")):
+            st.session_state.mode = "live"
+            st.session_state.analytics_data = None
+            st.session_state.game_data = None
+            st.session_state.processing_done = False
+            st.session_state.last_output_dir = None
+            st.session_state.last_video_name = None
+            st.session_state.selected_demo_id = None
+            st.session_state.ball_owner_map = None
+            st.session_state.stabilizer_report = None
+            st.rerun()
+    with mode_cols[1]:
+        if st.button("🎬  Demo", use_container_width=True,
+                     disabled=(st.session_state.mode == "demo")):
+            st.session_state.mode = "demo"
+            st.session_state.analytics_data = None
+            st.session_state.game_data = None
+            st.session_state.processing_done = False
+            st.session_state.last_output_dir = None
+            st.session_state.last_video_name = None
+            st.session_state.selected_demo_id = None
+            st.session_state.ball_owner_map = None
+            st.session_state.stabilizer_report = None
+            st.rerun()
+
+    # Demo picker: only meaningful in Demo mode, but always visible so the
+    # user can see which match is currently loaded.
+    if st.session_state.mode == "demo":
+        demos = list_demos()
+        if demos:
+            demo_options = {d.title: d.id for d in demos}
+            current_id = st.session_state.selected_demo_id
+            current_title = next(
+                (t for t, i in demo_options.items() if i == current_id),
+                None,
+            )
+            selected_title = st.selectbox(
+                "Loaded Demo",
+                options=list(demo_options.keys()),
+                index=(list(demo_options.keys()).index(current_title)
+                       if current_title in demo_options else 0),
+                label_visibility="visible",
+            )
+            st.session_state.selected_demo_id = demo_options[selected_title]
+        else:
+            st.caption(f"No demos in `{DEMO_CACHE_DIR}`.")
+            st.caption("Run `python scripts/setup_demo_cache.py` to populate.")
+
+    st.markdown("---")
+
     # Model status
     st.markdown("<div style='font-weight:600;font-size:0.82rem;margin-bottom:6px;color:var(--ps-text-dim);'>SYSTEM STATUS</div>", unsafe_allow_html=True)
     statuses = check_models()
+    if st.session_state.mode == "demo":
+        # Demos don't need model weights; show them as ready so the badge
+        # isn't red while the user is browsing demos.
+        for k in statuses:
+            statuses[k] = True
     rows_html = "".join(
         f'<div class="ps-status-row">'
         f'  <span class="ps-status-row__name">{name}</span>'
@@ -363,7 +504,7 @@ st.markdown(
       </div>
       <div class="ps-badge {'bad' if not all(statuses.values()) else ''}">
         <span class="dot"></span>
-        {"All models loaded" if all(statuses.values()) else "Models missing"}
+        {_mode_badge_label(statuses, st.session_state.mode)}
       </div>
     </div>
     """,
@@ -385,6 +526,81 @@ tab_processing, tab_match, tab_pitch, tab_players, tab_videos = st.tabs(
 # TAB 1 — PROCESSING
 # ═════════════════════════════════════════════════════════════════════════════
 with tab_processing:
+    if st.session_state.mode == "demo":
+        # ─── Demo Mode: picker over pre-cached bundles ─────────────────────
+        demos = list_demos()
+        if not demos:
+            st.markdown(
+                f"""
+                <div class='ps-card' style='text-align:center;padding:36px 24px;'>
+                  <div style='font-size:3rem;margin-bottom:10px;'>🎬</div>
+                  <h3 style='margin:0 0 8px;'>Demo cache is empty</h3>
+                  <p style='color:var(--ps-text-dim);max-width:560px;margin:0 auto 18px;'>
+                    Pre-cached output bundles live under
+                    <code>{DEMO_CACHE_DIR}</code>. Populate them with:
+                  </p>
+                  <code style='background:var(--ps-bg-alt);padding:8px 12px;
+                               border-radius:8px;display:inline-block;'>
+                    python scripts/setup_demo_cache.py
+                  </code>
+                  <p style='color:var(--ps-text-dim);margin-top:18px;max-width:560px;margin-left:auto;margin-right:auto;'>
+                    Or pass <code>--regenerate --source &lt;stem&gt;</code> to re-run the
+                    pipeline on a specific video under <code>data/matches/</code>.
+                  </p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            # No demos cached → stay in demo mode but stop so the live
+            # picker (which is for the "live" branch) doesn't render.
+            st.stop()
+        elif not st.session_state.game_data:
+            # No demo selected yet — show the picker and stop so the other
+            # tabs don't render an empty-state for missing data.
+            st.markdown(ui.card_open("Demo Matches",
+                                     "Pick a pre-cached match — every tab renders from cached "
+                                     "analytics without re-running inference."),
+                        unsafe_allow_html=True)
+            cols = st.columns(2)
+            for idx, d in enumerate(demos):
+                col = cols[idx % 2]
+                with col:
+                    _render_demo_card(d, current_id=st.session_state.selected_demo_id)
+            st.markdown(ui.card_close(), unsafe_allow_html=True)
+            st.stop()
+        else:
+            # A demo is already loaded — show a compact banner with a
+            # "Switch demo" expander so the user can change matches without
+            # losing context, then FALL THROUGH so Match Centre / Pitch
+            # Analysis / Player Analytics / Outputs all render their
+            # charts from the cached game_data.
+            loaded_title = st.session_state.get("last_video_name") or "Demo"
+            loaded_id = st.session_state.get("selected_demo_id")
+            st.markdown(
+                f"""
+                <div class='ps-card' style='display:flex;align-items:center;
+                                            justify-content:space-between;gap:12px;
+                                            padding:14px 18px;'>
+                  <div>
+                    <div style='font-weight:700;color:var(--ps-text);'>
+                      🎬 Loaded: {_remove_emojis(loaded_title)[:80]}
+                    </div>
+                    <div class='ps-card__sub' style='margin-top:4px;'>
+                      Demo bundle · all tabs render from cached analytics.
+                      Switch demo, or jump to another tab.
+                    </div>
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            with st.expander("Switch demo", expanded=False):
+                cols = st.columns(2)
+                for idx, d in enumerate(demos):
+                    col = cols[idx % 2]
+                    with col:
+                        _render_demo_card(d, current_id=loaded_id)
+
     video_files = get_video_files()
 
     if not video_files:
@@ -638,23 +854,9 @@ with tab_processing:
                 track_quality = team_info.get("track_quality") if team_info else None
                 team1_bgr = team_info.get("team1_bgr") if team_info else None
                 team2_bgr = team_info.get("team2_bgr") if team_info else None
-                st.session_state.game_data.append({
-                    "frame_idx": processed,
-                    "player_positions": result.get("player_pitch_pts", np.empty((0, 2))),
-                    "player_xyxy": result.get("player_xyxy", np.empty((0, 4))),
-                    "team_ids": team_ids,
-                    "role_ids": role_ids,
-                    "identity_ids": identity_ids,
-                    "track_ids": track_ids,
-                    "track_quality": track_quality,
-                    "team1_bgr": team1_bgr,
-                    "team2_bgr": team2_bgr,
-                    "ball_position": result.get("ball_pitch_pt"),
-                    "ball_xyxy": result.get("ball_xyxy", np.empty((0, 4))),
-                    "ball_conf": result.get("ball_conf", np.empty((0,))),
-                    "player_conf": result.get("player_conf", np.empty((0,))),
-                    "pass_event": result.get("pass_event"),
-                })
+                st.session_state.game_data.append(
+                    KeypointPipeline._build_game_data_entry(result, processed_count=processed)
+                )
 
                 pct = float(result.get("progress_pct", (processed / max(total_frames, 1)) * 100))
                 h_mode = result.get("H_info", {}).get("mode", "N/A")

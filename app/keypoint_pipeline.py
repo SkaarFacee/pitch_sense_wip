@@ -1,4 +1,5 @@
 """KeypointPipeline — End-to-end pipeline: keypoint→homography→player projection→team colors→ball→segmentation→5 output videos."""
+import json
 import cv2
 import numpy as np
 from pathlib import Path
@@ -1311,7 +1312,8 @@ class KeypointPipeline:
 
     def process_video(self, source_video_path: str, output_dir: str = "output", fps: float = 30.0,
                       start_frame: int = 0, max_frames: Optional[int] = None,
-                      process_every_n: int = 1, team_calibration=None):
+                      process_every_n: int = 1, team_calibration=None,
+                      persist_data: bool = True):
         process_every_n = max(1, int(process_every_n))
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
@@ -1415,6 +1417,11 @@ class KeypointPipeline:
 
         self._reset_video_state(reset_team_analyzer=False, reset_homography=False)
         frame_idx = rendered_count = record_idx = 0
+        # Optional: accumulate per-frame records alongside the rendered
+        # outputs so the dashboard can resume from disk after a restart and
+        # so the demo cache can be populated without re-running inference.
+        persisted_game_data: list[dict] = []
+        persisted_analytics_data: list[dict] = []
         try:
             while record_idx < len(frame_records):
                 ret, frame = cap_render.read()
@@ -1436,6 +1443,20 @@ class KeypointPipeline:
                 kpts = result.get('keypoints_used', [])
                 kw.write(self._draw_keypoints_on_frame(frame.copy(), kpts))
                 self._write_draft_frame(fw, frame, result.get('pitch_canvas'), frame_w, frame_h)
+                if persist_data:
+                    persisted_game_data.append(
+                        self._build_game_data_entry(result, processed_count=rendered_count + 1)
+                    )
+                    segs = result.get('processed_segments', []) or []
+                    if segs:
+                        persisted_analytics_data.append({
+                            "frame_idx": rendered_count + 1,
+                            "segments": [
+                                {"class_name": s.get("class_name"),
+                                 "confidence": float(s.get("confidence", 0.0))}
+                                for s in segs
+                            ],
+                        })
                 rendered_count += 1
                 record_idx += 1
                 yield result
@@ -1444,3 +1465,158 @@ class KeypointPipeline:
             cap_render.release()
             for w in [pw, aw, dw, fw, kw]:
                 w.release()
+            if persist_data and persisted_game_data:
+                self._persist_per_frame_data(
+                    output_path, persisted_game_data, persisted_analytics_data,
+                    fps=float(actual_fps), total_frames=int(rendered_count),
+                )
+
+    @staticmethod
+    def _build_game_data_entry(result: dict, processed_count: int) -> dict:
+        """Build the per-frame dict that the dashboard consumes.
+
+        Same shape the Streamlit loop builds today, factored so the
+        pipeline can also persist it without diverging from the live
+        behaviour. All array fields default to empty arrays of the
+        canonical dtype so missing detections don't break downstream
+        analytics.
+        """
+        team_info = result.get("team_info") or {}
+        return {
+            "frame_idx": int(processed_count),
+            "player_positions": result.get("player_pitch_pts",
+                                           np.empty((0, 2), dtype=np.float32)),
+            "player_xyxy": result.get("player_xyxy",
+                                      np.empty((0, 4), dtype=np.float32)),
+            "team_ids": team_info.get("team_ids") if team_info else None,
+            "role_ids": team_info.get("role_ids") if team_info else None,
+            "identity_ids": team_info.get("identity_ids") if team_info else None,
+            "track_ids": result.get("track_ids",
+                                    np.empty((0,), dtype=np.int32)),
+            "track_quality": team_info.get("track_quality") if team_info else None,
+            "team1_bgr": team_info.get("team1_bgr") if team_info else None,
+            "team2_bgr": team_info.get("team2_bgr") if team_info else None,
+            "ball_position": result.get("ball_pitch_pt"),
+            "ball_xyxy": result.get("ball_xyxy",
+                                    np.empty((0, 4), dtype=np.float32)),
+            "ball_conf": result.get("ball_conf",
+                                    np.empty((0,), dtype=np.float32)),
+            "player_conf": result.get("player_conf",
+                                      np.empty((0,), dtype=np.float32)),
+            "pass_event": result.get("pass_event"),
+        }
+
+    @staticmethod
+    def _persist_per_frame_data(output_path: Path,
+                                game_data: list,
+                                analytics_data: list,
+                                fps: float,
+                                total_frames: int) -> None:
+        """Write ``game_data.npz`` + ``analytics_data.json`` + ``meta.json``
+        under ``output_path/data/`` so the dashboard can reload without
+        re-running inference. Object arrays with per-frame variable shape
+        (e.g. ``player_positions``) are stored as ``dtype=object`` arrays
+        so round-tripping preserves the ragged shape. ``meta.json`` carries
+        the scalar fields needed by the demo picker.
+        """
+        data_dir = output_path / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+
+        # --- game_data.npz -------------------------------------------------
+        # Per-frame arrays share a row count; columns with variable
+        # per-row shape are stored as object arrays.
+        array_keys_scalar = (
+            "frame_idx", "team_ids", "role_ids", "identity_ids",
+            "track_ids", "track_quality", "player_conf", "ball_conf",
+        )
+        array_keys_2d = (
+            "player_positions", "player_xyxy", "ball_xyxy",
+        )
+        array_keys_misc = ("team1_bgr", "team2_bgr")
+
+        save_kwargs: dict = {}
+        n = len(game_data)
+        # Build a per-key list, then convert to a single ndarray of the
+        # right dtype. Empty frames still produce an empty row of the
+        # correct shape so the archive round-trips.
+        for key in array_keys_scalar:
+            col = []
+            for entry in game_data:
+                v = entry.get(key)
+                if v is None:
+                    col.append(np.asarray([-1], dtype=np.int32))
+                else:
+                    arr = np.asarray(v)
+                    if arr.ndim == 0:
+                        arr = arr.reshape(1)
+                    col.append(arr)
+            try:
+                save_kwargs[key] = np.asarray(col, dtype=np.int32)
+            except (ValueError, TypeError):
+                save_kwargs[key] = np.asarray(col, dtype=object)
+        for key in array_keys_2d:
+            col = [np.asarray(entry.get(key), dtype=np.float32)
+                   if entry.get(key) is not None else np.empty((0, 2), dtype=np.float32)
+                   for entry in game_data]
+            try:
+                save_kwargs[key] = np.asarray(col, dtype=np.float32)
+            except (ValueError, TypeError):
+                save_kwargs[key] = np.asarray(col, dtype=object)
+        for key in array_keys_misc:
+            col = []
+            for entry in game_data:
+                v = entry.get(key)
+                if v is None:
+                    col.append(np.asarray([-1, -1, -1], dtype=np.int32))
+                else:
+                    arr = np.asarray(v, dtype=np.int32).reshape(-1)
+                    if arr.size < 3:
+                        arr = np.concatenate(
+                            [arr, np.full(3 - arr.size, -1, dtype=np.int32)]
+                        )
+                    col.append(arr[:3])
+            save_kwargs[key] = np.asarray(col, dtype=np.int32)
+
+        # Per-frame ball_position is a (2,) float or None. Store as object
+        # array so the None entries survive.
+        ball_pos_col = []
+        for entry in game_data:
+            v = entry.get("ball_position")
+            if v is None:
+                ball_pos_col.append(np.asarray([np.nan, np.nan], dtype=np.float32))
+            else:
+                arr = np.asarray(v, dtype=np.float32).reshape(-1)
+                if arr.size < 2:
+                    ball_pos_col.append(np.asarray([np.nan, np.nan], dtype=np.float32))
+                else:
+                    ball_pos_col.append(arr[:2])
+        save_kwargs["ball_position"] = np.asarray(ball_pos_col, dtype=np.float32)
+
+        # pass_event is a dict-or-None per frame; store as object array.
+        save_kwargs["pass_event"] = np.asarray(
+            [entry.get("pass_event") for entry in game_data], dtype=object,
+        )
+
+        try:
+            np.savez_compressed(data_dir / "game_data.npz", **save_kwargs)
+        except Exception as exc:
+            print(f"[keypoint_pipeline] WARN: could not write game_data.npz: {exc}")
+
+        # --- analytics_data.json -----------------------------------------
+        try:
+            with open(data_dir / "analytics_data.json", "w") as f:
+                json.dump(analytics_data, f)
+        except Exception as exc:
+            print(f"[keypoint_pipeline] WARN: could not write analytics_data.json: {exc}")
+
+        # --- meta.json ----------------------------------------------------
+        try:
+            with open(data_dir / "meta.json", "w") as f:
+                json.dump({
+                    "schema_version": 1,
+                    "fps": float(fps),
+                    "total_frames": int(total_frames),
+                    "frame_count": int(n),
+                }, f, indent=2)
+        except Exception as exc:
+            print(f"[keypoint_pipeline] WARN: could not write meta.json: {exc}")

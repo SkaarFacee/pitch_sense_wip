@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "id": "Argentina-v-Austria_-FIFA-World-Cup-2026-Highlights-Group-J-_-2xc-5Lmnpw_",
+  "title": "Argentina v Austria\uff1a FIFA World Cup 2026 Highlights Group J [-2xc-5Lmnpw]",
+  "source_video": "Argentina-v-Austria_-FIFA-World-Cup-2026-Highlights-Group-J-_-2xc-5Lmnpw_",
+  "fps": 25.0,
+  "total_frames": 918,
+  "files": [
+    "videos/final_draft.mp4",
+    "videos/deep_analysis.mp4",
+    "videos/full_pitch_debug_map.mp4",
+    "videos/annotated_video.mp4",
+    "videos/keypoint_annotations.mp4",
+    "data/game_data.npz",
+    "data/analytics_data.json",
+    "meta.json",
+    "manifest.json"
+  ]
+}
